@@ -42,13 +42,14 @@ constexpr auto ObjectPath = "/org/nanoleaf/NanoleafSync";
 constexpr auto Interface = "org.nanoleaf.NanoleafSync";
 
 QVariantMap defaults() {
-  return {{"brightness", 1.0}, {"saturation_boost", 1.5}, {"fps", 30},
-          {"smooth", 0.35}, {"black_threshold", 0.02}, {"max_step", 12}, {"edge_depth", 15},
+  return {{"brightness", 1.5}, {"saturation_boost", 1.5}, {"fps", 30},
+          {"smooth", 0.35}, {"black_threshold", 0.01}, {"max_step", 12}, {"edge_depth", 8},
+          {"center_bleed", 0}, {"peak_mix", 15}, {"feather_depth", 5},
           {"corner", "bottom-center"}, {"offset", 0}, {"reverse", false},
           {"letterbox", true}, {"midtone_lift", false}, {"strict_black", false}};
 }
 const QStringList boolKeys{"reverse", "letterbox", "midtone_lift", "strict_black"};
-const QStringList intKeys{"fps", "max_step", "offset", "edge_depth"};
+const QStringList intKeys{"fps", "max_step", "offset", "edge_depth", "center_bleed", "peak_mix", "feather_depth"};
 const QStringList doubleKeys{"brightness", "saturation_boost", "smooth", "black_threshold"};
 
 QString configPath() { return QStandardPaths::writableLocation(QStandardPaths::ConfigLocation) + "/nanoleaf-sync/config.json"; }
@@ -183,6 +184,9 @@ class TrayApp : public QObject {
     addDouble(form, "Black threshold", "black_threshold", 0, 0.1, 3, 0.02, "Suppresses near-black capture noise; increase it if dark areas glow.");
     addSpin(form, "Maximum step", "max_step", 1, 255, "Limits each frame's color change; lower values are smoother but add lag.");
     addSpin(form, "Edge sample depth (%)", "edge_depth", 5, 20, "How far inward from each screen edge to sample; higher values pick up nearby content sooner.");
+    addSpin(form, "Center color blend (%)", "center_bleed", 0, 50, "Mix this share of the central picture's average color into every edge segment.");
+    addSpin(form, "Brightest-pixel blend (%)", "peak_mix", 0, 35, "Mix this share of the brightest-luma pixel in each zone; lower values suppress tiny highlights.");
+    addSpin(form, "Inward feather depth (%)", "feather_depth", 0, 20, "Extend each edge zone inward with a smooth taper to zero; 0 disables the feather.");
     addCheck(form, "Letterbox detection", "letterbox", "Detects black bars and samples within the active picture.");
     addCheck(form, "Midtone lift", "midtone_lift", "Optional legacy lift for dim and midtone content.");
     addCheck(form, "Strict black", "strict_black", "Sends exact black immediately instead of smoothing dark transitions.");
@@ -280,6 +284,7 @@ class TrayApp : public QObject {
     clampDouble("smooth", .05, 1); clampDouble("black_threshold", 0, .1);
     auto clampInt = [&v](const char *key, int low, int high) { bool ok = false; int n = v.value(key).toInt(&ok); v.insert(key, ok ? qBound(low, n, high) : defaults().value(key).toInt()); };
     clampInt("fps", 1, 60); clampInt("max_step", 1, 255); clampInt("offset", 0, 39); clampInt("edge_depth", 5, 20);
+    clampInt("center_bleed", 0, 50); clampInt("peak_mix", 0, 35); clampInt("feather_depth", 0, 20);
     static const QStringList corners{"bottom-center", "bottom-left", "top-left", "top-right", "bottom-right"};
     if (!corners.contains(v.value("corner").toString())) v.insert("corner", "bottom-center");
     for (const auto &key : boolKeys) v.insert(key, v.value(key).toBool());

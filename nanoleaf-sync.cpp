@@ -34,10 +34,11 @@ volatile sig_atomic_t running = 1;
 struct Color { float r = 0, g = 0, b = 0; };
 struct Rect { float x0 = 0, x1 = 1, y0 = 0, y1 = 1; };
 struct Zone { uint16_t id; float x0, x1, y0, y1; };
+struct PanelPosition { uint16_t id; int64_t x, y; };
 struct Config {
   std::string host, token, corner = "bottom-center", config_path, portal_restore_token;
-  int port = kDefaultPort, offset = 0, fps = 30, max_step = 12, edge_depth = 15;
-  float brightness = 1.0f, smooth = 0.35f, black_threshold = 0.02f, saturation_boost = 1.5f;
+  int port = kDefaultPort, offset = 0, fps = 30, max_step = 12, edge_depth = 8, center_bleed = 0, peak_mix = 15, feather_depth = 5;
+  float brightness = 1.5f, smooth = 0.35f, black_threshold = 0.01f, saturation_boost = 1.5f;
   bool reverse = false, letterbox = true, midtone_lift = false, strict_black = false;
 };
 struct Portal { GDBusConnection *bus = nullptr; std::string session; int fd = -1; guint32 node = 0; int width = 1920, height = 1080; };
@@ -170,6 +171,9 @@ void load_config(Config &c) {
   if (json_object_has_member(obj, "port")) c.port = static_cast<int>(json_object_get_int_member(obj, "port"));
   if (json_object_has_member(obj, "offset")) c.offset = static_cast<int>(json_object_get_int_member(obj, "offset"));
   if (json_object_has_member(obj, "edge_depth")) c.edge_depth = static_cast<int>(json_object_get_int_member(obj, "edge_depth"));
+  if (json_object_has_member(obj, "center_bleed")) c.center_bleed = static_cast<int>(json_object_get_int_member(obj, "center_bleed"));
+  if (json_object_has_member(obj, "peak_mix")) c.peak_mix = static_cast<int>(json_object_get_int_member(obj, "peak_mix"));
+  if (json_object_has_member(obj, "feather_depth")) c.feather_depth = static_cast<int>(json_object_get_int_member(obj, "feather_depth"));
   if (json_object_has_member(obj, "fps")) c.fps = static_cast<int>(json_object_get_int_member(obj, "fps"));
   if (json_object_has_member(obj, "max_step")) c.max_step = static_cast<int>(json_object_get_int_member(obj, "max_step"));
   if (json_object_has_member(obj, "smooth")) c.smooth = static_cast<float>(json_object_get_double_member(obj, "smooth"));
@@ -180,7 +184,7 @@ void load_config(Config &c) {
   if (json_object_has_member(obj, "letterbox")) c.letterbox = json_object_get_boolean_member(obj, "letterbox");
   if (json_object_has_member(obj, "midtone_lift")) c.midtone_lift = json_object_get_boolean_member(obj, "midtone_lift");
   if (json_object_has_member(obj, "strict_black")) c.strict_black = json_object_get_boolean_member(obj, "strict_black");
-  if (c.offset < 0 || c.offset > 39 || c.port < 1 || c.port > 65535 || c.fps < 1 || c.fps > 60 || c.max_step < 1 || c.max_step > 255 || c.edge_depth < 5 || c.edge_depth > 20 || c.smooth < 0.05f || c.smooth > 1 || c.black_threshold < 0 || c.black_threshold > 0.1f || c.brightness < 0 || c.brightness > 2 || c.saturation_boost < 0 || c.saturation_boost > 3) fail("config value outside its supported range");
+  if (c.offset < 0 || c.offset > 39 || c.port < 1 || c.port > 65535 || c.fps < 1 || c.fps > 60 || c.max_step < 1 || c.max_step > 255 || c.edge_depth < 5 || c.edge_depth > 20 || c.center_bleed < 0 || c.center_bleed > 50 || c.peak_mix < 0 || c.peak_mix > 35 || c.feather_depth < 0 || c.feather_depth > 20 || c.smooth < 0.05f || c.smooth > 1 || c.black_threshold < 0 || c.black_threshold > 0.1f || c.brightness < 0 || c.brightness > 2 || c.saturation_boost < 0 || c.saturation_boost > 3) fail("config value outside its supported range");
   if (c.corner != "bottom-center" && c.corner != "bottom-left" && c.corner != "top-left" && c.corner != "top-right" && c.corner != "bottom-right") fail("unknown config corner: " + c.corner);
   g_object_unref(parser);
 }
@@ -196,6 +200,9 @@ void save_config(const Config &c) {
   json_object_set_int_member(obj, "port", c.port);
   json_object_set_int_member(obj, "offset", c.offset);
   json_object_set_int_member(obj, "edge_depth", c.edge_depth);
+  json_object_set_int_member(obj, "center_bleed", c.center_bleed);
+  json_object_set_int_member(obj, "peak_mix", c.peak_mix);
+  json_object_set_int_member(obj, "feather_depth", c.feather_depth);
   json_object_set_int_member(obj, "fps", c.fps);
   json_object_set_int_member(obj, "max_step", c.max_step);
   json_object_set_double_member(obj, "smooth", c.smooth);
@@ -245,7 +252,7 @@ void pair_device(Config &c) {
   }
   fail("pairing timed out; re-enable Connect to API in the Nanoleaf app and retry");
 }
-std::vector<uint16_t> panel_ids(const Config &c) {
+std::vector<PanelPosition> panel_layout(const Config &c) {
   HttpResult response = http(c, "/panelLayout/layout", "GET");
   JsonParser *parser = nullptr; JsonNode *root = parse_json(response.body, &parser);
   if (!JSON_NODE_HOLDS_OBJECT(root)) fail("Nanoleaf layout response is not an object");
@@ -253,15 +260,18 @@ std::vector<uint16_t> panel_ids(const Config &c) {
   JsonArray *positions = json_object_get_array_member(obj, "positionData");
   gint64 count = json_object_get_int_member(obj, "numPanels");
   if (!positions || count < 4 || count > kPanels || json_array_get_length(positions) != guint(count)) fail("Nanoleaf 4D layout must contain 4..40 segments");
-  std::vector<uint16_t> ids; ids.reserve(static_cast<size_t>(count)); bool seen[65536] = {};
+  std::vector<PanelPosition> panels; panels.reserve(static_cast<size_t>(count)); bool seen[65536] = {};
   for (guint i = 0; i < guint(count); ++i) {
     JsonNode *node = json_array_get_element(positions, i);
     if (!JSON_NODE_HOLDS_OBJECT(node)) fail("malformed panel layout entry");
-    gint64 id = json_object_get_int_member(json_node_get_object(node), "panelId");
+    JsonObject *entry = json_node_get_object(node);
+    gint64 id = json_object_get_int_member(entry, "panelId");
     if (id < 0 || id > 65535 || seen[id]) fail("invalid or duplicate panel id in layout");
-    seen[id] = true; ids.push_back(static_cast<uint16_t>(id));
+    seen[id] = true;
+    if (!json_object_has_member(entry, "x") || !json_object_has_member(entry, "y")) fail("panel layout entry is missing coordinates");
+    panels.push_back({static_cast<uint16_t>(id), json_object_get_int_member(entry, "x"), json_object_get_int_member(entry, "y")});
   }
-  g_object_unref(parser); return ids;
+  g_object_unref(parser); return panels;
 }
 int enable_stream(const Config &c) {
   HttpResult response = http(c, "/effects", "PUT", "{\"write\":{\"command\":\"display\",\"animType\":\"extControl\",\"extControlVersion\":\"v2\"}}");
@@ -368,8 +378,8 @@ void close_portal(Portal &p) {
   if (p.bus) g_object_unref(p.bus);
 }
 
-std::vector<Zone> make_zones(const std::vector<uint16_t> &ids, const Config &c) {
-  const size_t n = ids.size();
+std::vector<Zone> make_zones(const std::vector<PanelPosition> &panels, const Config &c) {
+  const size_t n = panels.size();
   if (n < 4 || n > kPanels) fail("unsupported Nanoleaf segment count");
   if (c.offset < 0 || c.offset >= kPanels) fail("offset must be in 0..39");
   if (c.edge_depth < 5 || c.edge_depth > 20) fail("edge depth must be in 5..20 percent");
@@ -392,40 +402,84 @@ std::vector<Zone> make_zones(const std::vector<uint16_t> &ids, const Config &c) 
       else if (y >= 390) { float cx = x / 650; float span = (50.0f / 650.0f) * 0.7f; x0 = std::max(0.0f, cx - span); x1 = std::min(1.0f, cx + span); y0 = 0; y1 = border; }
       else if (x >= 640) { float cy = 1 - y / 400; float span = (50.0f / 400.0f) * 0.7f; x0 = 1 - border; x1 = 1; y0 = std::max(0.0f, cy - span); y1 = std::min(1.0f, cy + span); }
       else { float cx = x / 650; float span = (50.0f / 650.0f) * 0.7f; x0 = std::max(0.0f, cx - span); x1 = std::min(1.0f, cx + span); y0 = 1 - border; y1 = 1; }
-      zones[i] = {ids[i], x0, x1, y0, y1};
+      zones[i] = {panels[i].id, x0, x1, y0, y1};
+    }
+  } else if (n == 34) {
+    int64_t min_x = panels[0].x, max_x = panels[0].x, min_y = panels[0].y, max_y = panels[0].y;
+    for (const auto &panel : panels) {
+      min_x = std::min(min_x, panel.x); max_x = std::max(max_x, panel.x);
+      min_y = std::min(min_y, panel.y); max_y = std::max(max_y, panel.y);
+    }
+    if (min_x == max_x || min_y == max_y) fail("34-segment layout has no coordinate extent");
+    auto tangent = [&](size_t i, bool vertical) {
+      if (vertical) return 1.0f - float(panels[i].y - min_y) / float(max_y - min_y);
+      return float(panels[i].x - min_x) / float(max_x - min_x);
+    };
+    auto interval = [&](size_t first, size_t end, size_t i, bool vertical) {
+      float center = tangent(i, vertical);
+      float a = i == first ? center + (center - tangent(i + 1, vertical)) * 0.5f
+                           : (tangent(i - 1, vertical) + center) * 0.5f;
+      float b = i + 1 == end ? center + (center - tangent(i - 1, vertical)) * 0.5f
+                             : (center + tangent(i + 1, vertical)) * 0.5f;
+      return std::pair<float, float>{std::max(0.0f, std::min(a, b)), std::min(1.0f, std::max(a, b))};
+    };
+    for (size_t i = 0; i < 6; ++i) {
+      auto [x0, x1] = interval(0, 6, i, false);
+      zones[i] = {panels[i].id, x0, x1, 1 - border, 1};
+    }
+    for (size_t i = 6; i < 12; ++i) {
+      auto [y0, y1] = interval(6, 12, i, true);
+      zones[i] = {panels[i].id, 0, border, y0, y1};
+    }
+    for (size_t i = 12; i < 21; ++i) {
+      auto [x0, x1] = interval(12, 21, i, false);
+      zones[i] = {panels[i].id, x0, x1, 0, border};
+    }
+    for (size_t i = 21; i < 27; ++i) {
+      auto [y0, y1] = interval(21, 27, i, true);
+      zones[i] = {panels[i].id, 1 - border, 1, y0, y1};
+    }
+    for (size_t i = 27; i < 34; ++i) {
+      auto [x0, x1] = interval(27, 34, i, false);
+      zones[i] = {panels[i].id, x0, x1, 1 - border, 1};
     }
   } else {
     int left = std::max(1, int(std::lround(9.0 / 50.0 * n)));
     int top = std::max(1, int(std::lround(16.0 / 50.0 * n)));
     int right = std::max(1, int(std::lround(9.0 / 50.0 * n)));
-    int bottom = std::max(1, int(n) - left - top - right), index = 0;
+    int bottom = std::max(1, int(n) - left - top - right);
+    int index = 0;
     int bottom_left = bottom / 2;
     for (int i = 0; i < bottom_left; ++i) {
       float a = 0.5f - float(i) * 0.5f / bottom_left, b = 0.5f - float(i + 1) * 0.5f / bottom_left;
-      zones[index] = {ids[index], std::min(a,b), std::max(a,b), 1-border, 1}; ++index;
+      zones[index] = {panels[index].id, std::min(a,b), std::max(a,b), 1-border, 1}; ++index;
     }
     for (int i = 0; i < left; ++i) {
       float a = 1.0f - float(i) / left, b = 1.0f - float(i + 1) / left;
-      zones[index] = {ids[index], 0, border, std::min(a,b), std::max(a,b)}; ++index;
+      zones[index] = {panels[index].id, 0, border, std::min(a,b), std::max(a,b)}; ++index;
     }
     for (int i = 0; i < top; ++i) {
-      zones[index] = {ids[index], float(i)/top, float(i+1)/top, 0, border}; ++index;
+      float a = float(i)/top, b = float(i+1)/top;
+      zones[index] = {panels[index].id, a, b, 0, border}; ++index;
     }
     for (int i = 0; i < right; ++i) {
-      zones[index] = {ids[index], 1-border, 1, float(i)/right, float(i+1)/right}; ++index;
+      float a = float(i)/right, b = float(i+1)/right;
+      zones[index] = {panels[index].id, 1-border, 1, a, b}; ++index;
     }
     int bottom_right = bottom - bottom_left;
     for (int i = 0; i < bottom_right; ++i) {
       float a = 1.0f - float(i) * 0.5f / bottom_right, b = 1.0f - float(i + 1) * 0.5f / bottom_right;
-      zones[index] = {ids[index], std::min(a,b), std::max(a,b), 1-border, 1}; ++index;
+      zones[index] = {panels[index].id, std::min(a,b), std::max(a,b), 1-border, 1}; ++index;
     }
   }
-  int corner_index = c.corner == "bottom-left" ? 7 : c.corner == "top-left" ? 15 : c.corner == "top-right" ? 28 : c.corner == "bottom-right" ? 35 : 0;
-  int start = corner_index * int(n) / kPanels;
+  int corner_index = n == 34
+      ? (c.corner == "bottom-left" ? 6 : c.corner == "top-left" ? 11 : c.corner == "top-right" ? 20 : c.corner == "bottom-right" ? 26 : 0)
+      : (c.corner == "bottom-left" ? 7 : c.corner == "top-left" ? 15 : c.corner == "top-right" ? 28 : c.corner == "bottom-right" ? 35 : 0);
+  int start = n == 34 ? corner_index : corner_index * int(n) / kPanels;
   for (size_t i = 0; i < n; ++i) {
     int source = (start + c.offset % int(n) + (c.reverse ? -int(i) : int(i))) % int(n);
     if (source < 0) source += int(n);
-    zones[i].id = ids[source];
+    zones[i].id = panels[source].id;
   }
   return zones;
 }
@@ -483,23 +537,45 @@ struct Sampler {
     if (raw_colors) raw_colors->resize(zones.size());
     ++frames; int64_t now=g_get_monotonic_time(); float elapsed=last_us ? float(now-last_us)/1000000.0f : 1.0f/30; last_us=now; elapsed=std::min(elapsed,0.1f);
     if (cfg.letterbox && (frames==1 || frames%15==0)) active=detect_active_rect(data,stride,w,h);
+    float active_width=std::max(0.1f,active.x1-active.x0), active_height=std::max(0.1f,active.y1-active.y0);
+    int cx0=std::clamp(int((active.x0+0.25f*active_width)*w),0,w-1), cx1=std::clamp(int((active.x0+0.75f*active_width)*w),cx0+1,w);
+    int cy0=std::clamp(int((active.y0+0.25f*active_height)*h),0,h-1), cy1=std::clamp(int((active.y0+0.75f*active_height)*h),cy0+1,h);
     double sr=0,sg=0,sb=0; uint64_t count=0;
-    for (int y=h/4; y<3*h/4; y+=4) for (int x=w/4; x<3*w/4; x+=4) { Color c=pixel(data,stride,x,y); sr+=c.r; sg+=c.g; sb+=c.b; ++count; }
+    for (int y=cy0; y<cy1; y+=4) for (int x=cx0; x<cx1; x+=4) { Color c=pixel(data,stride,x,y); sr+=c.r; sg+=c.g; sb+=c.b; ++count; }
     Color current_global = count ? Color{float(sr/count),float(sg/count),float(sb/count)} : Color{};
     *scene_cut = frames>1 && std::sqrt(std::pow((current_global.r-global.r)/255,2)+std::pow((current_global.g-global.g)/255,2)+std::pow((current_global.b-global.b)/255,2)) > 0.35f;
     global=current_global;
+    const float feather=cfg.feather_depth/100.0f;
+    auto fade=[](float t) { t=std::clamp(t,0.0f,1.0f); return 1.0f-t*t*(3.0f-2.0f*t); };
     for (size_t i=0; i<zones.size(); ++i) {
-      const Zone &z=zones[i]; float xr=std::max(0.1f,active.x1-active.x0), yr=std::max(0.1f,active.y1-active.y0);
-      int x0=std::clamp(int((active.x0+z.x0*xr)*w),0,w-1), x1=std::clamp(int((active.x0+z.x1*xr)*w),x0+1,w);
-      int y0=std::clamp(int((active.y0+z.y0*yr)*h),0,h-1), y1=std::clamp(int((active.y0+z.y1*yr)*h),y0+1,h);
+      const Zone &z=zones[i];
+      const bool left=z.x0==0.0f, right=z.x1==1.0f, top=z.y0==0.0f, bottom=z.y1==1.0f;
+      float sx0=z.x0, sx1=z.x1, sy0=z.y0, sy1=z.y1;
+      if (feather>0) {
+        if (left) sx1=std::min(1.0f,sx1+feather); else if (right) sx0=std::max(0.0f,sx0-feather);
+        if (top) sy1=std::min(1.0f,sy1+feather); else if (bottom) sy0=std::max(0.0f,sy0-feather);
+      }
+      int x0=std::clamp(int((active.x0+sx0*active_width)*w),0,w-1), x1=std::clamp(int((active.x0+sx1*active_width)*w),x0+1,w);
+      int y0=std::clamp(int((active.y0+sy0*active_height)*h),0,h-1), y1=std::clamp(int((active.y0+sy1*active_height)*h),y0+1,h);
       double r=0,g=0,b=0,total=0; Color peak{}; float peak_luma=0;
       for (int y=y0; y<y1; y+=2) for (int x=x0; x<x1; x+=2) {
-        Color c=pixel(data,stride,x,y); float sat=saturation(c), lum=luma(c), weight=1+cfg.saturation_boost*sat*sat;
+        float spatial=1.0f;
+        if (feather>0) {
+          float nx=((float(x)+0.5f)/w-active.x0)/active_width, ny=((float(y)+0.5f)/h-active.y0)/active_height;
+          if (left && nx>z.x1) spatial*=fade((nx-z.x1)/feather);
+          else if (right && nx<z.x0) spatial*=fade((z.x0-nx)/feather);
+          if (top && ny>z.y1) spatial*=fade((ny-z.y1)/feather);
+          else if (bottom && ny<z.y0) spatial*=fade((z.y0-ny)/feather);
+        }
+        if (spatial<=0) continue;
+        Color c=pixel(data,stride,x,y); float sat=saturation(c), lum=luma(c), weight=(1+cfg.saturation_boost*sat*sat)*spatial;
         r+=c.r*weight; g+=c.g*weight; b+=c.b*weight; total+=weight;
-        if (lum>peak_luma) { peak_luma=lum; peak=c; }
+        float weighted_luma=lum*spatial;
+        if (weighted_luma>peak_luma) { peak_luma=weighted_luma; peak={c.r*spatial,c.g*spatial,c.b*spatial}; }
       }
       Color target=total ? Color{float(r/total),float(g/total),float(b/total)} : Color{};
-      if (peak_luma>0) target=mix(target,peak,0.35f);
+      if (peak_luma>0) target=mix(target,peak,float(cfg.peak_mix)/100.0f);
+      target=mix(target,current_global,float(cfg.center_bleed)/100.0f);
       if (cfg.black_threshold>0) { float lum=luma(target); if (lum<=cfg.black_threshold) target={}; else { float ramp=std::clamp((lum-cfg.black_threshold)/cfg.black_threshold,0.0f,1.0f); target={target.r*ramp,target.g*ramp,target.b*ramp}; } }
       target=boost_saturation(target,cfg.saturation_boost);
       if (cfg.midtone_lift) { auto lift=[](float x){x/=255; return std::clamp(x/(x+0.25f)*1.25f,0.0f,1.0f)*255;}; target={lift(target.r),lift(target.g),lift(target.b)}; }
@@ -583,7 +659,7 @@ int capture_test(Config &cfg) {
 }
 int capture_debug(Config &cfg) {
   std::signal(SIGINT,stop_signal); std::signal(SIGTERM,stop_signal);
-  auto ids=panel_ids(cfg); auto zones=make_zones(ids,cfg);
+  auto panels=panel_layout(cfg); auto zones=make_zones(panels,cfg);
   Capture cap=start_capture(cfg,false); Sampler sampler(zones,cfg); std::vector<Color> raw(zones.size());
   std::vector<double> pts_intervals, arrival_intervals; pts_intervals.reserve(600); arrival_intervals.reserve(600);
   constexpr int64_t duration_us=10000000;
@@ -647,14 +723,14 @@ int capture_debug(Config &cfg) {
     return std::pair<double,double>{v[(v.size()-1)/2],v[(v.size()-1)*95/100]};
   };
   auto pts=percentiles(pts_intervals), arrival=percentiles(arrival_intervals);
-  std::printf("# summary frames=%zu seconds=%.2f fps=%.1f pts_ms_median/p95=%.2f/%.2f arrival_ms_median/p95=%.2f/%.2f pts_gaps=%zu arrival_gaps=%zu pts_regressions=%zu scene_cuts=%zu active_rect_changes=%zu smooth=%.2f max_step=%d brightness=%.2f edge_depth=%d%%\n",
+  std::printf("# summary frames=%zu seconds=%.2f fps=%.1f pts_ms_median/p95=%.2f/%.2f arrival_ms_median/p95=%.2f/%.2f pts_gaps=%zu arrival_gaps=%zu pts_regressions=%zu scene_cuts=%zu active_rect_changes=%zu smooth=%.2f max_step=%d brightness=%.2f edge_depth=%d%% center_bleed=%d%% peak_mix=%d%% feather_depth=%d%%\n",
     frames,elapsed/1e6,elapsed?frames*1e6/elapsed:0.0,pts.first,pts.second,arrival.first,arrival.second,
-    pts_gaps,arrival_gaps,pts_regressions,scene_cuts,active_changes,cfg.smooth,cfg.max_step,cfg.brightness,cfg.edge_depth);
+    pts_gaps,arrival_gaps,pts_regressions,scene_cuts,active_changes,cfg.smooth,cfg.max_step,cfg.brightness,cfg.edge_depth,cfg.center_bleed,cfg.peak_mix,cfg.feather_depth);
   return frames ? 0 : 1;
 }
 struct Control {
   Config &cfg;
-  const std::vector<uint16_t> &ids;
+  const std::vector<PanelPosition> &panels;
   std::vector<Zone> &zones;
   Sampler &sampler;
   Capture &capture;
@@ -679,6 +755,9 @@ void add_settings(GVariantBuilder &b, const Config &c) {
   g_variant_builder_add(&b, "{sv}", "black_threshold", g_variant_new_double(c.black_threshold));
   g_variant_builder_add(&b, "{sv}", "max_step", g_variant_new_int32(c.max_step));
   g_variant_builder_add(&b, "{sv}", "edge_depth", g_variant_new_int32(c.edge_depth));
+  g_variant_builder_add(&b, "{sv}", "center_bleed", g_variant_new_int32(c.center_bleed));
+  g_variant_builder_add(&b, "{sv}", "peak_mix", g_variant_new_int32(c.peak_mix));
+  g_variant_builder_add(&b, "{sv}", "feather_depth", g_variant_new_int32(c.feather_depth));
   g_variant_builder_add(&b, "{sv}", "corner", g_variant_new_string(c.corner.c_str()));
   g_variant_builder_add(&b, "{sv}", "offset", g_variant_new_int32(c.offset));
   g_variant_builder_add(&b, "{sv}", "reverse", g_variant_new_boolean(c.reverse));
@@ -716,6 +795,9 @@ void dbus_method_call(GDBusConnection *, const gchar *, const gchar *, const gch
     else if (g_str_equal(key, "black_threshold") && g_variant_is_of_type(value, G_VARIANT_TYPE_DOUBLE)) next.black_threshold = static_cast<float>(g_variant_get_double(value));
     else if (g_str_equal(key, "max_step") && g_variant_is_of_type(value, G_VARIANT_TYPE_INT32)) next.max_step = g_variant_get_int32(value);
     else if (g_str_equal(key, "edge_depth") && g_variant_is_of_type(value, G_VARIANT_TYPE_INT32)) next.edge_depth = g_variant_get_int32(value);
+    else if (g_str_equal(key, "center_bleed") && g_variant_is_of_type(value, G_VARIANT_TYPE_INT32)) next.center_bleed = g_variant_get_int32(value);
+    else if (g_str_equal(key, "peak_mix") && g_variant_is_of_type(value, G_VARIANT_TYPE_INT32)) next.peak_mix = g_variant_get_int32(value);
+    else if (g_str_equal(key, "feather_depth") && g_variant_is_of_type(value, G_VARIANT_TYPE_INT32)) next.feather_depth = g_variant_get_int32(value);
     else if (g_str_equal(key, "corner") && g_variant_is_of_type(value, G_VARIANT_TYPE_STRING)) next.corner = g_variant_get_string(value, nullptr);
     else if (g_str_equal(key, "offset") && g_variant_is_of_type(value, G_VARIANT_TYPE_INT32)) next.offset = g_variant_get_int32(value);
     else if (g_str_equal(key, "reverse") && g_variant_is_of_type(value, G_VARIANT_TYPE_BOOLEAN)) next.reverse = g_variant_get_boolean(value);
@@ -727,6 +809,7 @@ void dbus_method_call(GDBusConnection *, const gchar *, const gchar *, const gch
     if (!valid) break;
   }
   g_variant_unref(settings);
+  if (valid) valid = next.center_bleed >= 0 && next.center_bleed <= 50 && next.peak_mix >= 0 && next.peak_mix <= 35 && next.feather_depth >= 0 && next.feather_depth <= 20;
   if (valid) valid = next.fps >= 1 && next.fps <= 60 && next.edge_depth >= 5 && next.edge_depth <= 20 && next.smooth >= 0.05f && next.smooth <= 1 &&
     std::isfinite(next.smooth) && next.black_threshold >= 0 && next.black_threshold <= 0.1f &&
     std::isfinite(next.black_threshold) && next.brightness >= 0 && next.brightness <= 2 &&
@@ -751,7 +834,7 @@ void apply_pending(Control &control) {
   if (!control.has_pending) return;
   Config next = std::move(control.pending); control.has_pending = false;
   int old_fps = control.cfg.fps;
-  auto zones = make_zones(control.ids, next);
+  auto zones = make_zones(control.panels, next);
   control.sampler.remap(zones); control.zones = std::move(zones); control.cfg = std::move(next);
   if (control.cfg.fps != old_fps) {
     g_object_set(control.capture.rate, "max-rate", control.cfg.fps, nullptr);
@@ -771,10 +854,10 @@ void run(Config &cfg) {
   std::signal(SIGINT,stop_signal); std::signal(SIGTERM,stop_signal);
   GError *error=nullptr; GDBusConnection *bus=g_bus_get_sync(G_BUS_TYPE_SESSION,nullptr,&error);
   if(!bus){std::string message=error?error->message:"session bus unavailable";g_clear_error(&error);fail(message);}
-  auto ids=panel_ids(cfg); auto zones=make_zones(ids,cfg); Capture cap; Sampler sampler(zones,cfg);
+  auto panels=panel_layout(cfg); auto zones=make_zones(panels,cfg); Capture cap; Sampler sampler(zones,cfg);
   GDBusNodeInfo *introspection=g_dbus_node_info_new_for_xml(kDbusXml,&error);
   if(!introspection){std::string message=error?error->message:"invalid D-Bus introspection";g_clear_error(&error);fail(message);}
-  Control control{cfg,ids,zones,sampler,cap,{},false,bus,0};
+  Control control{cfg,panels,zones,sampler,cap,{},false,bus,0};
   control.registration=g_dbus_connection_register_object(bus,kObjectPath,introspection->interfaces[0],&kDbusVtable,&control,nullptr,&error);
   if(!control.registration){std::string message=error?error->message:"cannot export D-Bus interface";g_clear_error(&error);fail(message);}
   claim_dbus_name(bus);
@@ -804,22 +887,66 @@ void run(Config &cfg) {
 }
 
 void self_test() {
+  Config defaults;
+  assert(defaults.brightness==1.5f && defaults.saturation_boost==1.5f && defaults.fps==30 && defaults.smooth==0.35f && defaults.black_threshold==0.01f && defaults.max_step==12);
+  assert(defaults.edge_depth==8 && defaults.center_bleed==0 && defaults.peak_mix==15 && defaults.feather_depth==5);
+  assert(defaults.corner=="bottom-center" && defaults.offset==0 && !defaults.reverse && defaults.letterbox && !defaults.midtone_lift && !defaults.strict_black);
   Config c; c.smooth=1; c.max_step=255; c.black_threshold=0.02f;
-  std::vector<uint16_t> ids(kPanels); for(int i=0;i<kPanels;++i) ids[i]=uint16_t(i+100);
-  auto z=make_zones(ids,c); assert(z.size()==40 && z[0].id==100 && z[7].id==107);
-  assert(c.edge_depth==15 && std::abs(z[0].y0-0.85f)<0.001f);
-  Config narrow=c; narrow.edge_depth=5; auto zn=make_zones(ids,narrow); assert(std::abs(zn[0].y0-0.95f)<0.001f);
-  Config wide=c; wide.edge_depth=20; auto zw=make_zones(ids,wide); assert(std::abs(zw[0].y0-0.80f)<0.001f);
-  c.corner="top-left"; c.offset=2; c.reverse=true; auto a=make_zones(ids,c); assert(a[0].id==117 && a[1].id==116);
-  std::vector<uint16_t> ids34(34); for(int i=0;i<34;++i) ids34[i]=uint16_t(i);
-  Config c34; c34.corner="bottom-left"; auto z34=make_zones(ids34,c34);
-  assert(z34.size()==34 && z34[0].id==5 && z34[33].id==4 && std::abs(z34[0].y0-0.85f)<0.001f);
-  c34.offset=39; auto z34_offset=make_zones(ids34,c34); assert(z34_offset[0].id==10 && z34_offset[33].id==9);
+  std::vector<PanelPosition> panels40(kPanels); for(int i=0;i<kPanels;++i) panels40[i]={uint16_t(i+100),0,0};
+  auto z=make_zones(panels40,c); assert(z.size()==40 && z[0].id==100 && z[7].id==107);
+  assert(c.edge_depth==8 && std::abs(z[0].y0-0.92f)<0.001f);
+  Config narrow=c; narrow.edge_depth=5; auto zn=make_zones(panels40,narrow); assert(std::abs(zn[0].y0-0.95f)<0.001f);
+  Config wide=c; wide.edge_depth=20; auto zw=make_zones(panels40,wide); assert(std::abs(zw[0].y0-0.80f)<0.001f);
+  c.corner="top-left"; c.offset=2; c.reverse=true; auto a=make_zones(panels40,c); assert(a[0].id==117 && a[1].id==116);
+  std::vector<PanelPosition> panels34(34);
+  for(int i=0;i<7;++i) panels34[i]={uint16_t(i),300-50*i,50};
+  for(int i=7;i<12;++i) panels34[i]={uint16_t(i),0,50+50*(i-6)};
+  for(int i=12;i<21;++i) panels34[i]={uint16_t(i),50*(i-11),300};
+  for(int i=21;i<27;++i) panels34[i]={uint16_t(i),450,300-50*(i-20)};
+  for(int i=27;i<34;++i) panels34[i]={uint16_t(i),450-50*(i-26),0};
+  Config c34_default; auto z34_default=make_zones(panels34,c34_default);
+  assert(z34_default[0].id==0 && std::abs((z34_default[0].x0+z34_default[0].x1)*0.5f-2.0f/3.0f)<0.001f);
+  Config c34; c34.corner="bottom-left"; auto z34=make_zones(panels34,c34);
+  assert(z34.size()==34 && z34[0].id==6 && z34[33].id==5 && std::abs(z34[0].y0-0.92f)<0.001f);
+  assert(z34[6].x0==0 && z34[11].x0==0 && z34[12].y0==0 && z34[20].y0==0 && z34[21].x0>0.8f && z34[26].x0>0.8f && z34[27].y0>0.8f);
+  Config c34_tl=c34; c34_tl.corner="top-left"; assert(make_zones(panels34,c34_tl)[0].id==11);
+  Config c34_tr=c34; c34_tr.corner="top-right"; assert(make_zones(panels34,c34_tr)[0].id==20);
+  Config c34_br=c34; c34_br.corner="bottom-right"; assert(make_zones(panels34,c34_br)[0].id==26);
+  c34.offset=39; auto z34_offset=make_zones(panels34,c34); assert(z34_offset[0].id==11 && z34_offset[33].id==10);
   constexpr int w=320,h=180,stride=w*4; std::vector<uint8_t> frame(stride*h);
   for(int y=0;y<h;++y) for(int x=0;x<w;++x){size_t o=y*stride+x*4; frame[o]=x<w/2?220:20; frame[o+1]=20; frame[o+2]=x<w/2?20:220; frame[o+3]=255;}
   Sampler s(z,c); bool cut=false; std::vector<Color> raw(z.size());
   const auto &colors=s.sample(frame.data(),stride,w,h,&cut,&raw); assert(!cut); assert(colors[11].r>colors[11].b); assert(colors[30].b>colors[30].r); assert(raw[11].r==colors[11].r && raw[30].b==colors[30].b);
   std::this_thread::sleep_for(std::chrono::milliseconds(40)); std::fill(frame.begin(),frame.end(),0); s.sample(frame.data(),stride,w,h,&cut,&raw); assert(raw[11].r==0 && raw[30].b==0 && colors[11].r==0 && colors[30].b==0);
+  assert(c.edge_depth==8 && c.center_bleed==0 && c.peak_mix==15 && c.feather_depth==5);
+  Config synthetic; synthetic.letterbox=false; synthetic.smooth=1; synthetic.max_step=255; synthetic.black_threshold=0; synthetic.saturation_boost=0; synthetic.brightness=1;
+  std::vector<Zone> corner_zone{{900,0,0.15f,0,0.15f}};
+  std::fill(frame.begin(),frame.end(),0);
+  for(int y=h/4;y<3*h/4;++y) for(int x=w/4;x<3*w/4;++x){size_t o=y*stride+x*4; frame[o]=100; frame[o+1]=40; frame[o+2]=10;}
+  Config center_cfg=synthetic; center_cfg.center_bleed=20; center_cfg.peak_mix=0; center_cfg.feather_depth=0;
+  Sampler center_sampler(corner_zone,center_cfg); std::vector<Color> center_raw(1); center_sampler.sample(frame.data(),stride,w,h,&cut,&center_raw);
+  assert(std::abs(center_raw[0].r-20)<0.1f && std::abs(center_raw[0].g-8)<0.1f && std::abs(center_raw[0].b-2)<0.1f);
+  std::fill(frame.begin(),frame.end(),0); frame[0]=frame[1]=frame[2]=255;
+  Config peak_off=synthetic; peak_off.center_bleed=0; peak_off.peak_mix=0; peak_off.feather_depth=0;
+  Sampler peak_off_sampler(corner_zone,peak_off); std::vector<Color> peak_off_raw(1); peak_off_sampler.sample(frame.data(),stride,w,h,&cut,&peak_off_raw);
+  Config peak_on=peak_off; peak_on.peak_mix=15;
+  Sampler peak_on_sampler(corner_zone,peak_on); std::vector<Color> peak_on_raw(1); peak_on_sampler.sample(frame.data(),stride,w,h,&cut,&peak_on_raw);
+  assert(peak_off_raw[0].r<1 && peak_on_raw[0].r>38 && peak_on_raw[0].r<40);
+  std::vector<Zone> side_zone{{901,0,0.15f,0.4f,0.6f}};
+  Config feather_cfg=synthetic; feather_cfg.center_bleed=0; feather_cfg.peak_mix=0; feather_cfg.feather_depth=10;
+  std::fill(frame.begin(),frame.end(),0); for(int y=72;y<108;y+=2){size_t o=y*stride+64*4; frame[o]=frame[o+1]=frame[o+2]=255;}
+  Sampler feather_mid_sampler(side_zone,feather_cfg); std::vector<Color> feather_mid(1); feather_mid_sampler.sample(frame.data(),stride,w,h,&cut,&feather_mid);
+  std::fill(frame.begin(),frame.end(),0); for(int y=72;y<108;y+=2){size_t o=y*stride+78*4; frame[o]=frame[o+1]=frame[o+2]=255;}
+  Sampler feather_outer_sampler(side_zone,feather_cfg); std::vector<Color> feather_outer(1); feather_outer_sampler.sample(frame.data(),stride,w,h,&cut,&feather_outer);
+  Config no_feather=feather_cfg; no_feather.feather_depth=0;
+  Sampler hard_edge_sampler(side_zone,no_feather); std::vector<Color> hard_edge(1); hard_edge_sampler.sample(frame.data(),stride,w,h,&cut,&hard_edge);
+  assert(feather_mid[0].r>feather_outer[0].r && feather_outer[0].r>0 && hard_edge[0].r==0);
+  std::vector<Zone> corner_zone_for_feather{{902,0,0.15f,0,0.15f}};
+  std::fill(frame.begin(),frame.end(),0); size_t horizontal_pixel=8*stride+64*4; frame[horizontal_pixel]=frame[horizontal_pixel+1]=frame[horizontal_pixel+2]=255;
+  Sampler corner_horizontal_sampler(corner_zone_for_feather,feather_cfg); std::vector<Color> corner_horizontal(1); corner_horizontal_sampler.sample(frame.data(),stride,w,h,&cut,&corner_horizontal);
+  std::fill(frame.begin(),frame.end(),0); size_t diagonal_pixel=36*stride+64*4; frame[diagonal_pixel]=frame[diagonal_pixel+1]=frame[diagonal_pixel+2]=255;
+  Sampler corner_diagonal_sampler(corner_zone_for_feather,feather_cfg); std::vector<Color> corner_diagonal(1); corner_diagonal_sampler.sample(frame.data(),stride,w,h,&cut,&corner_diagonal);
+  assert(corner_horizontal[0].r>corner_diagonal[0].r*1.8f && corner_diagonal[0].r>0);
   Packet packet{};
   std::vector<Color> colors34(34,Color{12,34,56}); make_packet(z34,colors34,packet); assert(packet[1]==34);
   int recvfd=socket(AF_INET,SOCK_DGRAM,0); assert(recvfd>=0); sockaddr_in addr{}; addr.sin_family=AF_INET; addr.sin_addr.s_addr=htonl(INADDR_LOOPBACK); assert(bind(recvfd,reinterpret_cast<sockaddr*>(&addr),sizeof(addr))==0); socklen_t len=sizeof(addr); assert(getsockname(recvfd,reinterpret_cast<sockaddr*>(&addr),&len)==0);
@@ -827,7 +954,7 @@ void self_test() {
   int sendfd=udp_socket("127.0.0.1",ntohs(addr.sin_port)); std::vector<Color> wire_colors(kPanels,Color{12,34,56}); make_packet(z,wire_colors,packet); send_packet(sendfd,packet,z.size());
   std::array<uint8_t,2+kPanels*8> received{}; ssize_t bytes=recv(recvfd,received.data(),received.size(),0); assert(bytes==322 && received[1]==40);
   make_packet(z34,colors34,packet); send_packet(sendfd,packet,z34.size()); bytes=recv(recvfd,received.data(),received.size(),0); assert(bytes==274 && received[1]==34);
-  close(sendfd); close(recvfd); std::puts("self-test: 5/15/20% edge depth, 40/34-zone geometry, alignment, RGB sampling, black gate, and 322/274-byte UDP frames OK");
+  close(sendfd); close(recvfd); std::puts("self-test: edge depth, center blend, peak attenuation, feather falloff, 40/34-zone alignment, RGB/black sampling, and UDP frames OK");
 }
 }
 
