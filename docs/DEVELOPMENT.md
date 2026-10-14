@@ -24,7 +24,7 @@ The worker discovers panel IDs and layout from the controller. The 34-segment pa
 
 | Path | Responsibility |
 |---|---|
-| `nanoleaf-sync.cpp` | CLI, `--version`, Nanoleaf LAN API, config persistence, portal/PipeWire capture, sampling, extControl v2 UDP, worker D-Bus API, `--device-info`, and `--self-test`. |
+| `src/nanoleaf-sync.cpp` | CLI, `--version`, Nanoleaf LAN API, config persistence, portal/PipeWire capture, sampling, extControl v2 UDP, worker D-Bus API, `--device-info`, and `--self-test`. |
 | `src/plasma/backend.cpp` | QML extension plugin; shared settings, worker status, user systemd unit, Avahi D-Bus discovery, CLI pairing/device details, and local credential removal. |
 | `share/plasma/io.github.avitretiak.Wayleaf4D/` | Plasma applet metadata, QML UI, and ambient-light icon. |
 | `share/plasma/io.github.avitretiak.Wayleaf4D/contents/ui/Nanoleaf/qmldir` | Declares the `Nanoleaf` QML module. |

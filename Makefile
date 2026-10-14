@@ -20,7 +20,7 @@ all: $(WORKER) $(BACKEND_PLUGIN)
 $(BUILD_DIR):
 	mkdir -p $@
 
-$(WORKER): nanoleaf-sync.cpp | $(BUILD_DIR)
+$(WORKER): src/nanoleaf-sync.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $(shell pkg-config --cflags $(PKGS)) $< -o $@ $(shell pkg-config --libs $(PKGS))
 
 $(BACKEND_MOC): src/plasma/backend.cpp | $(BUILD_DIR)
