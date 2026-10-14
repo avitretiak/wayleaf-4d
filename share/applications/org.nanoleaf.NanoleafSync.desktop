@@ -1,8 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=Nanoleaf Sync
-Comment=Control live Wayland ambient screen sync for Nanoleaf 4D
-Exec=nanoleaf-sync-tray
-Terminal=false
-NoDisplay=false
-Categories=Utility;

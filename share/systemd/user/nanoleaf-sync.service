@@ -1,0 +1,14 @@
+[Unit]
+Description=Wayleaf 4D screen ambient lighting
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/nanoleaf-sync
+Restart=no
+RestartForceExitStatus=75
+RestartSec=15s
+
+[Install]
+WantedBy=graphical-session.target

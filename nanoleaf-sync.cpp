@@ -1,5 +1,8 @@
-#include <gio/gio.h>
+// SPDX-FileCopyrightText: 2026 Avi Tretiak
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 #include <glib/gstdio.h>
+#include <glib-unix.h>
 #include <gst/app/gstappsink.h>
 #include <gst/gst.h>
 #include <gst/video/video.h>
@@ -25,11 +28,20 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <cerrno>
+#include <sysexits.h>
+
 namespace {
 constexpr int kPanels = 40;
 constexpr int kDefaultPort = 60222;
+constexpr int kMaxFps = 10;
+constexpr char kVersion[] = "0.1.0-beta";
 constexpr int kSmallWidth = 320;
 volatile sig_atomic_t running = 1;
+bool has_sent_udp = false;
+bool portal_closed = false;
+guint portal_closed_subscription = 0;
+const char *lifecycle_status(bool stopping, bool sent) { return stopping ? "stopping" : sent ? "running" : "starting"; }
 
 struct Color { float r = 0, g = 0, b = 0; };
 struct Rect { float x0 = 0, x1 = 1, y0 = 0, y1 = 1; };
@@ -37,15 +49,40 @@ struct Zone { uint16_t id; float x0, x1, y0, y1; };
 struct PanelPosition { uint16_t id; int64_t x, y; };
 struct Config {
   std::string host, token, corner = "bottom-center", config_path, portal_restore_token;
-  int port = kDefaultPort, offset = 0, fps = 30, max_step = 12, edge_depth = 8, center_bleed = 0, peak_mix = 15, feather_depth = 5;
+  int port = kDefaultPort, offset = 0, fps = 10, max_step = 12, edge_depth = 8, center_bleed = 0, peak_mix = 15, feather_depth = 5;
   float brightness = 1.5f, smooth = 0.35f, black_threshold = 0.01f, saturation_boost = 1.5f;
   bool reverse = false, letterbox = true, midtone_lift = false, strict_black = false;
 };
 struct Portal { GDBusConnection *bus = nullptr; std::string session; int fd = -1; guint32 node = 0; int width = 1920, height = 1080; };
 struct HttpResult { std::string body; long status = 0; };
 
-void stop_signal(int) { running = 0; }
 void fail(const std::string &message) { std::fprintf(stderr, "error: %s\n", message.c_str()); std::exit(1); }
+void fail_temporary(const std::string &message) { std::fprintf(stderr, "error: %s\n", message.c_str()); std::exit(EX_TEMPFAIL); }
+bool retryable_network_error(int error) {
+  switch (error) {
+    case EAGAIN: case EINTR: case ENETDOWN: case ENETUNREACH: case EHOSTUNREACH:
+    case ECONNREFUSED: case ECONNRESET: case ETIMEDOUT: case EADDRNOTAVAIL: case ENOBUFS:
+      return true;
+    default:
+      return false;
+  }
+}
+bool retryable_curl_error(CURLcode error) {
+  switch (error) {
+    case CURLE_COULDNT_RESOLVE_HOST: case CURLE_COULDNT_RESOLVE_PROXY: case CURLE_COULDNT_CONNECT:
+    case CURLE_OPERATION_TIMEDOUT: case CURLE_SEND_ERROR: case CURLE_RECV_ERROR:
+    case CURLE_GOT_NOTHING: case CURLE_AGAIN:
+      return true;
+    default:
+      return false;
+  }
+}
+bool retryable_http_status(long status) {
+  return status == 408 || status == 425 || status == 429 || status == 500 || status == 502 || status == 503 || status == 504;
+}
+int capture_exit_status(bool capture_failed, bool portal_was_closed) {
+  return capture_failed && !portal_was_closed ? EX_TEMPFAIL : 0;
+}
 
 bool parse_int(const char *s, int *out) {
   char *end = nullptr; long n = std::strtol(s, &end, 10);
@@ -61,20 +98,24 @@ void usage(const char *name) {
   std::printf("Usage: %s [--pair --ip HOST] | [--ip HOST --token TOKEN] [options]\n"
               "  --config PATH             config file (default: XDG config dir/nanoleaf-sync/config.json)\n"
               "  --pair                    pair now and securely save the device token\n"
-              "  --reverse --forward --offset 0..39 --fps 1..60 --port 60222\n"
+              "  --corner NAME             bottom-center, bottom-left, top-left, top-right, bottom-right\n"
+              "  --reverse --forward --offset 0..39\n"
+              "  --fps 1..10 --port 1..65535 (UDP fallback, default 60222)\n"
               "  --brightness 0..2 --saturation-boost 0..3 --smooth 0.05..1\n"
               "  --black-threshold 0..0.1 --max-step 1..255 --edge-depth 5..20%%\n"
               "  --no-letterbox --letterbox --midtone-lift --no-midtone-lift\n"
-              "  --strict-black --no-strict-black --self-test --capture-test --capture-debug\n", name);
+              "  --strict-black --no-strict-black --device-info --self-test --capture-test --capture-debug\n"
+              "  --version                 print Wayleaf 4D version\n", name);
 }
-Config arguments(int argc, char **argv, bool *self_test, bool *capture_test, bool *capture_debug, bool *pair, Config c) {
-  *self_test = false; *capture_test = false; *capture_debug = false; *pair = false;
+Config arguments(int argc, char **argv, bool *self_test, bool *capture_test, bool *capture_debug, bool *pair, bool *device_info, Config c) {
+  *self_test = false; *capture_test = false; *capture_debug = false; *pair = false; *device_info = false;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     if (a == "--help" || a == "-h") { usage(argv[0]); std::exit(0); }
     if (a == "--self-test") { *self_test = true; continue; }
     if (a == "--capture-test") { *capture_test = true; continue; }
     if (a == "--capture-debug") { *capture_debug = true; continue; }
+    if (a == "--device-info") { *device_info = true; continue; }
     if (a == "--pair") { *pair = true; continue; }
     if (a == "--reverse") { c.reverse = true; continue; }
     if (a == "--forward") { c.reverse = false; continue; }
@@ -110,7 +151,7 @@ Config arguments(int argc, char **argv, bool *self_test, bool *capture_test, boo
     if (a == "--brightness") c.brightness = f;
     if (a == "--saturation-boost") c.saturation_boost = f;
   }
-  if (c.offset < 0 || c.offset > 39 || c.port < 1 || c.port > 65535 || c.fps < 1 || c.fps > 60 || c.max_step < 1 || c.max_step > 255 || c.edge_depth < 5 || c.edge_depth > 20 || c.smooth < 0.05f || c.smooth > 1 || c.black_threshold < 0 || c.black_threshold > 0.1f || c.brightness < 0 || c.brightness > 2 || c.saturation_boost < 0 || c.saturation_boost > 3) fail("option value outside its supported range");
+  if (c.offset < 0 || c.offset > 39 || c.port < 1 || c.port > 65535 || c.fps < 1 || c.fps > kMaxFps || c.max_step < 1 || c.max_step > 255 || c.edge_depth < 5 || c.edge_depth > 20 || c.smooth < 0.05f || c.smooth > 1 || c.black_threshold < 0 || c.black_threshold > 0.1f || c.brightness < 0 || c.brightness > 2 || c.saturation_boost < 0 || c.saturation_boost > 3) fail("option value outside its supported range");
   if (c.corner != "bottom-center" && c.corner != "bottom-left" && c.corner != "top-left" && c.corner != "top-right" && c.corner != "bottom-right") fail("unknown corner: " + c.corner);
   return c;
 }
@@ -133,8 +174,16 @@ HttpResult http(const Config &c, const std::string &path, const char *method, co
   CURLcode rc = curl_easy_perform(curl);
   if (rc == CURLE_OK) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &result.status);
   std::string error = curl_easy_strerror(rc); curl_easy_cleanup(curl);
-  if (rc != CURLE_OK) fail("Nanoleaf HTTP request failed: " + error);
-  if (result.status < 200 || result.status >= 300) fail("Nanoleaf API returned HTTP " + std::to_string(result.status));
+  if (rc != CURLE_OK) {
+    std::string message = "Nanoleaf HTTP request failed: " + error;
+    if (retryable_curl_error(rc)) fail_temporary(message);
+    fail(message);
+  }
+  if (result.status < 200 || result.status >= 300) {
+    std::string message = "Nanoleaf API returned HTTP " + std::to_string(result.status);
+    if (retryable_http_status(result.status)) fail_temporary(message);
+    fail(message);
+  }
   return result;
 }
 JsonNode *parse_json(const std::string &text, JsonParser **parser_out = nullptr) {
@@ -145,6 +194,24 @@ JsonNode *parse_json(const std::string &text, JsonParser **parser_out = nullptr)
   JsonNode *root = json_parser_get_root(parser);
   if (parser_out) *parser_out = parser; else g_object_unref(parser);
   return root;
+}
+std::string safe_device_info_json(const std::string &text) {
+  JsonParser *parser = nullptr; JsonNode *root = parse_json(text, &parser);
+  if (!JSON_NODE_HOLDS_OBJECT(root)) { g_object_unref(parser); fail("device info response is not an object"); }
+  static const char *keys[] = {"name", "model", "serialNo", "firmwareVersion", "hardwareVersion", "manufacturer", "productName"};
+  JsonObject *safe = json_object_new();
+  JsonObject *device = json_node_get_object(root);
+  for (const char *key : keys) {
+    if (!json_object_has_member(device, key)) continue;
+    JsonNode *value = json_object_get_member(device, key);
+    if (JSON_NODE_HOLDS_VALUE(value)) json_object_set_member(safe, key, json_node_copy(value));
+  }
+  JsonNode *output = json_node_new(JSON_NODE_OBJECT); json_node_take_object(output, safe);
+  JsonGenerator *generator = json_generator_new(); json_generator_set_root(generator, output);
+  gsize length = 0; char *data = json_generator_to_data(generator, &length);
+  std::string result(data, length); g_free(data); g_object_unref(generator);
+  json_node_free(output); g_object_unref(parser);
+  return result;
 }
 const char *config_string(JsonObject *obj, const char *key) {
   if (!json_object_has_member(obj, key)) return nullptr;
@@ -174,7 +241,7 @@ void load_config(Config &c) {
   if (json_object_has_member(obj, "center_bleed")) c.center_bleed = static_cast<int>(json_object_get_int_member(obj, "center_bleed"));
   if (json_object_has_member(obj, "peak_mix")) c.peak_mix = static_cast<int>(json_object_get_int_member(obj, "peak_mix"));
   if (json_object_has_member(obj, "feather_depth")) c.feather_depth = static_cast<int>(json_object_get_int_member(obj, "feather_depth"));
-  if (json_object_has_member(obj, "fps")) c.fps = static_cast<int>(json_object_get_int_member(obj, "fps"));
+  if (json_object_has_member(obj, "fps")) c.fps = std::min(static_cast<int>(json_object_get_int_member(obj, "fps")), kMaxFps);
   if (json_object_has_member(obj, "max_step")) c.max_step = static_cast<int>(json_object_get_int_member(obj, "max_step"));
   if (json_object_has_member(obj, "smooth")) c.smooth = static_cast<float>(json_object_get_double_member(obj, "smooth"));
   if (json_object_has_member(obj, "black_threshold")) c.black_threshold = static_cast<float>(json_object_get_double_member(obj, "black_threshold"));
@@ -184,7 +251,7 @@ void load_config(Config &c) {
   if (json_object_has_member(obj, "letterbox")) c.letterbox = json_object_get_boolean_member(obj, "letterbox");
   if (json_object_has_member(obj, "midtone_lift")) c.midtone_lift = json_object_get_boolean_member(obj, "midtone_lift");
   if (json_object_has_member(obj, "strict_black")) c.strict_black = json_object_get_boolean_member(obj, "strict_black");
-  if (c.offset < 0 || c.offset > 39 || c.port < 1 || c.port > 65535 || c.fps < 1 || c.fps > 60 || c.max_step < 1 || c.max_step > 255 || c.edge_depth < 5 || c.edge_depth > 20 || c.center_bleed < 0 || c.center_bleed > 50 || c.peak_mix < 0 || c.peak_mix > 35 || c.feather_depth < 0 || c.feather_depth > 20 || c.smooth < 0.05f || c.smooth > 1 || c.black_threshold < 0 || c.black_threshold > 0.1f || c.brightness < 0 || c.brightness > 2 || c.saturation_boost < 0 || c.saturation_boost > 3) fail("config value outside its supported range");
+  if (c.offset < 0 || c.offset > 39 || c.port < 1 || c.port > 65535 || c.fps < 1 || c.fps > kMaxFps || c.max_step < 1 || c.max_step > 255 || c.edge_depth < 5 || c.edge_depth > 20 || c.center_bleed < 0 || c.center_bleed > 50 || c.peak_mix < 0 || c.peak_mix > 35 || c.feather_depth < 0 || c.feather_depth > 20 || c.smooth < 0.05f || c.smooth > 1 || c.black_threshold < 0 || c.black_threshold > 0.1f || c.brightness < 0 || c.brightness > 2 || c.saturation_boost < 0 || c.saturation_boost > 3) fail("config value outside its supported range");
   if (c.corner != "bottom-center" && c.corner != "bottom-left" && c.corner != "top-left" && c.corner != "top-right" && c.corner != "bottom-right") fail("unknown config corner: " + c.corner);
   g_object_unref(parser);
 }
@@ -192,7 +259,23 @@ void save_config(const Config &c) {
   char *dir = g_path_get_dirname(c.config_path.c_str());
   if (g_mkdir_with_parents(dir, 0700) != 0) { std::string path = dir; g_free(dir); fail("cannot create config directory: " + path); }
   g_free(dir);
-  JsonObject *obj = json_object_new();
+  JsonNode *root = nullptr;
+  JsonObject *obj = nullptr;
+  if (g_file_test(c.config_path.c_str(), G_FILE_TEST_EXISTS)) {
+    JsonParser *parser = json_parser_new(); GError *error = nullptr;
+    if (!json_parser_load_from_file(parser, c.config_path.c_str(), &error)) {
+      std::string message = error ? error->message : "invalid JSON"; g_clear_error(&error); g_object_unref(parser);
+      fail("cannot read config: " + message);
+    }
+    JsonNode *existing = json_parser_get_root(parser);
+    if (!JSON_NODE_HOLDS_OBJECT(existing)) { g_object_unref(parser); fail("config root must be an object"); }
+    root = json_node_copy(existing); obj = json_node_get_object(root);
+    g_object_unref(parser);
+  } else {
+    root = json_node_new(JSON_NODE_OBJECT);
+    obj = json_object_new();
+    json_node_take_object(root, obj);
+  }
   json_object_set_string_member(obj, "ip", c.host.c_str());
   json_object_set_string_member(obj, "token", c.token.c_str());
   json_object_set_string_member(obj, "portal_restore_token", c.portal_restore_token.c_str());
@@ -213,7 +296,6 @@ void save_config(const Config &c) {
   json_object_set_boolean_member(obj, "letterbox", c.letterbox);
   json_object_set_boolean_member(obj, "midtone_lift", c.midtone_lift);
   json_object_set_boolean_member(obj, "strict_black", c.strict_black);
-  JsonNode *root = json_node_new(JSON_NODE_OBJECT); json_node_take_object(root, obj);
   JsonGenerator *generator = json_generator_new(); json_generator_set_root(generator, root);
   gsize length = 0; char *data = json_generator_to_data(generator, &length);
   GError *error = nullptr;
@@ -223,7 +305,7 @@ void save_config(const Config &c) {
   if (g_chmod(c.config_path.c_str(), 0600) != 0) fail("cannot restrict config file permissions");
 }
 void pair_device(Config &c) {
-  std::fprintf(stderr, "Open the Nanoleaf 4D in the Nanoleaf app and enable Settings > Connect to API. Waiting up to 30 seconds...\n");
+  std::fprintf(stderr, "Hold the Nanoleaf 4D power button for 5 seconds, then pair within 30 seconds.\n");
   auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
   std::string url = "http://" + c.host + ":16021/api/v1/new";
   while (std::chrono::steady_clock::now() < deadline) {
@@ -287,11 +369,22 @@ int enable_stream(const Config &c) {
   return port;
 }
 
-struct RequestWait { GMainLoop *loop; guint code = 2; GVariant *results = nullptr; };
+struct RequestWait { GMainLoop *loop; guint code = 2; GVariant *results = nullptr; std::string path; };
+RequestWait *active_portal_wait = nullptr;
 void response_signal(GDBusConnection *, const gchar *, const gchar *, const gchar *, const gchar *, GVariant *parameters, gpointer data) {
   auto *wait = static_cast<RequestWait *>(data);
   g_variant_get(parameters, "(u@a{sv})", &wait->code, &wait->results);
   g_main_loop_quit(wait->loop);
+}
+gboolean signal_stop(gpointer) {
+  running = 0;
+  if (active_portal_wait) g_main_loop_quit(active_portal_wait->loop);
+  return G_SOURCE_CONTINUE;
+}
+void portal_closed_signal(GDBusConnection *, const gchar *, const gchar *, const gchar *, const gchar *, GVariant *, gpointer) {
+  portal_closed = true;
+  running = 0;
+  if (active_portal_wait) g_main_loop_quit(active_portal_wait->loop);
 }
 GVariant *request_options(const char *token, const char *extra_key = nullptr, GVariant *extra = nullptr) {
   GVariantBuilder b; g_variant_builder_init(&b, G_VARIANT_TYPE_VARDICT);
@@ -306,27 +399,35 @@ std::string sender_path(GDBusConnection *bus) {
   return name;
 }
 GVariant *portal_request(Portal &p, const char *method, GVariant *parameters, const char *handle_token) {
-  std::string request_path = "/org/freedesktop/portal/desktop/request/" + sender_path(p.bus) + "/" + handle_token;
-  RequestWait wait{g_main_loop_new(nullptr, FALSE)};
-  guint sub = g_dbus_connection_signal_subscribe(p.bus, "org.freedesktop.portal.Desktop", "org.freedesktop.portal.Request", "Response", request_path.c_str(), nullptr, G_DBUS_SIGNAL_FLAGS_NONE, response_signal, &wait, nullptr);
+  RequestWait wait{g_main_loop_new(nullptr, FALSE), 2, nullptr, {}};
+  wait.path = "/org/freedesktop/portal/desktop/request/" + sender_path(p.bus) + "/" + handle_token;
+  guint sub = g_dbus_connection_signal_subscribe(p.bus, "org.freedesktop.portal.Desktop", "org.freedesktop.portal.Request", "Response", wait.path.c_str(), nullptr, G_DBUS_SIGNAL_FLAGS_NONE, response_signal, &wait, nullptr);
   GError *error = nullptr;
   GVariant *reply = g_dbus_connection_call_sync(p.bus, "org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop", "org.freedesktop.portal.ScreenCast", method, parameters, G_VARIANT_TYPE("(o)"), G_DBUS_CALL_FLAGS_NONE, 30000, nullptr, &error);
   if (!reply) { g_dbus_connection_signal_unsubscribe(p.bus, sub); g_main_loop_unref(wait.loop); std::string msg = error ? error->message : "portal call failed"; g_clear_error(&error); fail("ScreenCast " + std::string(method) + ": " + msg); }
   const char *actual = nullptr; g_variant_get(reply, "(&o)", &actual);
-  if (request_path != actual) {
+  if (wait.path != actual) {
     g_dbus_connection_signal_unsubscribe(p.bus, sub);
-    sub = g_dbus_connection_signal_subscribe(p.bus, "org.freedesktop.portal.Desktop", "org.freedesktop.portal.Request", "Response", actual, nullptr, G_DBUS_SIGNAL_FLAGS_NONE, response_signal, &wait, nullptr);
+    wait.path = actual;
+    sub = g_dbus_connection_signal_subscribe(p.bus, "org.freedesktop.portal.Desktop", "org.freedesktop.portal.Request", "Response", wait.path.c_str(), nullptr, G_DBUS_SIGNAL_FLAGS_NONE, response_signal, &wait, nullptr);
   }
   g_variant_unref(reply);
-  g_main_loop_run(wait.loop);
+  active_portal_wait = &wait;
+  if (running) g_main_loop_run(wait.loop);
+  active_portal_wait = nullptr;
   g_dbus_connection_signal_unsubscribe(p.bus, sub); g_main_loop_unref(wait.loop);
+  if (!running) {
+    g_dbus_connection_call(p.bus, "org.freedesktop.portal.Desktop", wait.path.c_str(), "org.freedesktop.portal.Request", "Close", nullptr, nullptr, G_DBUS_CALL_FLAGS_NONE, 1000, nullptr, nullptr, nullptr);
+    if (wait.results) g_variant_unref(wait.results);
+    return nullptr;
+  }
   if (wait.code != 0) { if (wait.results) g_variant_unref(wait.results); fail("screen capture permission was cancelled or denied"); }
   return wait.results;
 }
 void register_portal_app(GDBusConnection *bus) {
   GVariantBuilder options; g_variant_builder_init(&options, G_VARIANT_TYPE_VARDICT);
   GError *error = nullptr;
-  GVariant *reply = g_dbus_connection_call_sync(bus, "org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop", "org.freedesktop.host.portal.Registry", "Register", g_variant_new("(s@a{sv})", "org.nanoleaf.NanoleafSync", g_variant_builder_end(&options)), G_VARIANT_TYPE("()"), G_DBUS_CALL_FLAGS_NONE, 5000, nullptr, &error);
+  GVariant *reply = g_dbus_connection_call_sync(bus, "org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop", "org.freedesktop.host.portal.Registry", "Register", g_variant_new("(s@a{sv})", "io.github.avitretiak.Wayleaf4D", g_variant_builder_end(&options)), G_VARIANT_TYPE("()"), G_DBUS_CALL_FLAGS_NONE, 5000, nullptr, &error);
   if (!reply) { std::string message = error ? error->message : "portal app registration failed"; g_clear_error(&error); fail("register portal app identity: " + message); }
   g_variant_unref(reply);
 }
@@ -344,14 +445,19 @@ Portal start_portal(Config &cfg, bool persist_restore_token = true) {
   register_portal_app(p.bus);
   std::string token = "nl_" + std::to_string(getpid()) + "_" + std::to_string(g_random_int());
   GVariant *res = portal_request(p, "CreateSession", g_variant_new("(@a{sv})", request_options(token.c_str(), "session_handle_token", g_variant_new_string(token.c_str()))), token.c_str());
+  if (!res) return p;
   const char *session = nullptr;
   if (!g_variant_lookup(res, "session_handle", "&s", &session)) fail("portal did not return a session handle");
   p.session = session; g_variant_unref(res);
+  portal_closed = false;
+  portal_closed_subscription = g_dbus_connection_signal_subscribe(p.bus, "org.freedesktop.portal.Desktop", "org.freedesktop.portal.Session", "Closed", p.session.c_str(), nullptr, G_DBUS_SIGNAL_FLAGS_NONE, portal_closed_signal, nullptr, nullptr);
   token += "_select";
   res = portal_request(p, "SelectSources", g_variant_new("(o@a{sv})", p.session.c_str(), source_options(token.c_str(), cfg)), token.c_str());
+  if (!res) return p;
   g_variant_unref(res);
   token += "_start";
   res = portal_request(p, "Start", g_variant_new("(os@a{sv})", p.session.c_str(), "", request_options(token.c_str())), token.c_str());
+  if (!res) return p;
   const char *restore = nullptr;
   cfg.portal_restore_token = g_variant_lookup(res, "restore_token", "&s", &restore) ? restore : "";
   if (persist_restore_token) save_config(cfg);
@@ -374,6 +480,7 @@ Portal start_portal(Config &cfg, bool persist_restore_token = true) {
 }
 void close_portal(Portal &p) {
   if (!p.session.empty()) g_dbus_connection_call(p.bus, "org.freedesktop.portal.Desktop", p.session.c_str(), "org.freedesktop.portal.Session", "Close", nullptr, nullptr, G_DBUS_CALL_FLAGS_NONE, 1000, nullptr, nullptr, nullptr);
+  if (portal_closed_subscription) { g_dbus_connection_signal_unsubscribe(p.bus, portal_closed_subscription); portal_closed_subscription = 0; }
   if (p.fd >= 0) close(p.fd);
   if (p.bus) g_object_unref(p.bus);
 }
@@ -608,20 +715,50 @@ void make_packet(const std::vector<Zone> &zones, const std::vector<Color> &color
     packet[o+2]=uint8_t(std::clamp(std::lround(colors[i].r),0L,255L)); packet[o+3]=uint8_t(std::clamp(std::lround(colors[i].g),0L,255L)); packet[o+4]=uint8_t(std::clamp(std::lround(colors[i].b),0L,255L)); packet[o+5]=0; packet[o+6]=0; packet[o+7]=0;
   }
 }
-void send_packet(int fd, const Packet &packet, size_t panel_count) { size_t length=2+panel_count*8; ssize_t n=send(fd,packet.data(),length,0); if(n<0 || size_t(n)!=length) fail("Nanoleaf UDP send failed"); }
+void send_packet(int fd, const Packet &packet, size_t panel_count) {
+  size_t length = 2 + panel_count * 8;
+  ssize_t sent = send(fd, packet.data(), length, 0);
+  if (sent < 0) {
+    int error = errno;
+    std::string message = "Nanoleaf UDP send failed: " + std::string(std::strerror(error));
+    if (retryable_network_error(error)) fail_temporary(message);
+    fail(message);
+  }
+  if (static_cast<size_t>(sent) != length) fail("Nanoleaf UDP send returned a short frame");
+}
 int udp_socket(const std::string &host, int port) {
   addrinfo hints{}; hints.ai_family=AF_UNSPEC; hints.ai_socktype=SOCK_DGRAM; addrinfo *list=nullptr;
-  std::string service=std::to_string(port); int rc=getaddrinfo(host.c_str(),service.c_str(),&hints,&list);
-  if (rc) fail("resolve Nanoleaf UDP target: " + std::string(gai_strerror(rc)));
-  int fd=-1;
-  for (addrinfo *a=list;a;a=a->ai_next) { fd=socket(a->ai_family,a->ai_socktype,a->ai_protocol); if(fd>=0 && connect(fd,a->ai_addr,a->ai_addrlen)==0) break; if(fd>=0) close(fd); fd=-1; }
-  freeaddrinfo(list); if(fd<0) fail("cannot open Nanoleaf UDP socket"); return fd;
+  std::string service = std::to_string(port);
+  int rc = getaddrinfo(host.c_str(), service.c_str(), &hints, &list);
+  if (rc) {
+    int error = errno;
+    std::string message = "resolve Nanoleaf UDP target: " + std::string(gai_strerror(rc));
+    if (rc == EAI_AGAIN || (rc == EAI_SYSTEM && retryable_network_error(error))) fail_temporary(message);
+    fail(message);
+  }
+  int fd = -1, last_error = 0;
+  for (addrinfo *address = list; address; address = address->ai_next) {
+    int candidate = socket(address->ai_family, address->ai_socktype, address->ai_protocol);
+    if (candidate < 0) { last_error = errno; continue; }
+    if (connect(candidate, address->ai_addr, address->ai_addrlen) == 0) { fd = candidate; break; }
+    last_error = errno;
+    close(candidate);
+  }
+  freeaddrinfo(list);
+  if (fd < 0) {
+    std::string message = "cannot open Nanoleaf UDP socket: " + std::string(std::strerror(last_error));
+    if (retryable_network_error(last_error)) fail_temporary(message);
+    fail(message);
+  }
+  return fd;
 }
 
 struct Capture { Portal portal; GstElement *pipeline=nullptr, *rate=nullptr, *fps_caps=nullptr; GstAppSink *sink=nullptr; };
 Capture start_capture(Config &cfg, bool persist_restore_token = true) {
   Capture c; c.portal=start_portal(cfg,persist_restore_token);
-  int width=std::min(kSmallWidth,c.portal.width), height=std::max(1,int(std::lround(width*double(c.portal.height)/c.portal.width)));
+  if (!running || c.portal.bus == nullptr) return c;
+  int width=std::min(kSmallWidth,c.portal.width);
+  int height=std::max(1,int(std::lround(width*double(c.portal.height)/c.portal.width)));
   std::string desc="pipewiresrc fd="+std::to_string(c.portal.fd)+" path="+std::to_string(c.portal.node)+" do-timestamp=true ! videorate name=rate drop-only=true max-rate="+std::to_string(cfg.fps)+" ! capsfilter name=fps_caps caps=\"video/x-raw,framerate=(fraction)"+std::to_string(cfg.fps)+"/1\" ! videoconvert ! videoscale ! video/x-raw,format=RGBA,width="+std::to_string(width)+",height="+std::to_string(height)+" ! appsink name=frames max-buffers=1 drop=true sync=false";
   GError *error=nullptr; c.pipeline=gst_parse_launch(desc.c_str(),&error);
   if(!c.pipeline){ std::string msg=error?error->message:"failed to create GStreamer pipeline"; g_clear_error(&error); fail(msg); }
@@ -635,12 +772,34 @@ Capture start_capture(Config &cfg, bool persist_restore_token = true) {
   std::fprintf(stderr,"ScreenCast granted; sampling %dx%d at up to %d FPS\n",width,height,cfg.fps);
   return c;
 }
-void stop_capture(Capture &c) { if(c.pipeline){gst_element_set_state(c.pipeline,GST_STATE_NULL);gst_object_unref(c.sink);gst_object_unref(c.rate);gst_object_unref(c.fps_caps);gst_object_unref(c.pipeline);} close_portal(c.portal); }
+void stop_capture(Capture &c) { if(c.pipeline){gst_element_set_state(c.pipeline,GST_STATE_NULL);if(c.sink)gst_object_unref(c.sink);if(c.rate)gst_object_unref(c.rate);if(c.fps_caps)gst_object_unref(c.fps_caps);gst_object_unref(c.pipeline);} close_portal(c.portal); }
+bool capture_error(Capture &c) {
+  if (!c.pipeline) return false;
+  GstBus *bus = gst_element_get_bus(c.pipeline);
+  if (!bus) return false;
+  GstMessage *message = gst_bus_pop_filtered(bus, static_cast<GstMessageType>(GST_MESSAGE_EOS | GST_MESSAGE_ERROR));
+  gst_object_unref(bus);
+  if (!message) return false;
+  if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_ERROR) {
+    GError *error = nullptr; gchar *debug = nullptr;
+    gst_message_parse_error(message, &error, &debug);
+    std::fprintf(stderr, "GStreamer capture failed: %s\n", error ? error->message : "unknown error");
+    g_clear_error(&error); g_free(debug);
+  } else std::fprintf(stderr, "GStreamer capture ended\n");
+  gst_message_unref(message);
+  return true;
+}
 int capture_test(Config &cfg) {
-  std::signal(SIGINT,stop_signal); std::signal(SIGTERM,stop_signal);
+  guint sigint_source = g_unix_signal_add(SIGINT, signal_stop, nullptr), sigterm_source = g_unix_signal_add(SIGTERM, signal_stop, nullptr);
   Capture cap=start_capture(cfg); int64_t started=g_get_monotonic_time(); int frames=0, width=0, height=0;
+  if (!running || !cap.sink) { stop_capture(cap); g_source_remove(sigint_source); g_source_remove(sigterm_source); return 0; }
+  bool capture_failed = false;
   while(running && frames<30 && g_get_monotonic_time()-started<5000000) {
     GstSample *sample=gst_app_sink_try_pull_sample(cap.sink,GST_SECOND);
+    capture_failed = capture_error(cap);
+    while (g_main_context_iteration(nullptr, FALSE)) {}
+    if (!running) { if (sample) gst_sample_unref(sample); break; }
+    if (capture_failed) { if (sample) gst_sample_unref(sample); break; }
     if(!sample) continue;
     GstCaps *caps=gst_sample_get_caps(sample); GstVideoInfo info; gst_video_info_init(&info);
     GstBuffer *buffer=gst_sample_get_buffer(sample);
@@ -654,13 +813,17 @@ int capture_test(Config &cfg) {
     gst_sample_unref(sample);
   }
   int64_t elapsed=g_get_monotonic_time()-started; stop_capture(cap);
+  g_source_remove(sigint_source); g_source_remove(sigterm_source);
   std::printf("PipeWire capture: %d frames at %dx%d in %.2f s (%.1f FPS)\n",frames,width,height,elapsed/1e6,elapsed?frames*1e6/elapsed:0.0);
-  return frames>=30 ? 0 : 1;
+  return capture_failed ? 1 : frames>=30 ? 0 : 1;
 }
 int capture_debug(Config &cfg) {
-  std::signal(SIGINT,stop_signal); std::signal(SIGTERM,stop_signal);
+  guint sigint_source = g_unix_signal_add(SIGINT, signal_stop, nullptr), sigterm_source = g_unix_signal_add(SIGTERM, signal_stop, nullptr);
   auto panels=panel_layout(cfg); auto zones=make_zones(panels,cfg);
-  Capture cap=start_capture(cfg,false); Sampler sampler(zones,cfg); std::vector<Color> raw(zones.size());
+  Capture cap=start_capture(cfg,false);
+  if (!running || !cap.sink) { stop_capture(cap); g_source_remove(sigint_source); g_source_remove(sigterm_source); return 0; }
+  bool capture_failed = false;
+  Sampler sampler(zones,cfg); std::vector<Color> raw(zones.size());
   std::vector<double> pts_intervals, arrival_intervals; pts_intervals.reserve(600); arrival_intervals.reserve(600);
   constexpr int64_t duration_us=10000000;
   const double expected_ms=1000.0/cfg.fps;
@@ -672,7 +835,11 @@ int capture_debug(Config &cfg) {
   std::fprintf(stderr,"Recording 10 seconds of sampled colors/timing only; no desktop images are saved\n");
   while(running && g_get_monotonic_time()-started<duration_us) {
     GstSample *sample=gst_app_sink_try_pull_sample(cap.sink,100*GST_MSECOND);
+    capture_failed = capture_error(cap);
     int64_t arrival=g_get_monotonic_time();
+    while (g_main_context_iteration(nullptr, FALSE)) {}
+    if (!running) { if (sample) gst_sample_unref(sample); break; }
+    if (capture_failed) { if (sample) gst_sample_unref(sample); break; }
     if(!sample) continue;
     GstCaps *caps=gst_sample_get_caps(sample); GstVideoInfo info; gst_video_info_init(&info);
     GstBuffer *buffer=gst_sample_get_buffer(sample);
@@ -717,6 +884,7 @@ int capture_debug(Config &cfg) {
     gst_video_frame_unmap(&frame); gst_sample_unref(sample);
   }
   int64_t elapsed=g_get_monotonic_time()-started; stop_capture(cap);
+  g_source_remove(sigint_source); g_source_remove(sigterm_source);
   auto percentiles=[](std::vector<double> &v) {
     if(v.empty()) return std::pair<double,double>{0,0};
     std::sort(v.begin(),v.end());
@@ -726,7 +894,7 @@ int capture_debug(Config &cfg) {
   std::printf("# summary frames=%zu seconds=%.2f fps=%.1f pts_ms_median/p95=%.2f/%.2f arrival_ms_median/p95=%.2f/%.2f pts_gaps=%zu arrival_gaps=%zu pts_regressions=%zu scene_cuts=%zu active_rect_changes=%zu smooth=%.2f max_step=%d brightness=%.2f edge_depth=%d%% center_bleed=%d%% peak_mix=%d%% feather_depth=%d%%\n",
     frames,elapsed/1e6,elapsed?frames*1e6/elapsed:0.0,pts.first,pts.second,arrival.first,arrival.second,
     pts_gaps,arrival_gaps,pts_regressions,scene_cuts,active_changes,cfg.smooth,cfg.max_step,cfg.brightness,cfg.edge_depth,cfg.center_bleed,cfg.peak_mix,cfg.feather_depth);
-  return frames ? 0 : 1;
+  return capture_failed ? 1 : frames ? 0 : 1;
 }
 struct Control {
   Config &cfg;
@@ -739,13 +907,14 @@ struct Control {
   GDBusConnection *bus = nullptr;
   guint registration = 0;
 };
-constexpr const char *kBusName = "org.nanoleaf.NanoleafSync";
-constexpr const char *kObjectPath = "/org/nanoleaf/NanoleafSync";
+constexpr const char *kBusName = "io.github.avitretiak.Wayleaf4D";
+constexpr const char *kObjectPath = "/io/github/avitretiak/Wayleaf4D";
 const char *kDbusXml =
-  "<node><interface name='org.nanoleaf.NanoleafSync'>"
+  "<node><interface name='io.github.avitretiak.Wayleaf4D'>"
   "<method name='GetSettings'><arg type='a{sv}' direction='out'/></method>"
   "<method name='SetSettings'><arg type='a{sv}' direction='in'/></method>"
   "<method name='Stop'/>"
+  "<method name='GetStatus'><arg type='s' direction='out'/></method>"
   "</interface></node>";
 void add_settings(GVariantBuilder &b, const Config &c) {
   g_variant_builder_add(&b, "{sv}", "brightness", g_variant_new_double(c.brightness));
@@ -767,7 +936,7 @@ void add_settings(GVariantBuilder &b, const Config &c) {
 }
 void invalid_settings(GDBusMethodInvocation *invocation, const char *key) {
   std::string message = std::string("invalid or unsupported setting: ") + key;
-  g_dbus_method_invocation_return_dbus_error(invocation, "org.nanoleaf.NanoleafSync.InvalidSettings", message.c_str());
+  g_dbus_method_invocation_return_dbus_error(invocation, "io.github.avitretiak.Wayleaf4D.InvalidSettings", message.c_str());
 }
 void dbus_method_call(GDBusConnection *, const gchar *, const gchar *, const gchar *, const gchar *method,
                      GVariant *parameters, GDBusMethodInvocation *invocation, gpointer data) {
@@ -779,7 +948,12 @@ void dbus_method_call(GDBusConnection *, const gchar *, const gchar *, const gch
   }
   if (g_str_equal(method, "Stop")) {
     running = 0;
+    if (active_portal_wait) g_main_loop_quit(active_portal_wait->loop);
     g_dbus_method_invocation_return_value(invocation, g_variant_new("()"));
+    return;
+  }
+  if (g_str_equal(method, "GetStatus")) {
+    g_dbus_method_invocation_return_value(invocation, g_variant_new("(s)", lifecycle_status(!running, has_sent_udp)));
     return;
   }
   Config next = control.has_pending ? control.pending : control.cfg;
@@ -810,7 +984,7 @@ void dbus_method_call(GDBusConnection *, const gchar *, const gchar *, const gch
   }
   g_variant_unref(settings);
   if (valid) valid = next.center_bleed >= 0 && next.center_bleed <= 50 && next.peak_mix >= 0 && next.peak_mix <= 35 && next.feather_depth >= 0 && next.feather_depth <= 20;
-  if (valid) valid = next.fps >= 1 && next.fps <= 60 && next.edge_depth >= 5 && next.edge_depth <= 20 && next.smooth >= 0.05f && next.smooth <= 1 &&
+  if (valid) valid = next.fps >= 1 && next.fps <= kMaxFps && next.edge_depth >= 5 && next.edge_depth <= 20 && next.smooth >= 0.05f && next.smooth <= 1 &&
     std::isfinite(next.smooth) && next.black_threshold >= 0 && next.black_threshold <= 0.1f &&
     std::isfinite(next.black_threshold) && next.brightness >= 0 && next.brightness <= 2 &&
     std::isfinite(next.brightness) && next.saturation_boost >= 0 && next.saturation_boost <= 3 &&
@@ -828,15 +1002,16 @@ void claim_dbus_name(GDBusConnection *bus) {
       g_variant_new("(su)", kBusName, 4u), G_VARIANT_TYPE("(u)"), G_DBUS_CALL_FLAGS_NONE, 5000, nullptr, &error);
   if (!reply) { std::string message = error ? error->message : "cannot claim D-Bus name"; g_clear_error(&error); fail(message); }
   guint32 result; g_variant_get(reply, "(u)", &result); g_variant_unref(reply);
-  if (result != 1) fail("another Nanoleaf Sync worker already owns the D-Bus service");
+  if (result != 1) fail("another Wayleaf 4D worker already owns the D-Bus service");
 }
 void apply_pending(Control &control) {
   if (!control.has_pending) return;
   Config next = std::move(control.pending); control.has_pending = false;
+  next.portal_restore_token = control.cfg.portal_restore_token;
   int old_fps = control.cfg.fps;
   auto zones = make_zones(control.panels, next);
   control.sampler.remap(zones); control.zones = std::move(zones); control.cfg = std::move(next);
-  if (control.cfg.fps != old_fps) {
+  if (control.capture.rate && control.capture.fps_caps && control.cfg.fps != old_fps) {
     g_object_set(control.capture.rate, "max-rate", control.cfg.fps, nullptr);
     GstCaps *caps = gst_caps_new_simple("video/x-raw", "framerate", GST_TYPE_FRACTION, control.cfg.fps, 1, nullptr);
     g_object_set(control.capture.fps_caps, "caps", caps, nullptr); gst_caps_unref(caps);
@@ -850,8 +1025,13 @@ void unregister_control(Control &control, GDBusNodeInfo *introspection) {
       g_variant_new("(s)", kBusName), G_VARIANT_TYPE("(u)"), G_DBUS_CALL_FLAGS_NONE, 2000, nullptr, nullptr);
   g_dbus_node_info_unref(introspection); g_object_unref(control.bus);
 }
-void run(Config &cfg) {
-  std::signal(SIGINT,stop_signal); std::signal(SIGTERM,stop_signal);
+int run(Config &cfg) {
+  running = 1;
+  has_sent_udp = false;
+  portal_closed = false;
+  std::signal(SIGINT, SIG_DFL); std::signal(SIGTERM, SIG_DFL);
+  guint sigint_source = g_unix_signal_add(SIGINT, signal_stop, nullptr);
+  guint sigterm_source = g_unix_signal_add(SIGTERM, signal_stop, nullptr);
   GError *error=nullptr; GDBusConnection *bus=g_bus_get_sync(G_BUS_TYPE_SESSION,nullptr,&error);
   if(!bus){std::string message=error?error->message:"session bus unavailable";g_clear_error(&error);fail(message);}
   auto panels=panel_layout(cfg); auto zones=make_zones(panels,cfg); Capture cap; Sampler sampler(zones,cfg);
@@ -862,16 +1042,24 @@ void run(Config &cfg) {
   if(!control.registration){std::string message=error?error->message:"cannot export D-Bus interface";g_clear_error(&error);fail(message);}
   claim_dbus_name(bus);
   cap=start_capture(cfg);
-  if(!running){stop_capture(cap);unregister_control(control,introspection);return;}
+  if(!running || !cap.sink) {
+    apply_pending(control);
+    stop_capture(cap); unregister_control(control,introspection);
+    g_source_remove(sigint_source); g_source_remove(sigterm_source); return 0;
+  }
   int port=enable_stream(cfg); int out=udp_socket(cfg.host,port);
   int64_t interval=1000000/cfg.fps,next=0;
   std::fprintf(stderr,"Streaming %zu Nanoleaf 4D segments to %s:%d; Ctrl-C or D-Bus Stop to stop\n",zones.size(),cfg.host.c_str(),port);
   Packet packet;
+  bool capture_failed = false;
   while(running){
-    GstSample *sample=gst_app_sink_try_pull_sample(cap.sink,100*GST_MSECOND);
-    while(g_main_context_iteration(nullptr,FALSE)) {}
+    GstSample *sample=cap.sink ? gst_app_sink_try_pull_sample(cap.sink,100*GST_MSECOND) : nullptr;
+    while (g_main_context_iteration(nullptr, FALSE)) {}
+    capture_failed = capture_error(cap);
+    if (capture_failed) running=0;
     int old_fps=cfg.fps; apply_pending(control);
     if(cfg.fps!=old_fps){interval=1000000/cfg.fps;next=0;}
+    if(!running) { if(sample) gst_sample_unref(sample); continue; }
     if(!sample) continue;
     int64_t now=g_get_monotonic_time(); if(now<next){gst_sample_unref(sample);continue;} next=now+interval;
     GstCaps *caps=gst_sample_get_caps(sample); GstVideoInfo info; gst_video_info_init(&info);
@@ -881,14 +1069,54 @@ void run(Config &cfg) {
     auto *data=static_cast<const uint8_t *>(GST_VIDEO_FRAME_PLANE_DATA(&frame,0));
     bool cut=false; const auto &colors=sampler.sample(data,GST_VIDEO_FRAME_PLANE_STRIDE(&frame,0),GST_VIDEO_FRAME_WIDTH(&frame),GST_VIDEO_FRAME_HEIGHT(&frame),&cut);
     gst_video_frame_unmap(&frame); gst_sample_unref(sample);
-    make_packet(zones,colors,packet); send_packet(out,packet,zones.size());
+    make_packet(zones,colors,packet); send_packet(out,packet,zones.size()); has_sent_udp = true;
   }
+  apply_pending(control);
   stop_capture(cap); close(out); unregister_control(control,introspection);
+  g_source_remove(sigint_source); g_source_remove(sigterm_source);
+  return capture_exit_status(capture_failed, portal_closed);
 }
 
 void self_test() {
+  assert(retryable_network_error(ENETUNREACH) && retryable_network_error(ETIMEDOUT));
+  assert(!retryable_network_error(EINVAL));
+  assert(retryable_curl_error(CURLE_COULDNT_CONNECT) && retryable_curl_error(CURLE_OPERATION_TIMEDOUT));
+  assert(!retryable_curl_error(CURLE_URL_MALFORMAT));
+  assert(retryable_http_status(429) && retryable_http_status(503));
+  assert(!retryable_http_status(401) && !retryable_http_status(404));
+  assert(capture_exit_status(true, false) == EX_TEMPFAIL);
+  assert(capture_exit_status(true, true) == 0 && capture_exit_status(false, false) == 0);
+  const std::string info = safe_device_info_json(R"({"name":"Nanoleaf 4D","model":"NL69","auth_token":"secret","state":{}})");
+  assert(info.find("Nanoleaf 4D") != std::string::npos && info.find("NL69") != std::string::npos);
+  assert(info.find("auth_token") == std::string::npos && info.find("secret") == std::string::npos && info.find("state") == std::string::npos);
+  char path[] = "/tmp/nanoleaf-sync-self-test-XXXXXX";
+  int fd = g_mkstemp(path); assert(fd >= 0); close(fd); g_unlink(path);
+  Config saved; saved.config_path = path; saved.host = "127.0.0.1"; saved.token = "test-token"; saved.fps = 30;
+  saved.portal_restore_token = "restore-token"; saved.brightness = 0.73f; save_config(saved);
+  Config loaded; loaded.config_path = path; load_config(loaded); g_unlink(path);
+  assert(loaded.host == saved.host && loaded.token == saved.token);
+  assert(loaded.portal_restore_token == saved.portal_restore_token && std::abs(loaded.brightness - 0.73f) < 0.001f && loaded.fps == kMaxFps);
   Config defaults;
-  assert(defaults.brightness==1.5f && defaults.saturation_boost==1.5f && defaults.fps==30 && defaults.smooth==0.35f && defaults.black_threshold==0.01f && defaults.max_step==12);
+  assert(defaults.brightness==1.5f && defaults.saturation_boost==1.5f && defaults.fps==10 && defaults.smooth==0.35f && defaults.black_threshold==0.01f && defaults.max_step==12);
+  running = 1;
+  guint stop_source = g_idle_add(signal_stop, nullptr);
+  assert(stop_source);
+  g_main_context_iteration(nullptr, FALSE);
+  assert(!running);
+  g_source_remove(stop_source);
+  running = 1;
+  std::vector<PanelPosition> idle_panels;
+  std::vector<Zone> idle_zones;
+  Sampler idle_sampler(idle_zones, loaded);
+  Capture idle_capture;
+  Control idle_control{loaded, idle_panels, idle_zones, idle_sampler, idle_capture, {}, false, nullptr, 0};
+  apply_pending(idle_control);
+  assert(loaded.config_path == path && loaded.host == saved.host);
+  char arg_program[] = "self-test", arg_fps[] = "--fps", arg_upper_bound[] = "10", arg_device_info_option[] = "--device-info";
+  char *args[] = {arg_program, arg_fps, arg_upper_bound, arg_device_info_option};
+  bool arg_self_test = false, arg_capture_test = false, arg_capture_debug = false, arg_pair = false, arg_device_info = false;
+  const Config parsed = arguments(4, args, &arg_self_test, &arg_capture_test, &arg_capture_debug, &arg_pair, &arg_device_info, defaults);
+  assert(parsed.fps == kMaxFps && arg_device_info);
   assert(defaults.edge_depth==8 && defaults.center_bleed==0 && defaults.peak_mix==15 && defaults.feather_depth==5);
   assert(defaults.corner=="bottom-center" && defaults.offset==0 && !defaults.reverse && defaults.letterbox && !defaults.midtone_lift && !defaults.strict_black);
   Config c; c.smooth=1; c.max_step=255; c.black_threshold=0.02f;
@@ -962,12 +1190,13 @@ int main(int argc,char **argv){
   Config initial; initial.config_path = std::string(g_get_user_config_dir()) + "/nanoleaf-sync/config.json";
   bool self_test_arg = false;
   for (int i = 1; i < argc; ++i) {
+    if (std::string(argv[i]) == "--version") { std::printf("Wayleaf 4D %s\n", kVersion); return 0; }
     if (std::string(argv[i]) == "--self-test") self_test_arg = true;
     if (std::string(argv[i]) == "--config" && i + 1 < argc) initial.config_path = argv[i + 1];
   }
   if (!self_test_arg) load_config(initial);
-  bool test=false, capture_only=false, capture_debug_arg=false, pair=false;
-  Config c=arguments(argc,argv,&test,&capture_only,&capture_debug_arg,&pair,initial);
+  bool test=false, capture_only=false, capture_debug_arg=false, pair=false, device_info_arg=false;
+  Config c=arguments(argc,argv,&test,&capture_only,&capture_debug_arg,&pair,&device_info_arg,initial);
   if(test){self_test();return 0;}
   gst_init(&argc,&argv);
   if(capture_only) return capture_test(c);
@@ -977,10 +1206,15 @@ int main(int argc,char **argv){
     int result=capture_debug(c); curl_global_cleanup(); return result;
   }
   if(curl_global_init(CURL_GLOBAL_DEFAULT)!=CURLE_OK) fail("libcurl initialization failed");
+  if(device_info_arg) {
+    if(c.host.empty() || c.token.empty()) fail("config or --ip and --token are required for --device-info");
+    std::puts(safe_device_info_json(http(c, "", "GET").body).c_str());
+    curl_global_cleanup(); return 0;
+  }
   if(pair) {
     if(c.host.empty()) { usage(argv[0]); fail("--ip is required to pair"); }
     pair_device(c); curl_global_cleanup(); return 0;
   }
   if(c.host.empty() || c.token.empty()) { usage(argv[0]); fail("config or --ip and --token are required"); }
-  run(c); curl_global_cleanup(); return 0;
+  int result=run(c); curl_global_cleanup(); return result;
 }

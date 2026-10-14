@@ -1,0 +1,22 @@
+{
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "Avi Tretiak"
+            }
+        ],
+        "BugReportUrl": "https://github.com/avitretiak/wayleaf-4d/issues",
+        "Category": "Hardware",
+        "Description": "Mirror screen-edge colors to Nanoleaf 4D",
+        "EnabledByDefault": true,
+        "Icon": "/ambient-light.svg",
+        "Id": "io.github.avitretiak.Wayleaf4D",
+        "License": "GPL-3.0-or-later",
+        "Name": "Wayleaf 4D",
+        "Version": "0.1.0-beta"
+    },
+    "KPackageStructure": "Plasma/Applet",
+    "X-Plasma-API-Minimum-Version": "6.0",
+ "X-Plasma-NotificationArea": "true",
+ "X-Plasma-NotificationAreaCategory": "Hardware"
+}
