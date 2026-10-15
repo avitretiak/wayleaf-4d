@@ -273,6 +273,140 @@ pub fn make_zones(panels: &[PanelPosition], cfg: &Config) -> Result<Vec<Zone>> {
 
     Ok(zones)
 }
+pub fn zones_for_mode(mode: &str, physical: &[Zone], edge_depth: i32) -> Result<Vec<Zone>> {
+    let border = edge_depth as f32 / 100.0;
+    match mode {
+        "1D" => Ok(Vec::new()),
+        "2D" => Ok(vec![Zone {
+            id: 0,
+            x0: 0.0,
+            x1: 1.0,
+            y0: 0.0,
+            y1: 1.0,
+        }]),
+        "3D" => {
+            let mut zones = Vec::with_capacity(10);
+            for i in 0..3 {
+                zones.push(Zone {
+                    id: zones.len() as u16,
+                    x0: i as f32 / 3.0,
+                    x1: (i + 1) as f32 / 3.0,
+                    y0: 0.0,
+                    y1: border,
+                });
+            }
+            for i in 0..2 {
+                zones.push(Zone {
+                    id: zones.len() as u16,
+                    x0: 1.0 - border,
+                    x1: 1.0,
+                    y0: i as f32 / 2.0,
+                    y1: (i + 1) as f32 / 2.0,
+                });
+            }
+            for i in 0..3 {
+                zones.push(Zone {
+                    id: zones.len() as u16,
+                    x0: i as f32 / 3.0,
+                    x1: (i + 1) as f32 / 3.0,
+                    y0: 1.0 - border,
+                    y1: 1.0,
+                });
+            }
+            for i in 0..2 {
+                zones.push(Zone {
+                    id: zones.len() as u16,
+                    x0: 0.0,
+                    x1: border,
+                    y0: i as f32 / 2.0,
+                    y1: (i + 1) as f32 / 2.0,
+                });
+            }
+            Ok(zones)
+        }
+        "4D" => Ok(physical.to_vec()),
+        _ => Err(AppError::new("unsupported sampling mode")),
+    }
+}
+
+pub fn colors_for_mode(
+    mode: &str,
+    physical: &[Zone],
+    sample_zones: &[Zone],
+    sampled: &[Color],
+    static_color: &str,
+    brightness: f32,
+    output: &mut Vec<Color>,
+) -> Result<()> {
+    if sample_zones.len() != sampled.len() {
+        return Err(AppError::new("invalid mode sampling dimensions"));
+    }
+    output.resize(physical.len(), Color::default());
+    match mode {
+        "1D" => {
+            let hex = static_color
+                .strip_prefix('#')
+                .filter(|hex| hex.len() == 6 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                .ok_or_else(|| AppError::new("invalid static color"))?;
+            let channel = |start| {
+                u8::from_str_radix(&hex[start..start + 2], 16)
+                    .map(f32::from)
+                    .map_err(|_| AppError::new("invalid static color"))
+            };
+            output.fill(Color {
+                r: (channel(0)? * brightness).clamp(0.0, 255.0),
+                g: (channel(2)? * brightness).clamp(0.0, 255.0),
+                b: (channel(4)? * brightness).clamp(0.0, 255.0),
+            });
+        }
+        "2D" if sampled.len() == 1 => output.fill(sampled[0]),
+        "2D" => return Err(AppError::new("2D mode requires one sampled color")),
+        "3D" if sampled.len() == 10 => {
+            for (color, zone) in output.iter_mut().zip(physical) {
+                let center = ((zone.x0 + zone.x1) * 0.5, (zone.y0 + zone.y1) * 0.5);
+                let closest = sample_zones
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| {
+                        let distance = |zone: &Zone| {
+                            let x = (zone.x0 + zone.x1) * 0.5 - center.0;
+                            let y = (zone.y0 + zone.y1) * 0.5 - center.1;
+                            x * x + y * y
+                        };
+                        distance(a).total_cmp(&distance(b))
+                    })
+                    .map(|(index, _)| index)
+                    .unwrap_or(0);
+                *color = sampled[closest];
+            }
+        }
+        "3D" => return Err(AppError::new("3D mode requires ten sampled colors")),
+        "4D" if physical.len() == sampled.len() => output.copy_from_slice(sampled),
+        "4D" => return Err(AppError::new("4D mode requires one color per panel")),
+        _ => return Err(AppError::new("unsupported sampling mode")),
+    }
+    Ok(())
+}
+
+pub fn preview_zones_for_mode(
+    mode: &str,
+    physical: &[Zone],
+    sample_zones: &[Zone],
+) -> Result<Vec<Zone>> {
+    match mode {
+        "1D" | "2D" => physical
+            .first()
+            .cloned()
+            .map(|zone| vec![zone])
+            .ok_or_else(|| AppError::new("no physical zones for mode preview")),
+        "3D" if sample_zones.len() == 10 && !physical.is_empty() => Ok(sample_zones.to_vec()),
+        "3D" => Err(AppError::new(
+            "3D preview requires ten zones and physical panels",
+        )),
+        "4D" => Ok(physical.to_vec()),
+        _ => Err(AppError::new("unsupported preview mode")),
+    }
+}
 
 #[inline]
 fn pixel(data: &[u8], stride: usize, x: usize, y: usize) -> Color {
@@ -533,6 +667,32 @@ impl Sampler {
         cfg: &Config,
         elapsed: Duration,
     ) -> Result<&[Color]> {
+        self.sample_inner(data, stride, width, height, cfg, elapsed, true, true)
+    }
+
+    pub fn sample_full_screen(
+        &mut self,
+        data: &[u8],
+        stride: usize,
+        width: usize,
+        height: usize,
+        cfg: &Config,
+        elapsed: Duration,
+    ) -> Result<&[Color]> {
+        self.sample_inner(data, stride, width, height, cfg, elapsed, false, false)
+    }
+
+    fn sample_inner(
+        &mut self,
+        data: &[u8],
+        stride: usize,
+        width: usize,
+        height: usize,
+        cfg: &Config,
+        elapsed: Duration,
+        use_letterbox: bool,
+        use_max_step: bool,
+    ) -> Result<&[Color]> {
         let row_bytes = width
             .checked_mul(4)
             .ok_or_else(|| AppError::new("capture dimensions overflow"))?;
@@ -547,7 +707,7 @@ impl Sampler {
         {
             return Err(AppError::new("invalid capture buffer dimensions or stride"));
         }
-        if cfg.letterbox {
+        if use_letterbox && cfg.letterbox {
             if self.frames == 0
                 || !self.letterbox_enabled
                 || self.frames.wrapping_add(1).is_multiple_of(15)
@@ -621,7 +781,11 @@ impl Sampler {
         } else {
             1.0 - (1.0 - cfg.smooth).powf(elapsed * 30.0)
         };
-        let step = cfg.max_step as f32 * elapsed * 30.0;
+        let step = if use_max_step {
+            cfg.max_step as f32 * elapsed * 30.0
+        } else {
+            255.0
+        };
         let peak_mix = cfg.peak_mix as f32 / 100.0;
         let center_bleed = cfg.center_bleed as f32 / 100.0;
         let sat_boost = cfg.saturation_boost;
@@ -802,9 +966,205 @@ pub fn self_test() -> Result<()> {
     {
         return Err(AppError::new("sampler 40-panel geometry self-test failed"));
     }
+    let edge_zones = zones_for_mode("3D", &[], cfg.edge_depth)?;
+    if edge_zones.len() != 10
+        || edge_zones[0].y0 != 0.0
+        || edge_zones[3].x0 != 1.0 - cfg.edge_depth as f32 / 100.0
+        || edge_zones[5].y0 != 1.0 - cfg.edge_depth as f32 / 100.0
+        || edge_zones[8].x0 != 0.0
+    {
+        return Err(AppError::new("3D edge-zone geometry self-test failed"));
+    }
+    let physical_zones: Vec<_> = edge_zones
+        .iter()
+        .enumerate()
+        .map(|(index, zone)| Zone {
+            id: index as u16 + 100,
+            ..zone.clone()
+        })
+        .collect();
+    let edge_colors: Vec<_> = (0..10)
+        .map(|index| Color {
+            r: index as f32 * 20.0,
+            g: index as f32 * 10.0,
+            b: 255.0 - index as f32 * 10.0,
+        })
+        .collect();
+    let mut mode_colors = Vec::new();
+    colors_for_mode(
+        "3D",
+        &physical_zones,
+        &edge_zones,
+        &edge_colors,
+        "#ffffff",
+        1.0,
+        &mut mode_colors,
+    )?;
+    let preview_3d = preview_zones_for_mode("3D", &physical_zones, &edge_zones)?;
+    if mode_colors != edge_colors || preview_3d != edge_zones {
+        return Err(AppError::new(
+            "3D preview geometry or physical panel mapping self-test failed",
+        ));
+    }
+    let mapped_panels = [
+        Zone {
+            id: 211,
+            x0: 0.0,
+            x1: 0.1,
+            y0: 0.0,
+            y1: 0.08,
+        },
+        Zone {
+            id: 34,
+            x0: 0.9,
+            x1: 1.0,
+            y0: 0.0,
+            y1: 0.08,
+        },
+        Zone {
+            id: 12,
+            x0: 0.92,
+            x1: 1.0,
+            y0: 0.72,
+            y1: 0.8,
+        },
+        Zone {
+            id: 3,
+            x0: 0.0,
+            x1: 0.08,
+            y0: 0.72,
+            y1: 0.8,
+        },
+    ];
+    let mut mapped_colors = Vec::new();
+    colors_for_mode(
+        "3D",
+        &mapped_panels,
+        &edge_zones,
+        &edge_colors,
+        "#ffffff",
+        1.0,
+        &mut mapped_colors,
+    )?;
+    if mapped_colors
+        != vec![
+            edge_colors[0],
+            edge_colors[2],
+            edge_colors[4],
+            edge_colors[9],
+        ]
+    {
+        return Err(AppError::new("3D panel-to-edge mapping self-test failed"));
+    }
+    colors_for_mode(
+        "1D",
+        &physical_zones,
+        &[],
+        &[],
+        "#01a2FF",
+        2.0,
+        &mut mode_colors,
+    )?;
+    let static_color = Color {
+        r: 2.0,
+        g: 255.0,
+        b: 255.0,
+    };
+    let preview_1d = preview_zones_for_mode("1D", &physical_zones, &[])?;
+    if mode_colors.len() != physical_zones.len()
+        || mode_colors.iter().any(|color| *color != static_color)
+        || preview_1d.len() != 1
+        || !physical_zones
+            .iter()
+            .any(|zone| zone.id == preview_1d[0].id)
+    {
+        return Err(AppError::new("1D static color output self-test failed"));
+    }
+    let full_zone = zones_for_mode("2D", &physical_zones, cfg.edge_depth)?;
+    let dominant = Color {
+        r: 21.0,
+        g: 42.0,
+        b: 84.0,
+    };
+    colors_for_mode(
+        "2D",
+        &physical_zones,
+        &full_zone,
+        &[dominant],
+        "#ffffff",
+        1.0,
+        &mut mode_colors,
+    )?;
+    let preview_2d = preview_zones_for_mode("2D", &physical_zones, &full_zone)?;
+    if mode_colors.len() != physical_zones.len()
+        || mode_colors.iter().any(|color| *color != dominant)
+        || preview_2d.len() != 1
+    {
+        return Err(AppError::new("2D uniform output self-test failed"));
+    }
+    colors_for_mode(
+        "4D",
+        &physical_zones,
+        &physical_zones,
+        &edge_colors,
+        "#ffffff",
+        1.0,
+        &mut mode_colors,
+    )?;
+    if mode_colors != edge_colors
+        || preview_zones_for_mode("4D", &physical_zones, &physical_zones)? != physical_zones
+    {
+        return Err(AppError::new("4D sampling preservation self-test failed"));
+    }
     let w = 32usize;
     let h = 24usize;
     let stride = w * 4 + 8;
+    let mut screen_config = cfg.clone();
+    screen_config.letterbox = true;
+    screen_config.smooth = 1.0;
+    screen_config.max_step = 255;
+    let mut screen_frame = vec![0u8; stride * h];
+    for y in 6..18 {
+        for x in 0..w {
+            let pixel = y * stride + x * 4;
+            screen_frame[pixel..pixel + 3].copy_from_slice(&[200, 0, 0]);
+        }
+    }
+    let mut full_sampler = Sampler::new(full_zone.clone());
+    let full = full_sampler.sample_full_screen(
+        &screen_frame,
+        stride,
+        w,
+        h,
+        &screen_config,
+        Duration::from_millis(34),
+    )?[0];
+    let mut low_step_config = screen_config.clone();
+    low_step_config.max_step = 1;
+    let mut low_step_sampler = Sampler::new(full_zone.clone());
+    let low_step = low_step_sampler.sample_full_screen(
+        &screen_frame,
+        stride,
+        w,
+        h,
+        &low_step_config,
+        Duration::from_millis(34),
+    )?[0];
+    if full != low_step {
+        return Err(AppError::new("2D applied hidden max-step filtering"));
+    }
+    let mut cropped_sampler = Sampler::new(full_zone);
+    let cropped = cropped_sampler.sample(
+        &screen_frame,
+        stride,
+        w,
+        h,
+        &screen_config,
+        Duration::from_millis(34),
+    )?[0];
+    if full.r <= 0.0 || full.r >= cropped.r * 0.75 {
+        return Err(AppError::new("2D full-screen sampling self-test failed"));
+    }
     let mut frame = vec![0u8; stride * h];
     for y in 0..h {
         for x in 0..w {

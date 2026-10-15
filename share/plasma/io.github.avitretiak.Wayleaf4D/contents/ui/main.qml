@@ -11,11 +11,12 @@ PlasmoidItem {
     property alias syncBackend: backend
 
     toolTipMainText: "Wayleaf 4D"
-    toolTipSubText: backend.status === "error" || backend.error.length > 0 ? "Screen synchronization needs attention"
-        : backend.status === "stopping" ? "Screen synchronization is stopping"
-            : backend.status === "starting" ? "Screen synchronization is starting"
-                : backend.running ? "Screen synchronization is on"
-                    : "Screen synchronization is stopped"
+    toolTipSubText: backend.error.length > 0 || backend.status === "error" ? "Error · " + (backend.error || "Synchronization needs attention")
+        : backend.status === "stopping" ? "Stopping synchronization"
+            : backend.status === "starting" ? "Starting synchronization"
+                : backend.running && backend.settings.mode === "1D" ? "1D · On · " + backend.settings.static_color
+                    : backend.running ? backend.settings.mode + " · Syncing · " + Number(backend.settings.fps) + " Hz · " + backend.selectedMonitor
+                        : (backend.settings.mode || "4D") + " · Stopped"
     Plasmoid.status: PlasmaCore.Types.ActiveStatus
 
     compactRepresentation: Item {
@@ -23,7 +24,7 @@ PlasmoidItem {
         implicitWidth: Kirigami.Units.iconSizes.small
         implicitHeight: Kirigami.Units.iconSizes.small
         Accessible.role: Accessible.Button
-        Accessible.name: "Wayleaf 4D"
+        Accessible.name: "Wayleaf 4D, " + (root.syncBackend.settings.mode || "4D") + " mode"
         Accessible.description: root.toolTipSubText
         activeFocusOnTab: true
         Keys.onReturnPressed: root.expanded = !root.expanded
@@ -38,6 +39,18 @@ PlasmoidItem {
                 anchors.fill: parent
                 source: Qt.resolvedUrl("../ambient-light.svg")
                 isMask: false
+            }
+            Rectangle {
+                visible: root.syncBackend.running && root.syncBackend.settings.mode === "1D"
+                width: 7
+                height: 7
+                radius: width / 2
+                anchors.right: parent.right
+                anchors.top: parent.top
+                color: root.syncBackend.settings.static_color || "#ffffff"
+                border.width: 1
+                border.color: Kirigami.Theme.backgroundColor
+                Accessible.ignored: true
             }
             Rectangle {
                 width: 10

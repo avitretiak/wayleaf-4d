@@ -17,8 +17,10 @@ pub struct Config {
     pub token: String,
     pub config_path: PathBuf,
     pub monitor: String,
-    pub port: i32,
+    pub mode: String,
+    pub static_color: String,
     pub fps: i32,
+    pub port: i32,
     pub max_step: i32,
     pub edge_depth: i32,
     pub center_bleed: i32,
@@ -45,8 +47,10 @@ impl Default for Config {
             token: String::new(),
             config_path: config_dir.join("nanoleaf-sync/config.json"),
             monitor: String::new(),
-            port: 60222,
+            mode: "4D".into(),
+            static_color: "#ffffff".into(),
             fps: MAX_FPS,
+            port: 60222,
             max_step: 12,
             edge_depth: 8,
             center_bleed: 0,
@@ -78,7 +82,9 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.port < 1
+        if !matches!(self.mode.as_str(), "1D" | "2D" | "3D" | "4D")
+            || !valid_static_color(&self.static_color)
+            || self.port < 1
             || self.port > 65_535
             || !(1..=MAX_FPS).contains(&self.fps)
             || !(1..=255).contains(&self.max_step)
@@ -149,6 +155,8 @@ impl Config {
     pub fn settings_json(&self) -> Value {
         json!({
             "monitor": self.monitor,
+            "mode": self.mode,
+            "static_color": self.static_color,
             "fps": self.fps,
             "max_step": self.max_step,
             "edge_depth": self.edge_depth,
@@ -173,6 +181,8 @@ impl Config {
         for (key, value) in settings {
             match key.as_str() {
                 "monitor" => next.monitor = json_string(value, key)?,
+                "mode" => next.mode = json_string(value, key)?,
+                "static_color" => next.static_color = json_string(value, key)?,
                 "fps" => next.fps = json_i32(value, key)?,
                 "max_step" => next.max_step = json_i32(value, key)?,
                 "edge_depth" => next.edge_depth = json_i32(value, key)?,
@@ -279,6 +289,11 @@ fn in_range(value: f32, min: f32, max: f32) -> bool {
     value.is_finite() && value >= min && value <= max
 }
 
+fn valid_static_color(value: &str) -> bool {
+    value.len() == 7
+        && value.starts_with('#')
+        && value[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
+}
 fn read_root(path: &Path) -> Result<Option<Value>> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
@@ -318,6 +333,12 @@ fn load_values(config: &mut Config, root: &Value) -> Result<()> {
     }
     if let Some(value) = object.get("monitor") {
         config.monitor = json_string(value, "monitor")?;
+    }
+    if let Some(value) = object.get("mode") {
+        config.mode = json_string(value, "mode")?;
+    }
+    if let Some(value) = object.get("static_color") {
+        config.static_color = json_string(value, "static_color")?;
     }
     if let Some(value) = object.get("port") {
         config.port = json_i32(value, "port")?;
@@ -489,7 +510,9 @@ pub fn self_test() -> Result<()> {
             br#"{"ip":"127.0.0.1","token":"test-token","portal_restore_token":"retained","future":{"enabled":true},"corner":"bottom-right","offset":26,"reverse":true,"fps":30}"#,
         )?;
         let mut config = Config::load(&path)?;
-        if config.fps != MAX_FPS
+        if config.mode != "4D"
+            || config.static_color != "#ffffff"
+            || config.fps != MAX_FPS
             || ["corner", "offset", "reverse"]
                 .iter()
                 .any(|key| config.settings_json().get(key).is_some())
@@ -499,6 +522,13 @@ pub fn self_test() -> Result<()> {
             ));
         }
         let before = config.settings_json();
+        for invalid in [json!({"mode":"5D"}), json!({"static_color":"red"})] {
+            if config.apply_settings(&invalid).is_ok() || config.settings_json() != before {
+                return Err(AppError::new(
+                    "self-test mode or static color validation failed",
+                ));
+            }
+        }
         if config
             .apply_settings(&json!({"monitor":"DP-3","brightness":0.8,"peak_mix":36}))
             .is_ok()
@@ -508,7 +538,12 @@ pub fn self_test() -> Result<()> {
                 "self-test settings update was not transactional",
             ));
         }
-        config.apply_settings(&json!({"monitor":"DP-3","brightness":0.8}))?;
+        config.apply_settings(&json!({
+            "monitor": "DP-3",
+            "brightness": 0.8,
+            "mode": "3D",
+            "static_color": "#01A2fF",
+        }))?;
         config.save()?;
         let reloaded = Config::load(&path)?;
         if reloaded.settings_json() != config.settings_json()

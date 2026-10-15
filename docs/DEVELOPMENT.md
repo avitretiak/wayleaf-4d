@@ -10,19 +10,20 @@ flowchart LR
     Control -->|session D-Bus| Worker
     Control -->|system D-Bus mDNS browse| Avahi[optional Avahi service]
     Config[Shared config] --> Control
-    Config --> Worker
+    Config -->|mode, static_color, shared settings| Worker
     Device[Nanoleaf 4D API layout] -->|panel IDs and layout| Worker
+    Worker -->|1D static color to all panel IDs| Device
     Helper[Installed GSR KMS helper] -->|KMS planes via private socket| Capture[EGL/GLES render to small RGBA frame]
-    Capture --> Sample[Edge-zone sampling and color processing]
+    Capture --> Sample[2D dominant color / 3D coarse zones / 4D per-panel sampling]
     Sample -->|RGB values| Worker
     Worker -->|extControl v2 RGB UDP| Device
 ```
 
-The Rust control process never captures. The worker uses the installed GPU Screen Recorder KMS helper (GSR 6.1.4) for direct KMS scanout; EGL/OpenGL ES on GBM composes supported planes and reduces them before CPU sampling. The helper has its package-managed `CAP_SYS_ADMIN` capability; the worker and control process remain unprivileged. There is no portal, PipeWire, GStreamer, consent prompt, or KDE Screen Casting indicator. This intentionally trades the portal's per-session consent/visible capture indicator for direct capture: the helper can access scanout without that prompt, so users must turn synchronization on deliberately.
+The Rust control process never captures. The worker only requests the installed GPU Screen Recorder KMS helper (GSR 6.1.4) in capture modes 2D–4D; 1D sends its configured static color directly to the controller without creating or using screen capture. For capture modes, EGL/OpenGL ES on GBM composes supported planes and reduces them before CPU sampling. The helper has its package-managed `CAP_SYS_ADMIN` capability; the worker and control process remain unprivileged. There is no portal, PipeWire, GStreamer, consent prompt, or KDE Screen Casting indicator. This intentionally trades the portal's per-session consent/visible capture indicator for direct capture: the helper can access scanout without that prompt, so users must turn synchronization on deliberately.
 
 The capture shader converts top-origin KMS source coordinates to the imported texture's Y convention after applying plane rotation. `glReadPixels` rows are then flipped once into top-down RGBA for sampling.
 
-The worker discovers panel IDs and layout from the controller. The 34-segment path uses the controller's `positionData`; the 40-segment NL69 path uses calibrated perimeter geometry and dedicated corner zones; other supported counts use the generic mapping. It preserves controller panel IDs without applying a corner, offset, or reverse-order remapping.
+Mode selects the worker's color-to-panel path while preserving discovered controller IDs: 1D sends `static_color` to every panel ID; 2D samples one dominant color from the full display and repeats it for all IDs; 3D samples 10 coarse edge zones (3 top, 2 right, 3 bottom, 2 left) and maps each to the closest matching physical panel zone; 4D retains the full per-panel edge sampling and layout behavior. In 4D, the 34-segment path uses controller `positionData`; the 40-segment NL69 path uses calibrated perimeter geometry and dedicated corner zones; other supported counts use the generic mapping. No corner, offset, or reverse-order remapping is applied.
 
 ## Source map
 
@@ -41,6 +42,8 @@ The worker discovers panel IDs and layout from the controller. The 34-segment pa
 | `docs/USAGE.md` | End-user setup, operation, settings, diagnostics, and removal. |
 
 QML uses Plasma's native asynchronous session-D-Bus interface; there is no C++/Qt plugin build. `make` builds the Rust binary as `build/wayleaf-4d`. `make install-user` installs it with the QML applet, D-Bus activation file, and worker unit. A Plasma reload may be needed after QML changes; this is separate from the worker and does not require restarting `wayleaf-4d.service`.
+
+The popup keeps the header, sync switch, mode selector, and brightness pinned above its mode-specific content. 1D presents static-color swatches and no monitor or fine-tuning controls; 2D–4D present the relevant Look presets and a collapsible Fine tune section. Its edge glow is a live mode-appropriate preview; monitor selection is in the footer for capture modes, alongside device identity. Preview updates are limited to 10 Hz and are published only while the popup is expanded. Keep these controls on the existing QML/D-Bus settings path and use Plasma/Kirigami-native components; do not introduce a parallel protocol or build dependency.
 
 The Plasma `DBusMessage` constructor takes `interface` in its map, even though its QML property is named `iface`.
 
@@ -85,4 +88,4 @@ Before publishing a release, verify a Plasma 6 session, helper/GPU capture, and 
 
 ## Shared-setting contract
 
-The worker `Config`, the QML backend defaults and normalizer, the visible controls, and the settings table in `docs/USAGE.md` describe one shared JSON schema. When changing a setting, update all of them together and keep ranges/defaults aligned. Live changes cross the session D-Bus interface; the worker merges accepted setting keys into the latest config file rather than replacing controller credentials or unrelated settings.
+The worker `Config`, the QML backend defaults and normalizer, the visible controls, and the settings table in `docs/USAGE.md` describe one shared JSON schema, including `mode` (`1D`, `2D`, `3D`, `4D`) and validated `static_color` (`#RRGGBB`). Defaults are `4D` and `#ffffff`; both values persist through config and the existing settings/D-Bus path. When changing a setting, update all of them together and keep ranges/defaults aligned. Live changes cross the session D-Bus interface; the worker merges accepted setting keys into the latest config file rather than replacing controller credentials or unrelated settings.

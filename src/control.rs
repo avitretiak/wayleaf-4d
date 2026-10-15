@@ -1138,11 +1138,11 @@ fn value_to_owned(key: &str, value: &Value) -> std::result::Result<OwnedValue, S
         "letterbox" | "midtone_lift" | "strict_black" => {
             value.as_bool().map(OwnedValue::from).ok_or_else(invalid)
         }
-        "monitor" => value
+        "monitor" | "mode" | "static_color" => value
             .as_str()
             .map(|value| OwnedValue::from(Str::from(value)))
             .ok_or_else(invalid),
-        _ => Err("unknown setting key".into()),
+        _ => Err(invalid()),
     }
 }
 
@@ -1337,6 +1337,17 @@ pub fn self_test() -> Result<()> {
     {
         return Err(AppError::new(
             "control discovery deduplication self-test failed",
+        ));
+    }
+    let mode_settings = json!({"mode":"3D","static_color":"#01A2fF"});
+    let forwarded = settings_to_dbus(&mode_settings)
+        .map_err(|error| AppError::new(format!("control settings self-test: {error}")))?;
+    if owned_settings_json(forwarded)
+        .map_err(|error| AppError::new(format!("control settings self-test: {error}")))?
+        != mode_settings
+    {
+        return Err(AppError::new(
+            "control D-Bus mode settings self-test failed",
         ));
     }
     let config = Config {

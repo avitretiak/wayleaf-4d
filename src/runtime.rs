@@ -3,7 +3,9 @@ use crate::device::{
     connect_udp, enable_stream, encode_packet, panel_layout, restore_effect, selected_effect,
     send_packet,
 };
-use crate::sampling::{make_zones, Sampler, Zone};
+use crate::sampling::{
+    colors_for_mode, make_zones, preview_zones_for_mode, zones_for_mode, Color, Sampler, Zone,
+};
 use crate::{AppError, Config, Result};
 use serde::Serialize;
 use serde_json::{Map, Number, Value};
@@ -302,7 +304,7 @@ fn settings_to_dbus(settings: &Value) -> WorkerResult<HashMap<String, OwnedValue
                     WorkerError::Failed("worker setting has an invalid boolean".to_owned())
                 })?)
             }
-            "monitor" => OwnedValue::try_from(DbusValue::from(
+            "monitor" | "mode" | "static_color" => OwnedValue::try_from(DbusValue::from(
                 value
                     .as_str()
                     .ok_or_else(|| {
@@ -333,7 +335,9 @@ fn settings_from_dbus(settings: HashMap<String, OwnedValue>) -> WorkerResult<Map
             "letterbox" | "midtone_lift" | "strict_black" => {
                 Value::from(bool::try_from(value).map_err(|_| invalid())?)
             }
-            "monitor" => Value::String(String::try_from(value).map_err(|_| invalid())?),
+            "monitor" | "mode" | "static_color" => {
+                Value::String(String::try_from(value).map_err(|_| invalid())?)
+            }
             _ => return Err(invalid()),
         };
         result.insert(key, json);
@@ -377,6 +381,47 @@ fn register_signals(stop: Arc<AtomicBool>) -> Result<()> {
     Ok(())
 }
 
+fn mode_requires_capture(mode: &str) -> bool {
+    mode != "1D"
+}
+
+fn capture_for_mode(config: &Config) -> Result<Option<Capture>> {
+    if mode_requires_capture(&config.mode) {
+        Capture::new(&config.monitor).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+fn mode_sampler_config(config: &Config) -> Config {
+    let mut sampling = config.clone();
+    match config.mode.as_str() {
+        "2D" => {
+            sampling.letterbox = false;
+            sampling.center_bleed = 0;
+            sampling.peak_mix = 0;
+            sampling.feather_depth = 0;
+            sampling.black_threshold = 0.0;
+            sampling.midtone_lift = false;
+            sampling.strict_black = false;
+        }
+        "3D" => {
+            sampling.letterbox = false;
+            sampling.center_bleed = 0;
+            sampling.feather_depth = 0;
+            sampling.black_threshold = 0.0;
+            sampling.midtone_lift = false;
+            sampling.strict_black = false;
+        }
+        _ => {}
+    }
+    sampling
+}
+
+fn stream_frame_interval(mode: &str, fps: i32) -> Duration {
+    frame_interval(if mode == "1D" { 10 } else { fps })
+}
+
 pub fn run(mut config: Config) -> Result<()> {
     config.validate()?;
     if config.host.is_empty() || config.token.is_empty() {
@@ -397,8 +442,12 @@ pub fn run(mut config: Config) -> Result<()> {
         return Ok(());
     }
     let mut zones = make_zones(&panels, &config)?;
-    let mut sampler = Sampler::new(zones.clone());
-    let mut capture = Capture::new(&config.monitor)?;
+    let mut sample_zones = zones_for_mode(&config.mode, &zones, config.edge_depth)?;
+    let mut preview_zones = preview_zones_for_mode(&config.mode, &zones, &sample_zones)?;
+    let mut sampler_config = mode_sampler_config(&config);
+    let mut sampler = Sampler::new(sample_zones.clone());
+    let mut mode_colors = vec![Color::default(); zones.len()];
+    let mut capture = capture_for_mode(&config)?;
     if shared.is_stopping() {
         return Ok(());
     }
@@ -422,12 +471,13 @@ pub fn run(mut config: Config) -> Result<()> {
         let socket = connect_udp(&config.host, port)?;
         let mut packet = [0_u8; 322];
         let mut revision = 0;
-        let mut interval = frame_interval(config.fps);
+        let mut interval = stream_frame_interval(&config.mode, config.fps);
         let mut next_frame = Instant::now();
         let mut previous_frame = None;
         eprintln!(
-            "Streaming {} Nanoleaf 4D segments to {}:{}",
+            "Streaming {} Nanoleaf panels in {} mode to {}:{}",
             zones.len(),
+            config.mode,
             config.host,
             port
         );
@@ -438,10 +488,14 @@ pub fn run(mut config: Config) -> Result<()> {
                 &panels,
                 &mut config,
                 &mut zones,
+                &mut sample_zones,
+                &mut preview_zones,
+                &mut sampler_config,
                 &mut sampler,
+                &mut capture,
                 &mut revision,
             )? {
-                interval = frame_interval(config.fps);
+                interval = stream_frame_interval(&config.mode, config.fps);
                 next_frame = Instant::now();
             }
             if !shared.wait_until(revision, next_frame) {
@@ -455,38 +509,83 @@ pub fn run(mut config: Config) -> Result<()> {
                 &panels,
                 &mut config,
                 &mut zones,
+                &mut sample_zones,
+                &mut preview_zones,
+                &mut sampler_config,
                 &mut sampler,
+                &mut capture,
                 &mut revision,
             )? {
-                interval = frame_interval(config.fps);
+                interval = stream_frame_interval(&config.mode, config.fps);
                 next_frame = Instant::now();
                 continue;
             }
 
-            let frame = capture.frame()?;
-            let sampled_at = Instant::now();
-            if shared.is_stopping() {
-                break;
-            }
-            let elapsed = previous_frame
-                .map(|previous: Instant| sampled_at.saturating_duration_since(previous))
-                .unwrap_or_else(|| Duration::from_secs_f64(1.0 / 30.0));
-            let colors = sampler.sample(
-                frame.data,
-                frame.stride,
-                frame.width,
-                frame.height,
-                &config,
-                elapsed,
-            )?;
-            shared.update_preview(&zones, colors);
+            let (colors, preview_colors): (&[Color], &[Color]) = if config.mode == "1D" {
+                colors_for_mode(
+                    &config.mode,
+                    &zones,
+                    &sample_zones,
+                    &[],
+                    &config.static_color,
+                    config.brightness,
+                    &mut mode_colors,
+                )?;
+                (&mode_colors, &mode_colors[..1])
+            } else {
+                let capture = capture
+                    .as_mut()
+                    .ok_or_else(|| AppError::new("capture missing for screen-sampling mode"))?;
+                let frame = capture.frame()?;
+                let sampled_at = Instant::now();
+                if shared.is_stopping() {
+                    break;
+                }
+                let elapsed = previous_frame
+                    .map(|previous: Instant| sampled_at.saturating_duration_since(previous))
+                    .unwrap_or_else(|| Duration::from_secs_f64(1.0 / 30.0));
+                let sampled = if config.mode == "2D" {
+                    sampler.sample_full_screen(
+                        frame.data,
+                        frame.stride,
+                        frame.width,
+                        frame.height,
+                        &sampler_config,
+                        elapsed,
+                    )?
+                } else {
+                    sampler.sample(
+                        frame.data,
+                        frame.stride,
+                        frame.width,
+                        frame.height,
+                        &sampler_config,
+                        elapsed,
+                    )?
+                };
+                previous_frame = Some(sampled_at);
+                if config.mode == "4D" {
+                    (sampled, sampled)
+                } else {
+                    colors_for_mode(
+                        &config.mode,
+                        &zones,
+                        &sample_zones,
+                        sampled,
+                        &config.static_color,
+                        config.brightness,
+                        &mut mode_colors,
+                    )?;
+                    (&mode_colors, sampled)
+                }
+            };
+            shared.update_preview(&preview_zones, preview_colors);
             let packet_len = encode_packet(&zones, colors, &mut packet)?;
             if shared.is_stopping() {
                 break;
             }
             send_packet(&socket, &packet[..packet_len])?;
             shared.sent.store(true, Ordering::Release);
-            previous_frame = Some(sampled_at);
             next_frame = next_deadline(next_frame, Instant::now(), interval);
         }
 
@@ -496,7 +595,11 @@ pub fn run(mut config: Config) -> Result<()> {
             &panels,
             &mut config,
             &mut zones,
+            &mut sample_zones,
+            &mut preview_zones,
+            &mut sampler_config,
             &mut sampler,
+            &mut capture,
             &mut revision,
         )?;
         Ok(())
@@ -521,15 +624,33 @@ fn refresh_config(
     panels: &[crate::sampling::PanelPosition],
     config: &mut Config,
     zones: &mut Vec<Zone>,
+    sample_zones: &mut Vec<Zone>,
+    preview_zones: &mut Vec<Zone>,
+    sampler_config: &mut Config,
     sampler: &mut Sampler,
+    capture: &mut Option<Capture>,
     revision: &mut u64,
 ) -> Result<bool> {
     let Some((next_revision, next_config)) = shared.updated_config(*revision) else {
         return Ok(false);
     };
     let next_zones = make_zones(panels, &next_config)?;
-    sampler.remap(next_zones.clone());
+    let next_sample_zones = zones_for_mode(&next_config.mode, &next_zones, next_config.edge_depth)?;
+    let next_preview_zones =
+        preview_zones_for_mode(&next_config.mode, &next_zones, &next_sample_zones)?;
+    let next_sampler_config = mode_sampler_config(&next_config);
+    if mode_requires_capture(&next_config.mode) {
+        if capture.is_none() {
+            *capture = capture_for_mode(&next_config)?;
+        }
+    } else {
+        *capture = None;
+    }
+    sampler.remap(next_sample_zones.clone());
     *zones = next_zones;
+    *sample_zones = next_sample_zones;
+    *preview_zones = next_preview_zones;
+    *sampler_config = next_sampler_config;
     *config = next_config;
     *revision = next_revision;
     Ok(true)
@@ -769,6 +890,87 @@ fn percentile_for_test(values: &[f64]) -> (f64, f64) {
 }
 
 pub fn self_test() -> Result<()> {
+    let static_mode = Config {
+        mode: "1D".into(),
+        ..Config::default()
+    };
+    if capture_for_mode(&static_mode)?.is_some()
+        || ["2D", "3D", "4D"]
+            .iter()
+            .any(|mode| !mode_requires_capture(mode))
+    {
+        return Err(AppError::new(
+            "runtime self-test: mode capture selection failed",
+        ));
+    }
+    let default = Config::default();
+    if stream_frame_interval("1D", 1) != Duration::from_millis(100)
+        || stream_frame_interval("3D", 4) != Duration::from_millis(250)
+        || mode_sampler_config(&default).settings_json() != default.settings_json()
+    {
+        return Err(AppError::new(
+            "runtime self-test: mode sampling controls changed",
+        ));
+    }
+    let two_d = mode_sampler_config(&Config {
+        mode: "2D".into(),
+        max_step: 1,
+        letterbox: true,
+        center_bleed: 20,
+        peak_mix: 25,
+        feather_depth: 10,
+        black_threshold: 0.05,
+        midtone_lift: true,
+        strict_black: true,
+        ..default.clone()
+    });
+    if two_d.max_step != 1
+        || two_d.letterbox
+        || two_d.center_bleed != 0
+        || two_d.peak_mix != 0
+        || two_d.feather_depth != 0
+        || two_d.black_threshold != 0.0
+        || two_d.midtone_lift
+        || two_d.strict_black
+        || two_d.brightness != default.brightness
+        || two_d.saturation_boost != default.saturation_boost
+        || two_d.smooth != default.smooth
+    {
+        return Err(AppError::new(
+            "runtime self-test: 2D exposed controls changed",
+        ));
+    }
+    let three_d_input = Config {
+        mode: "3D".into(),
+        edge_depth: 14,
+        max_step: 37,
+        peak_mix: 29,
+        letterbox: true,
+        center_bleed: 20,
+        feather_depth: 10,
+        black_threshold: 0.05,
+        midtone_lift: true,
+        strict_black: true,
+        ..default.clone()
+    };
+    let three_d = mode_sampler_config(&three_d_input);
+    if three_d.edge_depth != 14
+        || three_d.max_step != 37
+        || three_d.peak_mix != 29
+        || three_d.letterbox
+        || three_d.center_bleed != 0
+        || three_d.feather_depth != 0
+        || three_d.black_threshold != 0.0
+        || three_d.midtone_lift
+        || three_d.strict_black
+        || three_d.brightness != three_d_input.brightness
+        || three_d.saturation_boost != three_d_input.saturation_boost
+        || three_d.smooth != three_d_input.smooth
+    {
+        return Err(AppError::new(
+            "runtime self-test: 3D exposed controls changed",
+        ));
+    }
     let base = Instant::now();
     let interval = Duration::from_millis(100);
     let deadline = base + interval;
@@ -905,13 +1107,31 @@ fn settings_transaction_self_test() -> Result<()> {
         shared: shared.clone(),
     };
 
+    let mode = OwnedValue::try_from(DbusValue::from("2D".to_owned()))
+        .map_err(|_| AppError::new("runtime self-test: cannot create D-Bus mode value"))?;
+    let static_color = OwnedValue::try_from(DbusValue::from("#40a0ff".to_owned()))
+        .map_err(|_| AppError::new("runtime self-test: cannot create D-Bus color value"))?;
     let valid = HashMap::from([
         ("brightness".to_owned(), OwnedValue::from(0.73_f64)),
         ("smooth".to_owned(), OwnedValue::from(0.62_f64)),
+        ("mode".to_owned(), mode),
+        ("static_color".to_owned(), static_color),
     ]);
     interface
         .set_settings(valid)
         .map_err(|error| AppError::new(format!("runtime self-test: {error:?}")))?;
+    let returned = interface
+        .get_settings()
+        .map_err(|error| AppError::new(format!("runtime self-test: {error:?}")))?;
+    let returned = settings_from_dbus(returned)
+        .map_err(|error| AppError::new(format!("runtime self-test: {error:?}")))?;
+    if returned.get("mode") != Some(&Value::String("2D".into()))
+        || returned.get("static_color") != Some(&Value::String("#40a0ff".into()))
+    {
+        return Err(AppError::new(
+            "runtime self-test: mode settings D-Bus round trip failed",
+        ));
+    }
     let invalid = HashMap::from([
         ("brightness".to_owned(), OwnedValue::from(0.1_f64)),
         ("fps".to_owned(), OwnedValue::from(0_i32)),
@@ -968,6 +1188,8 @@ fn settings_transaction_self_test() -> Result<()> {
     if (saved.brightness - 0.73).abs() > f32::EPSILON
         || (saved.smooth - 0.62).abs() > f32::EPSILON
         || saved.fps != Config::default().fps
+        || saved.mode != "2D"
+        || saved.static_color != "#40a0ff"
     {
         return Err(AppError::new(
             "runtime self-test: settings transaction was lost or partially committed",

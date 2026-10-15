@@ -1,6 +1,6 @@
 # Wayleaf 4D User Guide
 
-Wayleaf 4D captures a selected display through direct KMS using the installed GPU Screen Recorder (GSR) KMS helper (version 6.1.4), samples reduced frames locally, and sends per-segment RGB values to a Nanoleaf 4D controller using extControl v2. It does not save screen images.
+Wayleaf 4D sends lighting to the controller in one of four modes: 1D static color, 2D one dominant color sampled from the full screen, 3D colors sampled from 10 coarse edge zones, or 4D per-panel edge mirroring. Screen capture is used only by 2D–4D. Captured frames are sampled locally; Wayleaf does not save screen images.
 
 ## Requirements
 
@@ -22,9 +22,9 @@ make install-user
 
 Open **Wayleaf 4D** from the System Tray or add the widget to a panel with Plasma's **Add Widgets**. Pair through **Pair a Nanoleaf 4D**: discover it through Avahi or enter its IPv4 address. Enable **Settings → Connect to API** in the Nanoleaf app or hold the 4D power button for 5 seconds, then pair within 30 seconds.
 
-The status dot is green while the worker reports `running`, red on an error, and muted otherwise. The Start/Stop switch controls the current sync session; **Start at login** is independent in the More options menu. Worker errors appear in the error banner. Since extControl uses one-way UDP, green means the worker successfully sent a frame locally; it does not confirm receipt by the panels.
+The header status identifies the active state; while running, 1D shows **On** and the selected color name, while 2D–4D show **Syncing**, the rate, and monitor. Errors appear in the header. The Start/Stop switch controls the current sync session; **Start at login** is independent in the overflow menu. Since extControl uses one-way UDP, a running status means the worker sent a frame locally; it does not confirm receipt by the panels.
 
-When unpaired, use **Pair a Nanoleaf 4D** to search the local network or enter a manual IPv4 address. Device details and **Disconnect** are in **More options**. Disconnect removes the saved address and token from this computer; it does not revoke controller authorization.
+When unpaired, use **Pair a Nanoleaf 4D** to search the local network or enter a manual IPv4 address. Device details and **Disconnect** are in the overflow menu. Disconnect removes the saved address and token from this computer; it does not revoke controller authorization.
 
 Terminal pairing is also available:
 
@@ -34,9 +34,13 @@ wayleaf-4d --pair --ip 192.0.2.10
 
 Replace `192.0.2.10` with the controller's address.
 
-After pairing, choose a capture monitor; the selection applies immediately. Use the Start/Stop switch to begin or end synchronization. **More options → About capture** explains that direct KMS capture bypasses portal consent and KDE's Screen Casting indicator; screen images are not saved. The package-managed GSR helper can access scanout without that prompt, so start sync only when you intend to send sampled display colors to the Nanoleaf.
-When the widget popup is open while sync is running, the LED-zone preview shows the sampled colors and controller IDs at up to 10 updates per second. Closing the popup disables preview updates; it does not stop synchronization.
-**HDR capture:** KMS planes with supported metadata use PQ (ST 2084) or HLG conversion and Rec.2020-to-Rec.709 tone mapping before producing the 8-bit RGB stream sent to the 4D. This is HDR-aware capture, not HDR output to the panels. Missing HDR metadata is treated as SDR; malformed or unsupported HDR metadata stops capture with an error rather than silently using SDR. Actual color accuracy depends on the monitor, driver, and KMS metadata.
+Select a mode in the popup's segmented control. The mode takes effect immediately and is saved in the shared settings. In **1D**, choose a color swatch or use the custom-color picker; the worker sends that static color to every discovered controller panel ID and does not create or use a screen-capture worker. The monitor picker is replaced by **No screen capture needed**. Brightness applies in every mode.
+
+**2D** samples one dominant color from the full selected screen and repeats it for every panel ID. **3D** samples 10 coarse zones around the screen (3 top, 2 right, 3 bottom, 2 left), then maps each zone color to the closest matching physical panel zone. **4D** retains the full per-panel edge sampling behavior, including the controller's panel IDs and layout mapping. The monitor picker applies immediately in 2D–4D.
+
+While the popup is open, its edge glow preview displays the current output colors and panel/zone arrangement for the selected mode; when synchronization is off, it is neutral. Preview updates are limited to at most 10 per second and stop while the popup is closed; closing it does not stop synchronization. The preview is drawn inside the popup and does not extend beyond its window.
+
+**Capture and privacy:** Direct KMS capture in 2D–4D bypasses portal consent and KDE's Screen Casting indicator. The package-managed GSR helper can access scanout without that prompt, so start sync only when you intend to send sampled display colors to the Nanoleaf. Frames are reduced and sampled in memory; screen images are not saved. 1D does not capture the screen. **HDR capture:** KMS planes with supported metadata use PQ (ST 2084) or HLG conversion and Rec.2020-to-Rec.709 tone mapping before producing the 8-bit RGB stream sent to the 4D. This is HDR-aware capture, not HDR output to the panels. Missing HDR metadata is treated as SDR; malformed or unsupported HDR metadata stops capture with an error rather than silently using SDR. Actual color accuracy depends on the monitor, driver, and KMS metadata.
 
 ## Start, stop, and login behavior
 
@@ -60,39 +64,43 @@ systemctl --user is-enabled wayleaf-4d.service
 The last command reports whether the service is configured to start at login.
 
 
-## Controls and defaults
+## Modes, controls, and defaults
 
-The main popup keeps the sync switch and **Brightness** visible. Brightness is shown as 0–100% of the available output range (50% is neutral; the default 1.5× setting appears as 75%). The **Main** tab contains the live preview, presets, monitor selection, pairing, and device actions. The **Fine tune** tab contains the remaining sampling and color controls in a scrollable panel. Use the reset icon beside each slider value to restore its default; click a value to enter it exactly. Keyboard arrows adjust the focused slider, Shift+wheel adjusts a slider, and normal wheel scrolling moves through the list.
+The popup keeps the sync switch, mode selector, brightness, and status visible. **1D** shows the static-color swatches and custom-color picker; it does not show screen-capture or fine-tuning controls. **2D**, **3D**, and **4D** show the Look control (Subtle, Balanced, Vivid, Custom) and a collapsible **Fine tune** section. The section contains 3 settings in 2D, 6 in 3D, and 12 in 4D; only settings relevant to the selected mode are shown. Brightness is always available. The monitor picker appears in 2D–4D and applies immediately.
 
-**Subtle**, **Balanced**, and **Vivid** adjust only saturation, response, maximum step, edge depth, center blend, brightest-pixel blend, and capture/send rate. Balanced matches those settings' existing defaults. Fine-tuning one of them selects **Custom**; its last custom values are saved in the applet configuration and restored by **Custom**. Other controls and existing settings remain unchanged when choosing a preset.
+The live edge glow is the preview: it shows the current color across the output in 1D and 2D, the 10 coarse zones in 3D, or the device's full panel zones in 4D. It updates only while the popup is open, at up to 10 updates per second. The **Start/Stop** switch controls output in every mode; off stops synchronization and best-effort turns the lights off. **Start at login** is independent and lives in the overflow menu.
 
-| Control | Config key | Range | Default | Effect |
-|---|---|---:|---:|---|
-| Brightness | `brightness` | 0–2 (displayed 0–100%) | 1.5 (displayed 75%) | Scales final LED brightness; 1.0 is neutral. |
-| Saturation boost | `saturation_boost` | 0–3 | 1.5 | Emphasizes saturated pixels. |
-| Response | `smooth` | 0.05–1 | 0.35 | Higher values follow changes faster; lower values smooth more but add lag. |
-| Capture/send rate | `fps` | 1–10 Hz | 10 Hz | Requested frame rate; the implementation caps it at 10 Hz. |
-| Maximum step | `max_step` | 1–255 | 12 | Caps each frame's color change; smaller steps respond more slowly. |
-| Edge sample depth | `edge_depth` | 5–20% | 8% | Distance inward from the screen edge sampled by each zone. |
-| Center color blend | `center_bleed` | 0–50% | 0% | Mixes the central picture's average RGB into each segment. |
-| Brightest-pixel blend | `peak_mix` | 0–35% | 15% | Mixes the zone's brightest-luma pixel; reduce it if tiny highlights dominate. |
-| Inward feather depth | `feather_depth` | 0–20% | 5% | Extends edge zones inward with weights tapering to zero; 0 disables feathering. |
-| Black threshold | `black_threshold` | 0–0.1 | 0.01 | Suppresses near-black capture noise. |
-| Letterbox detection | `letterbox` | On/off | On | Detects black bars and samples the active picture. |
-| Midtone lift | `midtone_lift` | On/off | Off | Optional legacy lift for dim and midtone content. |
-| Strict black | `strict_black` | On/off | Off | Sends exact black immediately instead of smoothing dark transitions. |
+**Subtle**, **Balanced**, and **Vivid** adjust shared color-response and sampling settings; Balanced matches the default values. The presets do not change mode, brightness, monitor, or toggles. Editing a preset-controlled setting selects **Custom**; the custom values are saved and restored when Custom is selected. Other settings remain unchanged when choosing a preset. Fine-tune settings are shared across modes and persist even when hidden in the current mode.
 
-Center blend, brightest-pixel blend, and feather depth can be set in the widget, config file, or CLI flags `--center-bleed`, `--peak-mix`, and `--feather-depth`.
+| Control | Config key | Range | Default | Applies to | Effect |
+|---|---|---:|---:|---|---|
+| Mode | `mode` | `1D`, `2D`, `3D`, `4D` | `4D` | All | Selects static color, full-screen dominant color, 10 coarse edge zones, or per-panel edge mirroring. |
+| Static color | `static_color` | `#RRGGBB` | `#ffffff` | 1D | Color sent to every discovered panel ID without screen capture. |
+| Brightness | `brightness` | 0–2 (displayed 0–100%) | 1.5 (displayed 75%) | All | Scales final LED brightness; 1.0 is neutral. |
+| Saturation boost | `saturation_boost` | 0–3 | 1.5 | 2D–4D | Emphasizes saturated sampled pixels. |
+| Response | `smooth` | 0.05–1 | 0.35 | 2D–4D | Higher values follow changes faster; lower values smooth more but add lag. |
+| Capture/send rate | `fps` | 1–10 Hz | 10 Hz | 2D–4D | Requested frame rate; the implementation caps it at 10 Hz. |
+| Maximum step | `max_step` | 1–255 | 12 | 3D–4D | Caps each frame's color change; smaller steps respond more slowly. |
+| Edge sample depth | `edge_depth` | 5–20% | 8% | 3D–4D | Distance inward from the screen edge sampled by each zone. |
+| Center color blend | `center_bleed` | 0–50% | 0% | 4D | Mixes the central picture's average RGB into each panel segment. |
+| Brightest-pixel blend | `peak_mix` | 0–35% | 15% | 3D–4D | Mixes each sampled zone's brightest-luma pixel; reduce it if tiny highlights dominate. |
+| Inward feather depth | `feather_depth` | 0–20% | 5% | 4D | Extends edge zones inward with weights tapering to zero; 0 disables feathering. |
+| Black threshold | `black_threshold` | 0–0.1 | 0.01 | 4D | Suppresses near-black capture noise. |
+| Letterbox detection | `letterbox` | On/off | On | 4D | Detects black bars and samples the active picture. |
+| Midtone lift | `midtone_lift` | On/off | Off | 4D | Optional lift for dim and midtone content. |
+| Strict black | `strict_black` | On/off | Off | 4D | Sends exact black immediately instead of smoothing dark transitions. |
+
+Center blend, brightest-pixel blend, and feather depth are also available through config or CLI flags `--center-bleed`, `--peak-mix`, and `--feather-depth`.
 
 ## Configuration and security
 
-The worker, widget, and CLI share `$XDG_CONFIG_HOME/nanoleaf-sync/config.json` (normally `~/.config/nanoleaf-sync/config.json`). Absolute `XDG_CONFIG_HOME` values are used; absent or relative values fall back to `~/.config`. The file contains the controller IP, API token, and settings. New settings use the documented defaults when older config files omit them. Settings saves discard obsolete `corner`, `offset`, and `reverse` keys while preserving unrelated JSON values, including a legacy portal restore-token key if one exists; that token is not used for capture. New writes use owner-only read/write permissions (mode `0600`); if an existing credential file is more permissive, the widget warns without silently changing its permissions. Do not publish it, paste it into support requests, or commit it.
+The worker, widget, and CLI share `$XDG_CONFIG_HOME/nanoleaf-sync/config.json` (normally `~/.config/nanoleaf-sync/config.json`). Absolute `XDG_CONFIG_HOME` values are used; absent or relative values fall back to `~/.config`. The file contains the controller IP, API token, and settings, including the selected `mode` (`1D`, `2D`, `3D`, or `4D`) and validated `static_color` (`#RRGGBB`). Their defaults are `4D` and `#ffffff`; both are saved and restored with the other settings. Settings omitted by older config files use documented defaults. Settings saves discard obsolete `corner`, `offset`, and `reverse` keys while preserving unrelated JSON values, including a legacy portal restore-token key if one exists; that token is not used for capture. New writes use owner-only read/write permissions (mode `0600`); if an existing credential file is more permissive, the widget warns without silently changing its permissions. Do not publish it, paste it into support requests, or commit it.
 
 The Nanoleaf LAN API uses HTTP on port 16021, and the extControl stream uses UDP on the controller-reported port (60222 is the fallback). Keep the controller and host on a trusted local network; do not expose these services to the Internet. The token is sent to the controller as part of the local API request.
 
 The widget's **Disconnect** action removes only `ip` and `token`; settings and other JSON keys remain unchanged. If sync is active, the action stops it and best-effort powers off the Nanoleaf first. A power-off failure is shown as a warning, but does not prevent local credential removal. Disconnect does not revoke the token on the controller. Revoke API access through the Nanoleaf controller/app if required.
 
-The helper can access the selected display's KMS scanout without a portal grant, consent dialog, or KDE Screen Casting indicator. Only the separately installed, package-managed GSR helper carries `CAP_SYS_ADMIN`; the worker/control process is not elevated and Wayleaf does not change capabilities. Frames are reduced and sampled in memory; only segment colors are sent to the controller, and no screen images are saved. `--capture-debug` prints sampled RGB values, which may disclose screen content in terminal logs; review that text before sharing it.
+In 2D–4D, the helper can access the selected display's KMS scanout without a portal grant, consent dialog, or KDE Screen Casting indicator. Only the separately installed, package-managed GSR helper carries `CAP_SYS_ADMIN`; the worker/control process is not elevated and Wayleaf does not change capabilities. Frames are reduced and sampled in memory; only segment colors are sent to the controller, and no screen images are saved. 1D sends the configured static color and does not capture. `--capture-debug` prints sampled RGB values, which may disclose screen content in terminal logs; review that text before sharing it.
 
 ## CLI and diagnostics
 
@@ -132,11 +140,16 @@ If the service stops on a permanent error, inspect `journalctl --user -u wayleaf
 
 ## Sampling and panel layouts
 
-Captured frames are downscaled to at most 320 pixels wide. Each controller segment samples a fixed rectangle on the corresponding screen edge; edge depth controls how far inward it reaches. Letterbox detection optionally limits sampling to the active picture.
+Mode determines how sampled or static colors are assigned while controller panel IDs remain intact:
 
-For 34 segments, mapping uses the controller's `positionData` coordinates and preserves each panel ID. The 40-segment NL69 layout uses calibrated perimeter geometry with dedicated corner zones 1.5 times the edge depth. Other reported counts from 4 through 40 use the generic perimeter mapping. There is no corner, offset, or reverse-order remapping; the count reported by the controller determines the number of LEDs sent.
+- **1D** uses `static_color` directly and sends that color to every discovered panel ID. It does not start screen capture.
+- **2D** samples one dominant color from the entire selected display and repeats it for every panel ID.
+- **3D** samples 10 coarse zones around the screen (3 top, 2 right, 3 bottom, 2 left); each zone color is assigned to the closest matching physical panel zone.
+- **4D** preserves the full per-panel behavior: each controller segment samples its corresponding screen-edge region. Captured frames are downscaled to at most 320 pixels wide; edge depth controls how far inward each region reaches, and letterbox detection optionally limits sampling to the active picture.
 
-Each zone uses saturation-weighted averaging blended with its brightest-luma pixel. Feathering tapers weights inward; center blend optionally mixes the average RGB of the central half of the active picture (sampled every fourth pixel) into each zone. Black gating and brightness/color controls follow these mixes; smoothing and maximum step bound temporal changes.
+For 4D with 34 segments, mapping uses the controller's `positionData` coordinates and preserves each panel ID. The 40-segment NL69 layout uses calibrated perimeter geometry with dedicated corner zones 1.5 times the edge depth. Other reported counts from 4 through 40 use the generic perimeter mapping. There is no corner, offset, or reverse-order remapping; the count reported by the controller determines the number of LEDs sent.
+
+4D zones use saturation-weighted averaging blended with their brightest-luma pixel. Feathering tapers weights inward; center blend optionally mixes the average RGB of the central half of the active picture (sampled every fourth pixel) into each zone. Black gating and brightness/color controls follow these mixes; smoothing and maximum step bound temporal changes. Controls that do not apply in the selected mode are hidden in the applet, but their saved values are retained.
 
 ## Remove
 

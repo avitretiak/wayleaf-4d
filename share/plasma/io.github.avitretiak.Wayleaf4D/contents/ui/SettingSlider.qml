@@ -1,10 +1,10 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import org.kde.kirigami as Kirigami
 
-ColumnLayout {
+Item {
     id: root
-
     required property var backend
     required property string settingKey
     required property string label
@@ -17,6 +17,8 @@ ColumnLayout {
     property real displayMultiplier: 1
     property string suffix: ""
     property bool editing: false
+    property real pendingValue: 0
+    property bool pendingValueValid: false
     signal valueEdited(string key, real value)
 
     readonly property int valueScale: Math.max(1, Math.round(valueMultiplier))
@@ -24,22 +26,21 @@ ColumnLayout {
     readonly property int high: Math.round(maximum * valueScale)
     readonly property real sliderValue: Number(backend.settings[settingKey]) * valueScale
     readonly property real shownValue: Number(backend.settings[settingKey]) * displayMultiplier
+    readonly property bool modified: Math.round(Number(backend.settings[settingKey]) * valueScale)
+        !== Math.round(Number(defaultValue) * valueScale)
     enabled: !backend.busy && !backend.deviceBusy && backend.status !== "starting" && backend.status !== "stopping"
-    // Values remain in backend units; valueScale drives slider steps and displayMultiplier changes readout units.
-
-    spacing: 2
     implicitWidth: 320
+    implicitHeight: 34
     Accessible.name: label
     Accessible.description: description
-    ToolTip.text: description
-    ToolTip.visible: labelHover.hovered
-    ToolTip.delay: 700
 
     function formatted(value) {
         return Number(value).toLocaleString(Qt.locale(), "f", decimals) + suffix
     }
 
     function commitStoredValue(value) {
+        debounce.stop()
+        pendingValueValid = false
         const bounded = Math.max(minimum, Math.min(maximum, Math.round(value * valueScale) / valueScale))
         if (Number(backend.settings[settingKey]) !== bounded) {
             valueEdited(settingKey, bounded)
@@ -49,6 +50,12 @@ ColumnLayout {
 
     function commitDisplayedValue(value) {
         commitStoredValue(value / displayMultiplier)
+    }
+
+    function queueValue(value) {
+        pendingValue = value
+        pendingValueValid = true
+        debounce.restart()
     }
 
     function beginEdit() {
@@ -73,46 +80,93 @@ ColumnLayout {
         editing = false
     }
 
+    Timer {
+        id: debounce
+        interval: 50
+        repeat: false
+        onTriggered: {
+            if (root.pendingValueValid)
+                root.commitStoredValue(root.pendingValue)
+        }
+    }
+
     RowLayout {
-        Layout.fillWidth: true
+        anchors.fill: parent
+        spacing: Kirigami.Units.smallSpacing / 2
         Label {
             id: settingLabel
             text: root.label
+            Layout.preferredWidth: Kirigami.Units.gridUnit * 6.5
+            Layout.minimumWidth: Kirigami.Units.gridUnit * 5
+            elide: Text.ElideRight
+            Accessible.name: root.label + (root.modified ? ", changed from default" : "")
+            ToolTip.text: "Range " + root.formatted(root.minimum * root.displayMultiplier) + " to "
+                + root.formatted(root.maximum * root.displayMultiplier) + " · Default "
+                + root.formatted(root.defaultValue * root.displayMultiplier)
+            ToolTip.visible: labelHover.hovered || activeFocus
+            ToolTip.delay: 500
+            HoverHandler { id: labelHover }
+            TapHandler { onDoubleTapped: root.resetToDefault() }
+        }
+        Rectangle {
+            Layout.preferredWidth: 5
+            Layout.preferredHeight: 5
+            radius: width / 2
+            visible: root.modified
+            color: Kirigami.Theme.highlightColor
+            Accessible.ignored: true
+        }
+        Slider {
+            id: slider
+            objectName: "setting-" + root.settingKey + "-slider"
             Layout.fillWidth: true
+            from: root.low
+            to: root.high
+            stepSize: 1
+            value: Math.round(root.sliderValue)
+            onMoved: root.queueValue(value / root.valueScale)
+            onPressedChanged: {
+                if (!pressed && root.pendingValueValid)
+                    root.commitStoredValue(root.pendingValue)
+            }
             Accessible.name: root.label
+            Accessible.description: root.description + " Range " + root.formatted(root.minimum * root.displayMultiplier)
+                + " to " + root.formatted(root.maximum * root.displayMultiplier) + ". Use arrow keys or the mouse wheel to adjust. Double-click to reset."
+            ToolTip.text: "Range " + root.formatted(root.minimum * root.displayMultiplier) + " to "
+                + root.formatted(root.maximum * root.displayMultiplier) + " · Default "
+                + root.formatted(root.defaultValue * root.displayMultiplier)
+            ToolTip.visible: slider.hovered || slider.activeFocus
+            ToolTip.delay: 500
+            TapHandler { onDoubleTapped: root.resetToDefault() }
+            WheelHandler {
+                acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
+                onWheel: function(event) {
+                    if (event.angleDelta.y !== 0) {
+                        root.commitStoredValue((slider.value + (event.angleDelta.y > 0 ? 1 : -1)) / root.valueScale)
+                        event.accepted = true
+                    }
+                }
+            }
         }
-        HoverHandler { id: labelHover; target: settingLabel }
-        ToolButton {
-            id: valueButton
+        Label {
             visible: !root.editing
+            Layout.preferredWidth: 48
+            horizontalAlignment: Text.AlignRight
             text: root.formatted(root.shownValue)
-            flat: true
-            onClicked: root.beginEdit()
-            Accessible.name: "Edit " + root.label + " value"
-            Accessible.description: "Current value " + text + ". Click to enter an exact value; use the reset button to restore " + root.formatted(root.defaultValue * root.displayMultiplier) + "."
-            ToolTip.text: root.description
-            ToolTip.visible: hovered
-        }
-        ToolButton {
-            id: resetButton
-            objectName: "reset-" + root.settingKey
-            icon.name: "view-refresh"
-            display: AbstractButton.IconOnly
-            Layout.preferredWidth: 28
-            Layout.preferredHeight: 28
-            padding: 2
-            enabled: Math.round(Number(root.backend.settings[root.settingKey]) * root.valueScale) !== Math.round(Number(root.defaultValue) * root.valueScale)
-            onClicked: root.resetToDefault()
-            Accessible.name: "Reset " + root.label + " to default"
-            Accessible.description: "Restore " + root.formatted(root.defaultValue * root.displayMultiplier) + "."
-            ToolTip.text: "Reset to default (" + root.formatted(root.defaultValue * root.displayMultiplier) + ")"
-            ToolTip.visible: hovered
+            Accessible.name: root.label + " value " + text
+            Accessible.role: Accessible.Button
+            activeFocusOnTab: true
+            Keys.onReturnPressed: root.beginEdit()
+            Keys.onEnterPressed: root.beginEdit()
+            Keys.onSpacePressed: root.beginEdit()
+            TapHandler { onTapped: root.beginEdit() }
         }
         TextField {
             id: editField
             visible: root.editing
-            Layout.preferredWidth: 88
+            Layout.preferredWidth: 58
             text: ""
+            horizontalAlignment: Text.AlignRight
             validator: DoubleValidator {
                 bottom: root.minimum * root.displayMultiplier
                 top: root.maximum * root.displayMultiplier
@@ -126,45 +180,5 @@ ColumnLayout {
             Accessible.description: "Enter a value from " + root.formatted(root.minimum * root.displayMultiplier)
                 + " to " + root.formatted(root.maximum * root.displayMultiplier) + ". Press Enter to apply."
         }
-    }
-
-    Slider {
-        id: slider
-        objectName: "setting-" + root.settingKey + "-slider"
-        Layout.fillWidth: true
-        from: root.low
-        to: root.high
-        stepSize: 1
-        value: Math.round(root.sliderValue)
-        onMoved: root.commitStoredValue(value / root.valueScale)
-        Accessible.name: root.label
-        Accessible.description: root.description + " Range " + root.formatted(root.minimum * root.displayMultiplier)
-            + " to " + root.formatted(root.maximum * root.displayMultiplier) + ". Use keyboard arrows or Shift+scroll to adjust; use the reset button to restore the default."
-        WheelHandler {
-            acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
-            onWheel: function(event) {
-                if (event.angleDelta.y !== 0 && (event.modifiers & Qt.ShiftModifier)) {
-                    root.commitStoredValue((slider.value + (event.angleDelta.y > 0 ? 1 : -1)) / root.valueScale)
-                    event.accepted = true
-                }
-            }
-        }
-    }
-    Label {
-        text: "Range " + root.formatted(root.minimum * root.displayMultiplier) + "–"
-            + root.formatted(root.maximum * root.displayMultiplier) + " · Default "
-            + root.formatted(root.defaultValue * root.displayMultiplier)
-        opacity: 0.75
-        wrapMode: Text.Wrap
-        Accessible.name: root.label + " " + text
-    }
-
-    Label {
-        visible: root.backend.isSettingPending(root.settingKey)
-        text: root.backend.settingsError.length > 0
-            ? "Pending — service has not confirmed this value. Retry pending settings above."
-            : "Applying setting…"
-        wrapMode: Text.Wrap
-        Accessible.name: root.label + ": " + text
     }
 }

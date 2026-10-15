@@ -10,6 +10,8 @@ Item {
     readonly property string interfaceName: "io.github.avitretiak.Wayleaf4D.Control"
 
     property var settings: ({
+        mode: "4D",
+        static_color: "#ffffff",
         brightness: 1.5,
         saturation_boost: 1.5,
         fps: 10,
