@@ -289,8 +289,8 @@ Item {
             id: glowFrame
             objectName: "live-preview"
             Layout.fillWidth: true
-            Layout.preferredHeight: headerContent.implicitHeight + 32
-            implicitHeight: headerContent.implicitHeight + 32
+            Layout.preferredHeight: headerContent.implicitHeight + 48
+            implicitHeight: headerContent.implicitHeight + 48
             property var visibleZones: !root.expanded ? []
                 : root.mode === "1D" || root.mode === "2D" ? root.uniformZones()
                     : root.mode === "3D" ? (root.backend.previewZones.length > 0 ? root.backend.previewZones : root.coarseZones())
@@ -304,12 +304,13 @@ Item {
                 layer.enabled: root.expanded
                 layer.effect: MultiEffect {
                     blurEnabled: true
-                    blur: 0.35
-                    blurMax: 2
+                    blur: 0.65
+                    blurMax: 3
                 }
                 Repeater {
                     model: glowFrame.visibleZones
-                    delegate: Rectangle {
+                    delegate: Item {
+                        id: zoneLight
                         required property var modelData
                         readonly property string edge: String(modelData.edge)
                         readonly property real segmentSpan: Math.max(0, Number(modelData.span))
@@ -324,21 +325,32 @@ Item {
                             Math.min(1, Number(modelData.r) / 255 * brightness),
                             Math.min(1, Number(modelData.g) / 255 * brightness),
                             Math.min(1, Number(modelData.b) / 255 * brightness), 1)
-                        x: edge === "top" || edge === "bottom" ? 16 + edgeLength * start : edge === "right" ? glowFrame.width - 14 : 8
-                        y: edge === "left" || edge === "right" ? 16 + edgeLength * start : edge === "bottom" ? glowFrame.height - 14 : 8
-                        width: edge === "top" || edge === "bottom" ? Math.max(2, edgeLength * span - 2) : 6
-                        height: edge === "left" || edge === "right" ? Math.max(2, edgeLength * span - 2) : 6
-                        color: !root.backend.running || (root.mode !== "1D" && !liveZone)
+                        property color segmentColor: !root.backend.running || (root.mode !== "1D" && !liveZone)
                             ? Kirigami.Theme.disabledTextColor
                             : root.mode === "1D"
                                 ? Qt.rgba(Math.min(1, root.staticColor.r * brightness), Math.min(1, root.staticColor.g * brightness), Math.min(1, root.staticColor.b * brightness), 1)
                                 : colorAtBrightness
-                        radius: 3
+                        x: edge === "top" || edge === "bottom" ? 16 + edgeLength * start : edge === "right" ? glowFrame.width - 14 : 8
+                        y: edge === "left" || edge === "right" ? 16 + edgeLength * start : edge === "bottom" ? glowFrame.height - 14 : 8
+                        width: edge === "top" || edge === "bottom" ? Math.max(4, edgeLength * span - 4) : 4
+                        height: edge === "left" || edge === "right" ? Math.max(4, edgeLength * span - 4) : 4
                         ToolTip.visible: root.mode === "4D" && zoneHover.hovered
                         ToolTip.text: "Controller zone " + modelData.id + " · " + edge + " · " + Math.round(position * 100) + "%"
                         HoverHandler { id: zoneHover }
-                        Behavior on color {
+                        Behavior on segmentColor {
                             ColorAnimation { duration: Kirigami.Units.longDuration === 0 ? 0 : 80 }
+                        }
+                        Rectangle {
+                            anchors.fill: parent
+                            anchors.margins: -3
+                            color: zoneLight.segmentColor
+                            opacity: 0.24
+                            radius: Math.min(width, height) / 2
+                        }
+                        Rectangle {
+                            anchors.fill: parent
+                            color: zoneLight.segmentColor
+                            radius: Math.min(width, height) / 2
                         }
                     }
                 }
@@ -346,8 +358,8 @@ Item {
             ColumnLayout {
                 id: headerContent
                 anchors.fill: parent
-                anchors.margins: 16
-                spacing: Kirigami.Units.smallSpacing
+                anchors.margins: 24
+                spacing: Kirigami.Units.largeSpacing
 
                 RowLayout {
                     Layout.fillWidth: true
@@ -439,6 +451,32 @@ Item {
                 RowLayout {
                     Layout.fillWidth: true
                     spacing: Kirigami.Units.smallSpacing
+                    Kirigami.Icon {
+                        source: "brightness-high"
+                        implicitWidth: Kirigami.Units.iconSizes.small
+                        implicitHeight: implicitWidth
+                        Accessible.ignored: true
+                    }
+                    SettingSlider {
+                        backend: root.backend
+                        Layout.fillWidth: true
+                        settingKey: "brightness"
+                        label: "Brightness"
+                        description: "Scales the output brightness."
+                        minimum: 0
+                        maximum: 2
+                        decimals: 0
+                        valueMultiplier: 50
+                        displayMultiplier: 50
+                        suffix: "%"
+                        defaultValue: 1.5
+                        objectName: "control-brightness"
+                    }
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: Kirigami.Units.smallSpacing
                     ButtonGroup { id: modeGroup; exclusive: true }
                     Repeater {
                         id: modeRepeater
@@ -482,31 +520,6 @@ Item {
             }
         }
 
-        RowLayout {
-            Layout.fillWidth: true
-            spacing: Kirigami.Units.smallSpacing
-            Kirigami.Icon {
-                source: "brightness-high"
-                implicitWidth: Kirigami.Units.iconSizes.small
-                implicitHeight: implicitWidth
-                Accessible.ignored: true
-            }
-            SettingSlider {
-                backend: root.backend
-                Layout.fillWidth: true
-                settingKey: "brightness"
-                label: "Brightness"
-                description: "Scales the output brightness."
-                minimum: 0
-                maximum: 2
-                decimals: 0
-                valueMultiplier: 50
-                displayMultiplier: 50
-                suffix: "%"
-                defaultValue: 1.5
-                objectName: "control-brightness"
-            }
-        }
 
         ScrollView {
             id: bodyScroll
@@ -571,15 +584,15 @@ Item {
                         }
                         ToolButton {
                             id: customColorButton
-                            Layout.preferredWidth: 22
-                            Layout.preferredHeight: 22
+                            Layout.preferredWidth: 28
+                            Layout.preferredHeight: 28
                             padding: 0
                             enabled: !root.backend.busy && !root.backend.deviceBusy
                             checkable: true
                             checked: root.colorName() === "Custom"
-                            text: "+"
-                            Accessible.name: "Choose a custom color"
-                            ToolTip.text: "Choose a custom color"
+                            Accessible.name: "Custom color picker"
+                            Accessible.description: "Choose a custom color. The center dot shows the current output color."
+                            ToolTip.text: Accessible.description
                             ToolTip.visible: hovered
                             onClicked: {
                                 colorDialog.selectedColor = root.staticColor
@@ -589,15 +602,42 @@ Item {
                                 anchors.fill: parent
                                 anchors.margins: customColorButton.checked ? -2 : 0
                                 radius: width / 2
-                                color: customColorButton.checked ? "transparent" : root.staticColor
+                                gradient: Gradient {
+                                    orientation: Gradient.Horizontal
+                                    GradientStop { position: 0.0; color: "#ff3b30" }
+                                    GradientStop { position: 0.2; color: "#ff9500" }
+                                    GradientStop { position: 0.4; color: "#34c759" }
+                                    GradientStop { position: 0.6; color: "#00aaff" }
+                                    GradientStop { position: 0.8; color: "#007aff" }
+                                    GradientStop { position: 1.0; color: "#af52de" }
+                                }
                                 border.width: customColorButton.checked ? 2 : 1
                                 border.color: customColorButton.checked ? Kirigami.Theme.highlightColor : Kirigami.Theme.textColor
                                 Rectangle {
-                                    visible: customColorButton.checked
-                                    anchors.fill: parent
-                                    anchors.margins: 4
+                                    anchors.centerIn: parent
+                                    width: 10
+                                    height: 10
                                     radius: width / 2
                                     color: root.staticColor
+                                    border.width: 1
+                                    border.color: Kirigami.Theme.backgroundColor
+                                }
+                                Rectangle {
+                                    anchors.right: parent.right
+                                    anchors.bottom: parent.bottom
+                                    width: 11
+                                    height: 11
+                                    radius: width / 2
+                                    color: Kirigami.Theme.backgroundColor
+                                    border.width: 1
+                                    border.color: Kirigami.Theme.textColor
+                                    Text {
+                                        anchors.centerIn: parent
+                                        text: "+"
+                                        font.pixelSize: 9
+                                        color: Kirigami.Theme.textColor
+                                        Accessible.ignored: true
+                                    }
                                 }
                             }
                         }
