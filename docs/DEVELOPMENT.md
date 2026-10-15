@@ -23,7 +23,7 @@ The Rust control process never captures. The worker only requests the installed 
 
 The capture shader converts top-origin KMS source coordinates to the imported texture's Y convention after applying plane rotation. `glReadPixels` rows are then flipped once into top-down RGBA for sampling.
 
-Mode selects the worker's color-to-panel path while preserving discovered controller IDs: 1D sends `static_color` to every panel ID; 2D samples one dominant color from the full display and repeats it for all IDs; 3D samples 10 coarse edge zones (3 top, 2 right, 3 bottom, 2 left) and maps each to the closest matching physical panel zone; 4D retains the full per-panel edge sampling and layout behavior. In 4D, the 34-segment path uses controller `positionData`; the 40-segment NL69 path uses calibrated perimeter geometry and dedicated corner zones; other supported counts use the generic mapping. No corner, offset, or reverse-order remapping is applied.
+The worker assigns colors to discovered controller IDs according to the selected mode; sampling behavior and panel-layout geometry are detailed in [Sampling and panel layouts](#sampling-and-panel-layouts).
 
 ## Source map
 
@@ -39,17 +39,31 @@ Mode selects the worker's color-to-panel path while preserving discovered contro
 | `Makefile` | Builds/installs Rust binaries and generates the absolute-path D-Bus activation entry. |
 | `share/systemd/user/wayleaf-4d.service` | User worker service managed by the widget toggle. |
 | `share/applications/io.github.avitretiak.Wayleaf4D.desktop` | Hidden desktop identity installed with the applet. |
-| `docs/USAGE.md` | End-user setup, operation, settings, diagnostics, and removal. |
+| `README.md` | User-facing overview, requirements, source installation, and first run. |
+| `docs/USAGE.md` | Detailed controls, service behavior, configuration, CLI, diagnostics, and removal. |
 
 QML uses Plasma's native asynchronous session-D-Bus interface. The control process owns service and device-management actions; the worker owns capture, sampling, frame scheduling, and UDP streaming. The CLI shares `Config` and can run diagnostics or a standalone stream.
 
 The popup keeps status, the sync switch, mode selector, and brightness visible while showing mode-specific settings. Its live edge preview uses worker-published colors at up to 10 Hz while expanded: one color in 1D and 2D, 10 zones in 3D, and per-panel colors in 4D.
 
-## Dependencies
+## Build and capture internals
 
-Build requires Rust and Cargo 1.89 or newer, GNU Make, and development/linker support for system libcurl and libdrm. Cargo resolves the locked Rust dependencies in `Cargo.lock`. No C++ compiler, Qt development packages, or portal/PipeWire/GStreamer capture stack are required.
+User-facing prerequisites and source-install steps are in the [README](../README.md). The Makefile builds with the checked-in `Cargo.lock`; the worker links system libcurl and libdrm and dynamically loads `libEGL.so.1`, `libGLESv2.so.2`, and `libgbm.so.1`. No C++ or Qt toolchain or portal/PipeWire/GStreamer capture stack is used.
 
-Runtime capture requires `/usr/bin/gsr-kms-server` from GPU Screen Recorder version 6.1.4 (the package-managed helper carries `CAP_SYS_ADMIN`; Wayleaf does not set or change capabilities and its worker stays unprivileged). It also requires working EGL, OpenGL ES 3, GBM, libdrm, and DRM/GPU drivers supporting the monitor's scanout formats. The implementation dynamically loads `libEGL.so.1`, `libGLESv2.so.2`, and `libgbm.so.1` and links libdrm. No portal consent or Screen Casting indicator is involved. Plasma 6 and a systemd user manager are required for the widget/service controls; system Avahi D-Bus is optional for discovery, with manual IPv4 entry available.
+`make install-user` installs the worker, applet, user service, desktop identity, and D-Bus activation entry under user directories, then reloads systemd and D-Bus. It does not start or enable Wayleaf. It refuses to proceed while the legacy `nanoleaf-sync` worker or service is active; otherwise it disables and removes that legacy service and binaries while preserving the shared configuration. The Wayleaf binary is replaced atomically, so an already-running worker continues with its loaded code. Absolute `XDG_DATA_HOME` and `XDG_CONFIG_HOME` overrides are honored; unset or relative values use the standard home-directory defaults.
+
+## Sampling and panel layouts
+
+Mode determines how sampled or static colors are assigned while controller panel IDs remain intact:
+
+- **1D** uses `static_color` directly and sends that color to every discovered panel ID. It does not start screen capture.
+- **2D** samples one dominant color from the entire selected display and repeats it for every panel ID.
+- **3D** samples 10 coarse zones around the screen (3 top, 2 right, 3 bottom, 2 left); each zone color is assigned to the closest matching physical panel zone.
+- **4D** preserves the full per-panel behavior: each controller segment samples its corresponding screen-edge region. Captured frames are downscaled to at most 320 pixels wide; edge depth controls how far inward each region reaches, and letterbox detection optionally limits sampling to the active picture.
+
+For 4D with 34 segments, mapping uses the controller's `positionData` coordinates and preserves each panel ID. The 40-segment NL69 layout uses calibrated perimeter geometry with dedicated corner zones 1.5 times the edge depth. Other reported counts from 4 through 40 use the generic perimeter mapping. There is no corner, offset, or reverse-order remapping; the count reported by the controller determines the number of LEDs sent.
+
+4D zones use saturation-weighted averaging blended with their brightest-luma pixel. Feathering tapers weights inward; center blend optionally mixes the average RGB of the central half of the active picture (sampled every fourth pixel) into each zone. Black gating and brightness/color controls follow these mixes; smoothing and maximum step bound temporal changes. Controls that do not apply in the selected mode are hidden in the applet, but their saved values are retained.
 
 ## Configuration and runtime settings
 

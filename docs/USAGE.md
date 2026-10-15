@@ -1,39 +1,8 @@
 # Wayleaf 4D User Guide
 
-Wayleaf 4D sends lighting to the controller in one of four modes: 1D static color, 2D one dominant color sampled from the full screen, 3D colors sampled from 10 coarse edge zones, or 4D per-panel edge mirroring. Screen capture is used only by 2D–4D. Captured frames are sampled locally; Wayleaf does not save screen images.
+For requirements, installation, pairing, and a first-run overview, see the [README](../README.md). This guide covers detailed controls, service behavior, configuration, CLI diagnostics, troubleshooting, and removal. For architecture and implementation details, see the [Implementation reference](DEVELOPMENT.md).
 
-## Requirements
-
-- Linux with DRM/KMS and working EGL, OpenGL ES 3, GBM, libdrm, and GPU drivers that support the display's scanout formats.
-- The installed `/usr/bin/gsr-kms-server` helper from GPU Screen Recorder 6.1.4. The package-managed helper has `CAP_SYS_ADMIN`; Wayleaf's worker remains unprivileged. Do not set capabilities on Wayleaf or run its worker as root.
-- A Nanoleaf 4D reachable on the local network. Avahi mDNS discovery is optional; manual IPv4 entry remains available. API pairing must be enabled on the controller.
-- Plasma 6 and a systemd user manager for the widget's service toggle. Build dependencies are listed in the [Implementation reference](DEVELOPMENT.md).
-
-## Install and first run
-
-Build and install for the current user:
-
-```sh
-make
-make install-user
-```
-
-`make install-user` installs the worker, Plasma applet, user service, D-Bus activation entry, and hidden desktop identity. It refuses to continue while the legacy `nanoleaf-sync.service` or CLI worker is active; stop that old stream yourself, then retry. It removes only the inactive legacy service/binaries, reloads D-Bus activation and systemd's user units, and does not enable, start, stop, or restart Wayleaf 4D. The executable is replaced atomically, so installation does not interrupt a running stream; an already-running worker keeps its old code until its next start. Existing config and credentials are not replaced. Absolute `XDG_DATA_HOME` and `XDG_CONFIG_HOME` overrides are honored; absent or relative values use the standard home-directory defaults.
-
-Open **Wayleaf 4D** from the System Tray or add the widget to a panel with Plasma's **Add Widgets**. Pair through **Pair a Nanoleaf 4D**: discover it through Avahi or enter its IPv4 address. Enable **Settings → Connect to API** in the Nanoleaf app or hold the 4D power button for 5 seconds, then pair within 30 seconds.
-
-The header status identifies the active state; while running, 1D shows **On** and the selected color name, while 2D–4D show **Syncing**, the rate, and monitor. Errors appear in the header. The Start/Stop switch controls the current sync session; **Start at login** is independent in the overflow menu. Since extControl uses one-way UDP, a running status means the worker sent a frame locally; it does not confirm receipt by the panels.
-
-When unpaired, use **Pair a Nanoleaf 4D** to search the local network or enter a manual IPv4 address. Device details and **Disconnect** are in the overflow menu. Disconnect removes the saved address and token from this computer; it does not revoke controller authorization.
-
-Terminal pairing is also available:
-
-```sh
-wayleaf-4d --pair --ip 192.0.2.10
-```
-
-Replace `192.0.2.10` with the controller's address.
-
+## Modes and capture behavior
 Select a mode in the popup's segmented control. The mode takes effect immediately and is saved in the shared settings. In **1D**, choose a color swatch or use the custom-color picker; the worker sends that static color to every discovered controller panel ID and does not create or use a screen-capture worker. The monitor picker is replaced by **No screen capture needed**. Brightness applies in every mode.
 
 **2D** samples one dominant color from the full selected screen and repeats it for every panel ID. **3D** samples 10 coarse zones around the screen (3 top, 2 right, 3 bottom, 2 left), then maps each zone color to the closest matching physical panel zone. **4D** retains the full per-panel edge sampling behavior, including the controller's panel IDs and layout mapping. The monitor picker applies immediately in 2D–4D.
@@ -62,7 +31,6 @@ systemctl --user is-enabled wayleaf-4d.service
 ```
 
 The last command reports whether the service is configured to start at login.
-
 
 ## Modes, controls, and defaults
 
@@ -138,18 +106,7 @@ Diagnostic modes:
 
 If the service stops on a permanent error, inspect `journalctl --user -u wayleaf-4d.service -b`, fix the reported cause, then toggle the widget off and on. Use `wayleaf-4d --list-monitors` to find a monitor name and `--monitor NAME` for a standalone run or diagnostic.
 
-## Sampling and panel layouts
-
-Mode determines how sampled or static colors are assigned while controller panel IDs remain intact:
-
-- **1D** uses `static_color` directly and sends that color to every discovered panel ID. It does not start screen capture.
-- **2D** samples one dominant color from the entire selected display and repeats it for every panel ID.
-- **3D** samples 10 coarse zones around the screen (3 top, 2 right, 3 bottom, 2 left); each zone color is assigned to the closest matching physical panel zone.
-- **4D** preserves the full per-panel behavior: each controller segment samples its corresponding screen-edge region. Captured frames are downscaled to at most 320 pixels wide; edge depth controls how far inward each region reaches, and letterbox detection optionally limits sampling to the active picture.
-
-For 4D with 34 segments, mapping uses the controller's `positionData` coordinates and preserves each panel ID. The 40-segment NL69 layout uses calibrated perimeter geometry with dedicated corner zones 1.5 times the edge depth. Other reported counts from 4 through 40 use the generic perimeter mapping. There is no corner, offset, or reverse-order remapping; the count reported by the controller determines the number of LEDs sent.
-
-4D zones use saturation-weighted averaging blended with their brightest-luma pixel. Feathering tapers weights inward; center blend optionally mixes the average RGB of the central half of the active picture (sampled every fourth pixel) into each zone. Black gating and brightness/color controls follow these mixes; smoothing and maximum step bound temporal changes. Controls that do not apply in the selected mode are hidden in the applet, but their saved values are retained.
+Panel mapping and sampling implementation details are in the [Implementation reference](DEVELOPMENT.md).
 
 ## Remove
 

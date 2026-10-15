@@ -1,29 +1,51 @@
 # Wayleaf 4D
 
-Wayleaf 4D mirrors display colors to Nanoleaf 4D panels. Choose 1D static-color ambience (no screen capture), 2D single dominant screen color, 3D coarse colors from 10 edge zones, or 4D full per-panel edge mirroring. The Rust worker captures scanout through the installed GPU Screen Recorder (GSR) KMS helper (version 6.1.4) when the selected mode needs screen color, samples frames locally, and streams colors to the controller with Nanoleaf extControl v2 over UDP. It does not save screen images.
+Mirror display colors to a Nanoleaf 4D from KDE Plasma. The Wayleaf 4D widget is the primary interface: choose 1D static color, 2D one screen-wide color, 3D ten coarse edge zones, or 4D per-panel edge mirroring. The `wayleaf-4d` CLI remains available for pairing, diagnostics, and standalone streaming.
 
-The Plasma 6 widget controls a user-level worker service. The `wayleaf-4d` CLI remains available for pairing, diagnostics, and standalone streaming.
+![Wayleaf 4D Plasma widget showing active 4D sync controls and a live edge preview](docs/wayleaf-4d.png)
 
-Release notes: [0.2.0](docs/RELEASE_NOTES-0.2.0.md).
+## Requirements
 
-## Quick start
+- KDE Plasma 6 on Wayland and a systemd user manager.
+- A Nanoleaf 4D reachable on the local network. Enable API pairing on the controller. Avahi discovery is optional; manual IPv4 entry works.
+- Source build: Rust/Cargo 1.89 or newer, GNU Make, and system libcurl/libdrm development files. On Arch or CachyOS:
 
-Requirements and source-build dependencies are listed in the [Implementation reference](docs/DEVELOPMENT.md). For a Plasma 6 Wayland session:
+  ```sh
+  yay -S --needed base-devel rust curl libdrm
+  ```
+
+  `base-devel` includes Make and pkgconf; `rust` provides Cargo.
+- Screen-color modes (2D–4D) also require `/usr/bin/gsr-kms-server` from GPU Screen Recorder 6.1.4. On Arch or CachyOS, install it with:
+
+  ```sh
+  yay -S --needed gpu-screen-recorder
+  ```
+
+  The capture path also requires compatible DRM/KMS, EGL, OpenGL ES 3, and GBM drivers. 1D static color does not need screen capture or this helper.
+
+## Install and first run
+
+From an existing source checkout:
 
 ```sh
-make
 make install-user
 ```
 
-Open **Wayleaf 4D** from the System Tray or add the widget to a panel with Plasma's **Add Widgets**. Pair through **Pair a Nanoleaf 4D**: discover it through Avahi or enter its IPv4 address, enable **Settings → Connect to API** in the Nanoleaf app or hold the 4D power button for 5 seconds, then pair within 30 seconds:
+This builds and installs Wayleaf 4D for the current user. It does not install the GSR helper, start the worker, or enable start-at-login. If the legacy `nanoleaf-sync` worker is installed, stop it first; the target refuses to replace an active worker, then disables and removes the old service and binaries. Shared settings and credentials are preserved.
 
-```sh
-wayleaf-4d --pair --ip 192.0.2.10
-```
+1. In Plasma, use **Add Widgets** to add **Wayleaf 4D** to the panel or System Tray if it is not already visible.
+2. In the Nanoleaf app, enable **Settings → Connect to API**, or hold the 4D power button for five seconds. Choose **Find devices**, select the controller, and press **Pair device** within 30 seconds. Or enter its IPv4 address and press **Pair device**; Avahi discovery is optional.
+3. Choose **1D** and a static color, or **2D–4D** for screen sampling. Select a monitor in 2D–4D, then press **Start**. Use **Start at login** separately if you want the service enabled for future logins.
 
-Choose a mode in the applet; mode and static color are saved with the shared settings. The monitor picker is not needed in 1D. In 2D–4D, the popup preview reflects the mode's output while open. Direct KMS capture in 2D–4D bypasses portal consent and KDE's Screen Casting indicator; no screen images are saved. The package-managed GSR helper accesses scanout without that prompt, so start sync only when you intend to send sampled display colors to the Nanoleaf. In 1D no screen capture is used. Installation does not enable or start the worker by itself. Run `wayleaf-4d --version` to check the worker build.
+## Capture, performance, and privacy
 
-See the [User Guide](docs/USAGE.md) for settings, privacy, troubleshooting, and removal instructions.
+Modes 2D–4D use direct KMS capture through the GSR helper instead of KDE's ScreenCast/portal path. The helper composites supported planes on the GPU and reduces them to a small frame before CPU sampling. No project-specific performance benchmark is published; actual capture and game-frame impact depend on the GPU and driver. The package-managed helper carries `CAP_SYS_ADMIN`; the Wayleaf worker stays unprivileged. Direct KMS shows neither a portal-consent prompt nor KDE's Screen Casting indicator. Start sync only when you intend to send sampled display colors. Captured frames are reduced and sampled in memory; screen images are not saved. Mode 1D does not capture.
+
+## More
+
+- [User Guide](docs/USAGE.md): detailed controls, service behavior, configuration, CLI, diagnostics, and removal.
+- [Implementation reference](docs/DEVELOPMENT.md): architecture and implementation details.
+- [Release notes](docs/RELEASE_NOTES-0.2.0.md).
 
 ## License
 
