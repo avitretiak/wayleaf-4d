@@ -66,7 +66,6 @@ Item {
             TabButton { text: "Main"; objectName: "tab-main"; Accessible.name: "Main settings" }
             TabButton { text: "Device"; objectName: "tab-device"; Accessible.name: "Device connection" }
             TabButton { text: "Tuning"; objectName: "tab-tuning"; Accessible.name: "Tuning settings" }
-            TabButton { text: "Alignment"; objectName: "tab-alignment"; Accessible.name: "4D alignment settings" }
         }
 
         StackLayout {
@@ -92,16 +91,50 @@ Item {
                     }
                     Label {
                         Layout.fillWidth: true
-                        text: "Choose a different display. Sync pauses briefly while the desktop portal opens."
+                        text: "Capture reads the selected display directly through KMS; the desktop portal and its privacy indicator are not used."
                         wrapMode: Text.Wrap
                     }
+                    ComboBox {
+                        id: monitorBox
+                        objectName: "capture-monitor"
+                        Layout.fillWidth: true
+                        model: root.backend.monitors
+                        textRole: "name"
+                        property string monitorChoice: root.backend.selectedMonitor
+                        currentIndex: {
+                            for (let i = 0; i < model.length; ++i) {
+                                if (model[i].name === monitorChoice)
+                                    return i
+                            }
+                            return model.length > 0 ? 0 : -1
+                        }
+                        onActivated: monitorChoice = currentText
+                        Accessible.name: "Capture monitor"
+                        Accessible.description: "Choose a display captured directly through KMS."
+                        ToolTip.text: Accessible.description
+                        ToolTip.visible: hovered
+                    }
                     Button {
-                        text: "Change Capture…"
-                        objectName: "change-capture"
-                        enabled: root.backend.enabled && (root.backend.status === "running" || root.backend.status === "error")
-                        onClicked: root.backend.changeCapture()
-                        Accessible.name: "Change screen capture"
-                        Accessible.description: "Reopen the desktop portal and select a display again."
+                        text: "Apply monitor"
+                        objectName: "apply-capture-monitor"
+                        enabled: !root.backend.busy && !root.backend.deviceBusy
+                            && monitorBox.monitorChoice.length > 0
+                            && monitorBox.monitorChoice !== root.backend.selectedMonitor
+                        onClicked: root.backend.selectMonitor(monitorBox.monitorChoice)
+                        Accessible.name: "Apply capture monitor"
+                        Accessible.description: "Save this display as the capture source. This works while synchronization is stopped."
+                    }
+                    Label {
+                        Layout.fillWidth: true
+                        visible: root.backend.monitors.length === 0
+                        text: "No KMS displays are available. Check that a DRM display is connected."
+                        wrapMode: Text.Wrap
+                    }
+                    Connections {
+                        target: root.backend
+                        function onSelectedMonitorChanged() {
+                            monitorBox.monitorChoice = root.backend.selectedMonitor
+                        }
                     }
                     SettingSlider {
                         backend: root.backend
@@ -336,57 +369,6 @@ Item {
                 }
             }
 
-            Flickable {
-                clip: true
-                contentWidth: width
-                contentHeight: alignmentColumn.implicitHeight
-                boundsBehavior: Flickable.StopAtBounds
-                ScrollBar.vertical: ScrollBar { }
-                ColumnLayout {
-                    id: alignmentColumn
-                    width: parent.width
-                    spacing: Kirigami.Units.smallSpacing
-                    Label {
-                        Layout.fillWidth: true
-                        wrapMode: Text.Wrap
-                        text: "Choose the screen corner that matches the strip's starting segment. Use Reverse if the lighting order runs backwards; use Offset to shift the segment mapping."
-                        Accessible.name: text
-                    }
-                    ColumnLayout {
-                        Layout.fillWidth: true
-                        Label { text: "Start corner"; Accessible.name: text }
-                        ComboBox {
-                            id: cornerBox
-                            objectName: "setting-corner"
-                            Layout.fillWidth: true
-                            model: ["bottom-center", "bottom-left", "top-left", "top-right", "bottom-right"]
-                            currentIndex: Math.max(0, model.indexOf(String(root.backend.settings.corner)))
-                            onActivated: root.backend.setSetting("corner", currentText)
-                            Accessible.name: "Start corner"
-                            Accessible.description: "Choose the screen corner used to align the strip's starting segment."
-                            ToolTip.text: Accessible.description
-                            ToolTip.visible: hovered
-                        }
-                    }
-                    SettingSlider {
-                        backend: root.backend
-                        settingKey: "offset"
-                        label: "Offset"
-                        description: "Rotates the panel mapping by this many segments."
-                        minimum: 0; maximum: 39
-                    }
-                    CheckBox {
-                        objectName: "setting-reverse"
-                        text: "Reverse direction"
-                        checked: Boolean(root.backend.settings.reverse)
-                        onClicked: root.backend.setSetting("reverse", checked)
-                        Accessible.name: text
-                        ToolTip.text: Accessible.description
-                        ToolTip.visible: hovered
-                        Accessible.description: "Reverses the order used to map screen zones to strip segments."
-                    }
-                }
-            }
         }
     }
     Dialog {

@@ -1,0 +1,548 @@
+use crate::{AppError, Result};
+use serde_json::{json, Map, Value};
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::{convert::TryFrom, env};
+
+const MAX_FPS: i32 = 10;
+static TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone)]
+pub struct Config {
+    pub host: String,
+    pub token: String,
+    pub config_path: PathBuf,
+    pub monitor: String,
+    pub port: i32,
+    pub fps: i32,
+    pub max_step: i32,
+    pub edge_depth: i32,
+    pub center_bleed: i32,
+    pub peak_mix: i32,
+    pub feather_depth: i32,
+    pub brightness: f32,
+    pub smooth: f32,
+    pub black_threshold: f32,
+    pub saturation_boost: f32,
+    pub letterbox: bool,
+    pub midtone_lift: bool,
+    pub strict_black: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        let config_dir = env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+            .unwrap_or_else(|| PathBuf::from(".config"));
+        Self {
+            host: String::new(),
+            token: String::new(),
+            config_path: config_dir.join("nanoleaf-sync/config.json"),
+            monitor: String::new(),
+            port: 60222,
+            fps: MAX_FPS,
+            max_step: 12,
+            edge_depth: 8,
+            center_bleed: 0,
+            peak_mix: 15,
+            feather_depth: 5,
+            brightness: 1.5,
+            smooth: 0.35,
+            black_threshold: 0.01,
+            saturation_boost: 1.5,
+            letterbox: true,
+            midtone_lift: false,
+            strict_black: false,
+        }
+    }
+}
+
+impl Config {
+    pub fn load(path: &Path) -> Result<Self> {
+        let mut config = Self {
+            config_path: path.to_path_buf(),
+            ..Self::default()
+        };
+        let Some(root) = read_root(path)? else {
+            return Ok(config);
+        };
+        load_values(&mut config, &root)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.port < 1
+            || self.port > 65_535
+            || !(1..=MAX_FPS).contains(&self.fps)
+            || !(1..=255).contains(&self.max_step)
+            || !(5..=20).contains(&self.edge_depth)
+            || !(0..=50).contains(&self.center_bleed)
+            || !(0..=35).contains(&self.peak_mix)
+            || !(0..=20).contains(&self.feather_depth)
+            || !in_range(self.brightness, 0.0, 2.0)
+            || !in_range(self.smooth, 0.05, 1.0)
+            || !in_range(self.black_threshold, 0.0, 0.1)
+            || !in_range(self.saturation_boost, 0.0, 3.0)
+        {
+            return Err(AppError::new(
+                "configuration value outside its supported range",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn save(&self) -> Result<()> {
+        self.validate()?;
+        let mut root = match read_root(&self.config_path)? {
+            Some(root) => {
+                let mut check = Self {
+                    config_path: self.config_path.clone(),
+                    ..Self::default()
+                };
+                load_values(&mut check, &root)?;
+                check.validate()?;
+                root
+            }
+            None => Value::Object(Map::new()),
+        };
+        let object = root
+            .as_object_mut()
+            .ok_or_else(|| AppError::new("config root must be an object"))?;
+        for key in ["corner", "offset", "reverse"] {
+            object.remove(key);
+        }
+        if !self.host.is_empty() {
+            object.insert("ip".into(), Value::String(self.host.clone()));
+        }
+        if !self.token.is_empty() {
+            object.insert("token".into(), Value::String(self.token.clone()));
+        }
+        write_known_settings(object, self);
+        let data = serde_json::to_vec_pretty(&root)
+            .map_err(|_| AppError::new("cannot encode configuration"))?;
+        write_atomic(&self.config_path, &data)
+    }
+
+    pub fn settings_json(&self) -> Value {
+        json!({
+            "monitor": self.monitor,
+            "fps": self.fps,
+            "max_step": self.max_step,
+            "edge_depth": self.edge_depth,
+            "center_bleed": self.center_bleed,
+            "peak_mix": self.peak_mix,
+            "feather_depth": self.feather_depth,
+            "brightness": self.brightness,
+            "smooth": self.smooth,
+            "black_threshold": self.black_threshold,
+            "saturation_boost": self.saturation_boost,
+            "letterbox": self.letterbox,
+            "midtone_lift": self.midtone_lift,
+            "strict_black": self.strict_black,
+        })
+    }
+
+    pub fn apply_settings(&mut self, values: &Value) -> Result<()> {
+        let settings = values
+            .as_object()
+            .ok_or_else(|| AppError::new("settings must be a JSON object"))?;
+        let mut next = self.clone();
+        for (key, value) in settings {
+            match key.as_str() {
+                "monitor" => next.monitor = json_string(value, key)?,
+                "fps" => next.fps = json_i32(value, key)?,
+                "max_step" => next.max_step = json_i32(value, key)?,
+                "edge_depth" => next.edge_depth = json_i32(value, key)?,
+                "center_bleed" => next.center_bleed = json_i32(value, key)?,
+                "peak_mix" => next.peak_mix = json_i32(value, key)?,
+                "feather_depth" => next.feather_depth = json_i32(value, key)?,
+                "brightness" => next.brightness = json_f32(value, key)?,
+                "smooth" => next.smooth = json_f32(value, key)?,
+                "black_threshold" => next.black_threshold = json_f32(value, key)?,
+                "saturation_boost" => next.saturation_boost = json_f32(value, key)?,
+                "letterbox" => next.letterbox = json_bool(value, key)?,
+                "midtone_lift" => next.midtone_lift = json_bool(value, key)?,
+                "strict_black" => next.strict_black = json_bool(value, key)?,
+                _ => return Err(AppError::new("unknown setting key")),
+            }
+        }
+        next.validate()?;
+        *self = next;
+        Ok(())
+    }
+}
+
+pub fn forget_device(path: &Path) -> Result<()> {
+    let Some(mut root) = read_root(path)? else {
+        return Ok(());
+    };
+    let mut check = Config {
+        config_path: path.to_path_buf(),
+        ..Config::default()
+    };
+    load_values(&mut check, &root)?;
+    check.validate()?;
+    let object = root
+        .as_object_mut()
+        .ok_or_else(|| AppError::new("config root must be an object"))?;
+    object.remove("ip");
+    object.remove("token");
+    let data = serde_json::to_vec_pretty(&root)
+        .map_err(|_| AppError::new("cannot encode configuration"))?;
+    write_atomic(path, &data)
+}
+
+fn in_range(value: f32, min: f32, max: f32) -> bool {
+    value.is_finite() && value >= min && value <= max
+}
+
+fn read_root(path: &Path) -> Result<Option<Value>> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(AppError::new("cannot read config file")),
+    };
+    let root: Value =
+        serde_json::from_str(&text).map_err(|_| AppError::new("invalid config JSON"))?;
+    if !root.is_object() {
+        return Err(AppError::new("config root must be an object"));
+    }
+    Ok(Some(root))
+}
+
+fn load_values(config: &mut Config, root: &Value) -> Result<()> {
+    let object = root
+        .as_object()
+        .ok_or_else(|| AppError::new("config root must be an object"))?;
+    if let Some(value) = object.get("ip") {
+        config.host = json_string(value, "ip")?;
+    }
+    if let Some(value) = object.get("token") {
+        config.token = json_string(value, "token")?;
+    }
+    if let Some(value) = object.get("monitor") {
+        config.monitor = json_string(value, "monitor")?;
+    }
+    if let Some(value) = object.get("port") {
+        config.port = json_i32(value, "port")?;
+    }
+    if let Some(value) = object.get("fps") {
+        config.fps = legacy_fps(value)?;
+    }
+    if let Some(value) = object.get("max_step") {
+        config.max_step = json_i32(value, "max_step")?;
+    }
+    if let Some(value) = object.get("edge_depth") {
+        config.edge_depth = json_i32(value, "edge_depth")?;
+    }
+    if let Some(value) = object.get("center_bleed") {
+        config.center_bleed = json_i32(value, "center_bleed")?;
+    }
+    if let Some(value) = object.get("peak_mix") {
+        config.peak_mix = json_i32(value, "peak_mix")?;
+    }
+    if let Some(value) = object.get("feather_depth") {
+        config.feather_depth = json_i32(value, "feather_depth")?;
+    }
+    if let Some(value) = object.get("brightness") {
+        config.brightness = json_f32(value, "brightness")?;
+    }
+    if let Some(value) = object.get("smooth") {
+        config.smooth = json_f32(value, "smooth")?;
+    }
+    if let Some(value) = object.get("black_threshold") {
+        config.black_threshold = json_f32(value, "black_threshold")?;
+    }
+    if let Some(value) = object.get("saturation_boost") {
+        config.saturation_boost = json_f32(value, "saturation_boost")?;
+    }
+    if let Some(value) = object.get("letterbox") {
+        config.letterbox = json_bool(value, "letterbox")?;
+    }
+    if let Some(value) = object.get("midtone_lift") {
+        config.midtone_lift = json_bool(value, "midtone_lift")?;
+    }
+    if let Some(value) = object.get("strict_black") {
+        config.strict_black = json_bool(value, "strict_black")?;
+    }
+    Ok(())
+}
+
+fn json_string(value: &Value, key: &str) -> Result<String> {
+    value
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| AppError::new(format!("config field {key} must be a string")))
+}
+
+fn json_bool(value: &Value, key: &str) -> Result<bool> {
+    value
+        .as_bool()
+        .ok_or_else(|| AppError::new(format!("config field {key} must be a boolean")))
+}
+
+fn json_i32(value: &Value, key: &str) -> Result<i32> {
+    let integer = value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|n| i64::try_from(n).ok()))
+        .and_then(|n| i32::try_from(n).ok())
+        .ok_or_else(|| AppError::new(format!("config field {key} must be a 32-bit integer")))?;
+    Ok(integer)
+}
+
+fn legacy_fps(value: &Value) -> Result<i32> {
+    if let Some(integer) = value.as_i64() {
+        return Ok(if integer > i64::from(MAX_FPS) {
+            MAX_FPS
+        } else {
+            i32::try_from(integer)
+                .map_err(|_| AppError::new("config field fps is outside its supported range"))?
+        });
+    }
+    if let Some(integer) = value.as_u64() {
+        return Ok(if integer > MAX_FPS as u64 {
+            MAX_FPS
+        } else {
+            integer as i32
+        });
+    }
+    Err(AppError::new("config field fps must be an integer"))
+}
+
+fn json_f32(value: &Value, key: &str) -> Result<f32> {
+    let number = value
+        .as_f64()
+        .filter(|number| number.is_finite())
+        .map(|number| number as f32)
+        .filter(|number| number.is_finite())
+        .ok_or_else(|| AppError::new(format!("config field {key} must be finite")))?;
+    Ok(number)
+}
+
+fn write_known_settings(object: &mut Map<String, Value>, config: &Config) {
+    let settings = config.settings_json();
+    object.insert("port".into(), json!(config.port));
+    for (key, value) in settings.as_object().expect("settings_json is an object") {
+        object.insert(key.clone(), value.clone());
+    }
+}
+
+fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| AppError::new("invalid config file path"))?;
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700);
+    builder
+        .create(parent)
+        .map_err(|_| AppError::new("cannot create config directory"))?;
+
+    let mut created = None;
+    for _ in 0..32 {
+        let id = TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
+        let mut name = std::ffi::OsString::from(".");
+        name.push(file_name);
+        name.push(format!(".{}.{}.tmp", std::process::id(), id));
+        let temporary = parent.join(name);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+        {
+            Ok(file) => {
+                created = Some((temporary, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return Err(AppError::new("cannot create temporary config file")),
+        }
+    }
+    let (temporary, mut file) =
+        created.ok_or_else(|| AppError::new("cannot create temporary config file"))?;
+
+    let result = (|| -> std::io::Result<()> {
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, path)?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+        return Err(AppError::new("cannot atomically save config file"));
+    }
+    Ok(())
+}
+
+pub fn self_test() -> Result<()> {
+    let path = env::temp_dir().join(format!(
+        "wayleaf-config-self-test-{}-{}.json",
+        std::process::id(),
+        TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| {
+        write_atomic(
+            &path,
+            br#"{"ip":"127.0.0.1","token":"test-token","portal_restore_token":"retained","future":{"enabled":true},"corner":"bottom-right","offset":26,"reverse":true,"fps":30}"#,
+        )?;
+        let mut config = Config::load(&path)?;
+        if config.fps != MAX_FPS
+            || ["corner", "offset", "reverse"]
+                .iter()
+                .any(|key| config.settings_json().get(key).is_some())
+        {
+            return Err(AppError::new(
+                "self-test config defaults or settings failed",
+            ));
+        }
+        let before = config.settings_json();
+        if config
+            .apply_settings(&json!({"monitor":"DP-3","brightness":0.8,"peak_mix":36}))
+            .is_ok()
+            || config.settings_json() != before
+        {
+            return Err(AppError::new(
+                "self-test settings update was not transactional",
+            ));
+        }
+        config.apply_settings(&json!({"monitor":"DP-3","brightness":0.8}))?;
+        config.save()?;
+        let reloaded = Config::load(&path)?;
+        if reloaded.settings_json() != config.settings_json()
+            || reloaded.host != config.host
+            || reloaded.token != config.token
+        {
+            return Err(AppError::new("self-test config round trip failed"));
+        }
+        let mode = fs::metadata(&path)
+            .map_err(|_| AppError::new("self-test config metadata failed"))?
+            .permissions()
+            .mode()
+            & 0o777;
+        if mode != 0o600 {
+            return Err(AppError::new("self-test config permissions failed"));
+        }
+        forget_device(&path)?;
+        let root =
+            read_root(&path)?.ok_or_else(|| AppError::new("self-test config was removed"))?;
+        if root.get("ip").is_some()
+            || root.get("token").is_some()
+            || root.get("portal_restore_token") != Some(&Value::String("retained".into()))
+            || root.get("future") != Some(&json!({"enabled": true}))
+        {
+            return Err(AppError::new("self-test config preservation failed"));
+        }
+        Ok(())
+    })();
+    let _ = fs::remove_file(path);
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_path() -> PathBuf {
+        env::temp_dir().join(format!(
+            "wayleaf-config-test-{}-{}.json",
+            std::process::id(),
+            TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[test]
+    fn settings_updates_are_atomic_and_credentials_are_not_exported() {
+        let mut config = Config {
+            host: "192.0.2.10".into(),
+            token: "private-token".into(),
+            ..Config::default()
+        };
+        let before = config.settings_json();
+        assert!(config
+            .apply_settings(&json!({"monitor":"DP-3","brightness":0.8,"peak_mix":36}))
+            .is_err());
+        assert_eq!(config.settings_json(), before);
+        assert!(config
+            .apply_settings(&json!({"monitor":"DP-3","future_setting":true}))
+            .is_err());
+        assert_eq!(config.settings_json(), before);
+        assert!(config
+            .apply_settings(&json!({"monitor":"DP-3","corner":"top-left"}))
+            .is_err());
+        assert_eq!(config.settings_json(), before);
+        config
+            .apply_settings(&json!({"monitor":"DP-3","brightness":0.8}))
+            .expect("apply valid settings");
+        assert_eq!(config.monitor, "DP-3");
+        assert!(config.settings_json().get("token").is_none());
+        assert!(config.settings_json().get("ip").is_none());
+        assert!(config.settings_json().get("port").is_none());
+    }
+
+    #[test]
+    fn save_preserves_unknown_values_and_forget_removes_only_credentials() {
+        let path = test_path();
+        write_atomic(
+            &path,
+            br#"{"ip":"192.0.2.10","token":"private-token","portal_restore_token":"unrelated","future":{"x":1},"corner":"bottom-right","offset":26,"reverse":true,"fps":40}"#,
+        )
+        .expect("seed config");
+        let mut config = Config::load(&path).expect("load config");
+        assert_eq!(config.fps, MAX_FPS);
+        config.brightness = 0.7;
+        config.save().expect("save config");
+        let root = read_root(&path)
+            .expect("read saved config")
+            .expect("saved config");
+        assert!(["corner", "offset", "reverse"]
+            .iter()
+            .all(|key| root.get(key).is_none()));
+        assert_eq!(root["future"], json!({"x": 1}));
+        assert_eq!(root["portal_restore_token"], "unrelated");
+        assert_eq!(root["port"], json!(config.port));
+        assert_eq!(root["token"], "private-token");
+        assert_eq!(
+            fs::metadata(&path).expect("metadata").permissions().mode() & 0o777,
+            0o600
+        );
+        forget_device(&path).expect("forget device");
+        let root = read_root(&path)
+            .expect("read forgotten config")
+            .expect("config remains");
+        assert!(root.get("ip").is_none() && root.get("token").is_none());
+        assert_eq!(root["portal_restore_token"], "unrelated");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn save_refuses_invalid_files_without_overwriting_or_leaking_credentials() {
+        let path = test_path();
+        let invalid = b"not-json";
+        write_atomic(&path, invalid).expect("seed invalid config");
+        let config = Config {
+            config_path: path.clone(),
+            token: "private-token".into(),
+            ..Config::default()
+        };
+        let error = match config.save() {
+            Err(error) => error,
+            Ok(()) => panic!("invalid config was overwritten"),
+        };
+        assert!(!error.message.contains(&config.token));
+        assert_eq!(fs::read(&path).expect("read invalid config"), invalid);
+        let _ = fs::remove_file(path);
+    }
+}

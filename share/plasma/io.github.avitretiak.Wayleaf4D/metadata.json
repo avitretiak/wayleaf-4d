@@ -9,7 +9,7 @@
         "Category": "Hardware",
         "Description": "Mirror screen-edge colors to Nanoleaf 4D",
         "EnabledByDefault": true,
-        "Icon": "/ambient-light.svg",
+        "Icon": "io.github.avitretiak.Wayleaf4D",
         "Id": "io.github.avitretiak.Wayleaf4D",
         "License": "GPL-3.0-or-later",
         "Name": "Wayleaf 4D",

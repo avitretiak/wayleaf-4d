@@ -1,45 +1,49 @@
-CXX ?= c++
-CXXFLAGS ?= -O2 -std=c++17 -Wall -Wextra -Wpedantic
-PKGS = gio-2.0 gstreamer-app-1.0 gstreamer-video-1.0 json-glib-1.0 libcurl
-QT_PKGS = Qt6Core Qt6Qml Qt6DBus
-QT_LIBEXECDIR ?= $(shell pkg-config --variable=libexecdir Qt6Core)
-MOC ?= $(QT_LIBEXECDIR)/moc
 APP_ID = io.github.avitretiak.Wayleaf4D
 PLASMA_PACKAGE = share/plasma/$(APP_ID)
 USER_SHARE = $(HOME)/.local/share
 PLASMA_DIR = $(USER_SHARE)/plasma/plasmoids/$(APP_ID)
-QML_MODULE_DIR = $(PLASMA_DIR)/contents/ui/Nanoleaf
+USER_ICON_DIR = $(USER_SHARE)/icons/hicolor/scalable/apps
 USER_CONFIG = $(if $(XDG_CONFIG_HOME),$(XDG_CONFIG_HOME),$(HOME)/.config)
+USER_BIN = $(HOME)/.local/bin
 BUILD_DIR = build
-WORKER = $(BUILD_DIR)/nanoleaf-sync
-BACKEND_MOC = $(BUILD_DIR)/backend.moc
-BACKEND_PLUGIN = $(BUILD_DIR)/libnanoleafbackend.so
-
-all: $(WORKER) $(BACKEND_PLUGIN)
-
-$(BUILD_DIR):
-	mkdir -p $@
-
-$(WORKER): src/nanoleaf-sync.cpp | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) $(shell pkg-config --cflags $(PKGS)) $< -o $@ $(shell pkg-config --libs $(PKGS))
-
-$(BACKEND_MOC): src/plasma/backend.cpp | $(BUILD_DIR)
-	$(MOC) $(shell pkg-config --cflags Qt6Core Qt6Qml Qt6DBus) $< -o $@
-
-$(BACKEND_PLUGIN): src/plasma/backend.cpp $(BACKEND_MOC) | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) -fPIC -shared -I$(BUILD_DIR) $(shell pkg-config --cflags $(QT_PKGS)) $< -o $@ $(shell pkg-config --libs $(QT_PKGS))
+CARGO_TARGET_DIR = $(BUILD_DIR)/cargo
+WORKER = $(BUILD_DIR)/wayleaf-4d
+DBUS_SERVICE = $(USER_SHARE)/dbus-1/services/io.github.avitretiak.Wayleaf4D.Control.service
 
 .PHONY: all clean install-user
+all: $(WORKER)
+
+$(WORKER): Cargo.toml Cargo.lock $(wildcard src/*.rs)
+	cargo build --release --locked --target-dir $(CARGO_TARGET_DIR)
+	cp $(CARGO_TARGET_DIR)/release/wayleaf-4d $@
+
 clean:
-	rm -rf build
-	rm -f nanoleaf-sync nanoleaf-sync-tray libnanoleafbackend.so src/plasma/backend.moc
+	rm -rf $(BUILD_DIR)
 
 install-user: all
-	install -Dm755 $(WORKER) "$(HOME)/.local/bin/nanoleaf-sync"
-	rm -f "$(HOME)/.local/bin/nanoleaf-sync-tray"
+	@if systemctl --user is-active --quiet nanoleaf-sync.service; then \
+		echo "Refusing to replace active nanoleaf-sync.service; stop it first." >&2; \
+		exit 1; \
+	fi
+	@for comm in /proc/[0-9]*/comm; do \
+		read -r name < "$$comm" || continue; \
+		if [ "$$name" = nanoleaf-sync ]; then \
+			echo "Refusing to replace active nanoleaf-sync worker; stop it first." >&2; \
+			exit 1; \
+		fi; \
+	done
+	@if systemctl --user is-enabled --quiet nanoleaf-sync.service >/dev/null 2>&1; then \
+		systemctl --user disable nanoleaf-sync.service; \
+	fi
+	rm -f "$(USER_CONFIG)/systemd/user/nanoleaf-sync.service" "$(USER_BIN)/nanoleaf-sync" "$(USER_BIN)/nanoleaf-sync-tray"
+	install -Dm755 $(WORKER) "$(USER_BIN)/wayleaf-4d"
 	install -d "$(PLASMA_DIR)"
 	cp -R "$(PLASMA_PACKAGE)/." "$(PLASMA_DIR)/"
-	install -Dm755 $(BACKEND_PLUGIN) "$(QML_MODULE_DIR)/libnanoleafbackend.so"
-	install -Dm644 share/systemd/user/nanoleaf-sync.service "$(USER_CONFIG)/systemd/user/nanoleaf-sync.service"
+	install -Dm644 "$(PLASMA_PACKAGE)/contents/ambient-light.svg" "$(USER_ICON_DIR)/$(APP_ID).svg"
+	install -Dm644 share/systemd/user/wayleaf-4d.service "$(USER_CONFIG)/systemd/user/wayleaf-4d.service"
 	install -Dm644 share/applications/$(APP_ID).desktop "$(USER_SHARE)/applications/$(APP_ID).desktop"
+	install -d "$(dir $(DBUS_SERVICE))"
+	printf '[D-BUS Service]\nName=io.github.avitretiak.Wayleaf4D.Control\nExec="%s/wayleaf-4d" --control\n' "$(USER_BIN)" > "$(DBUS_SERVICE)"
+	busctl --user call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus ReloadConfig
+	rm -f "$(PLASMA_DIR)/contents/ui/Nanoleaf/libnanoleafbackend.so"
 	systemctl --user daemon-reload

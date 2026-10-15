@@ -4,48 +4,51 @@
 
 ```mermaid
 flowchart LR
-    UI[Plasma 6 widget] -->|user systemd service| Worker[nanoleaf-sync worker]
+    UI[Plasma 6 QML widget] -->|session D-Bus| Control[ D-Bus-activated Rust control ]
+    Control -->|user systemd toggle| Worker[wayleaf-4d worker]
     CLI[CLI pairing, diagnostics, and standalone streaming] --> Worker
-    UI -->|QProcess device operations| CLI
-    UI -->|system D-Bus mDNS browse| Avahi[optional Avahi service]
-    Config[Shared config] --> Worker
-    Device[Nanoleaf 4D API layout] --> Worker
-    Portal[XDG ScreenCast portal] --> PipeWire[PipeWire stream]
-    PipeWire --> Gst[GStreamer scale and frame-rate limit]
-    Gst --> Sample[Edge-zone sampling and color processing]
-    Device --> Sample
-    Sample -->|extControl v2 RGB UDP| Device
-    UI <-->|session D-Bus status and settings| Worker
+    Control -->|session D-Bus| Worker
+    Control -->|system D-Bus mDNS browse| Avahi[optional Avahi service]
+    Config[Shared config] --> Control
+    Config --> Worker
+    Device[Nanoleaf 4D API layout] -->|panel IDs and layout| Worker
+    Helper[Installed GSR KMS helper] -->|KMS planes via private socket| Capture[EGL/GLES render to small RGBA frame]
+    Capture --> Sample[Edge-zone sampling and color processing]
+    Sample -->|RGB values| Worker
+    Worker -->|extControl v2 RGB UDP| Device
 ```
 
-The worker discovers panel IDs and layout from the controller. The 34-segment path uses the controller's `positionData`; the 40-segment NL69 path uses calibrated perimeter geometry and dedicated corner zones; other supported counts use the generic mapping. Screen zones are mapped to the controller's panel IDs before packets are sent.
+The Rust control process never captures. The worker uses the installed GPU Screen Recorder KMS helper (GSR 6.1.4) for direct KMS scanout; EGL/OpenGL ES on GBM composes supported planes and reduces them before CPU sampling. The helper has its package-managed `CAP_SYS_ADMIN` capability; the worker and control process remain unprivileged. There is no portal, PipeWire, GStreamer, consent prompt, or KDE Screen Casting indicator. This intentionally trades the portal's per-session consent/visible capture indicator for direct capture: the helper can access scanout without that prompt, so users must turn synchronization on deliberately.
+
+The capture shader converts top-origin KMS source coordinates to the imported texture's Y convention after applying plane rotation. `glReadPixels` rows are then flipped once into top-down RGBA for sampling.
+
+The worker discovers panel IDs and layout from the controller. The 34-segment path uses the controller's `positionData`; the 40-segment NL69 path uses calibrated perimeter geometry and dedicated corner zones; other supported counts use the generic mapping. It preserves controller panel IDs without applying a corner, offset, or reverse-order remapping.
 
 ## Source map
 
 | Path | Responsibility |
 |---|---|
-| `src/nanoleaf-sync.cpp` | CLI, `--version`, Nanoleaf LAN API, config persistence, portal/PipeWire capture, sampling, extControl v2 UDP, worker D-Bus API, `--device-info`, and `--self-test`. |
-| `src/plasma/backend.cpp` | QML extension plugin; shared settings, worker status, user systemd unit, Avahi D-Bus discovery, CLI pairing/device details, and local credential removal. |
-| `share/plasma/io.github.avitretiak.Wayleaf4D/` | Plasma applet metadata, QML UI, and ambient-light icon. |
-| `share/plasma/io.github.avitretiak.Wayleaf4D/contents/ui/Nanoleaf/qmldir` | Declares the `Nanoleaf` QML module. |
-| `share/systemd/user/nanoleaf-sync.service` | User service started and stopped by the applet. |
-| `share/applications/io.github.avitretiak.Wayleaf4D.desktop` | Hidden desktop identity used when registering the app with the portal. |
+| `src/main.rs`, `src/cli.rs` | `wayleaf-4d` CLI dispatch, help/version, pairing, device info, monitor listing, diagnostics, and standalone streaming. |
+| `src/config.rs` | Shared XDG config loading, validation, secure atomic saves, defaults, and device credential removal. |
+| `src/device.rs` | Nanoleaf LAN API, pairing, device/layout parsing, extControl v2 UDP. |
+| `src/kms.rs`, `src/capture.rs`, `src/gpu.rs` | Monitor selection, GSR KMS helper IPC, EGL/GLES/GBM plane composition and reduced RGBA capture. |
+| `src/sampling.rs`, `src/runtime.rs` | Edge-zone mapping/color processing, worker D-Bus API, frame scheduling, capture diagnostics. |
+| `src/control.rs` | D-Bus-activated control API, settings and service lifecycle, Avahi discovery, pairing/device actions. |
+| `share/plasma/io.github.avitretiak.Wayleaf4D/` | Plasma applet metadata and QML UI. |
+| `Makefile` | Builds/installs Rust binaries and generates the absolute-path D-Bus activation entry. |
+| `share/systemd/user/wayleaf-4d.service` | User worker service managed by the widget toggle. |
+| `share/applications/io.github.avitretiak.Wayleaf4D.desktop` | Hidden desktop identity installed with the applet. |
 | `docs/USAGE.md` | End-user setup, operation, settings, diagnostics, and removal. |
 
-The QML plugin is built at `build/libnanoleafbackend.so` and installed separately into the applet's `contents/ui/Nanoleaf/` directory by the Makefile. Use `make install-user` to install or update the project. Upgrading only the Plasma package with `kpackagetool6` can remove that separately installed binary and produce `module "Nanoleaf" plugin "nanoleafbackend" not found`.
+QML uses Plasma's native asynchronous session-D-Bus interface; there is no C++/Qt plugin build. `make` builds the Rust binary as `build/wayleaf-4d`. `make install-user` installs it with the QML applet, D-Bus activation file, and worker unit. A Plasma reload may be needed after QML changes; this is separate from the worker and does not require restarting `wayleaf-4d.service`.
 
-## Build dependencies
+The Plasma `DBusMessage` constructor takes `interface` in its map, even though its QML property is named `iface`.
 
-Use a C++17 compiler, GNU Make, `pkg-config`, Qt's `moc`, and development packages exposing these pkg-config modules:
+## Build and runtime dependencies
 
-- `gio-2.0`
-- `gstreamer-app-1.0`
-- `gstreamer-video-1.0`
-- `json-glib-1.0`
-- `libcurl`
-- `Qt6Core`, `Qt6Qml`, and `Qt6DBus`
+Build requires Rust 2021 support (`rustc` and Cargo), GNU Make, and development/linker support for system libcurl and libdrm. Cargo resolves the locked Rust dependencies in `Cargo.lock`. No C++ compiler, Qt development packages, or portal/PipeWire/GStreamer capture stack are needed to build this project.
 
-Runtime capture also needs a Wayland session, an XDG Desktop Portal ScreenCast implementation, PipeWire, and the GStreamer PipeWire source plus video-processing plugins. The Plasma applet requires Plasma 6 and a systemd user manager. Optional discovery uses the system Avahi D-Bus service; without it, enter the controller IPv4 address manually. The Makefile locates `moc` using `pkg-config --variable=libexecdir Qt6Core`; override `QT_LIBEXECDIR` or `MOC` if the local Qt installation places it elsewhere.
+Runtime capture requires `/usr/bin/gsr-kms-server` from GPU Screen Recorder version 6.1.4 (the package-managed helper carries `CAP_SYS_ADMIN`; Wayleaf does not set or change capabilities and its worker stays unprivileged). It also requires working EGL, OpenGL ES 3, GBM, libdrm, and DRM/GPU drivers supporting the monitor's scanout formats. The implementation dynamically loads `libEGL.so.1`, `libGLESv2.so.2`, and `libgbm.so.1` and links libdrm. No portal consent or Screen Casting indicator is involved. Plasma 6 and a systemd user manager are required for the widget/service toggle; system Avahi D-Bus is optional for discovery, with manual IPv4 entry available.
 
 ## Build and install
 
@@ -54,7 +57,7 @@ make
 make install-user
 ```
 
-`make` builds the worker and QML plugin under `build/`. `make install-user` installs under `~/.local/`, installs the user service under `$XDG_CONFIG_HOME/systemd/user/`, then runs `systemctl --user daemon-reload`. It does not enable, start, stop, or restart the worker. It does not overwrite the user's Nanoleaf config. `make clean` removes build outputs and old root-level artifacts from previous Makefile versions.
+`make` builds the Rust worker under `build/` using Cargo's locked release build. `make install-user` installs under `~/.local/`, installs the user service under `$XDG_CONFIG_HOME/systemd/user/`, registers and reloads the D-Bus-activated control process, and runs `systemctl --user daemon-reload`. It refuses to continue while the legacy `nanoleaf-sync.service` or CLI worker is active; it never stops an active stream. It disables/removes only the inactive legacy service and binaries, does not enable, start, stop, or restart Wayleaf 4D, and does not overwrite Nanoleaf config. `make clean` removes `build/`.
 
 After changing QML or applet metadata, Plasma must reload the applet to read the new files. Log out and back in, or restart the Plasma shell on sessions providing `plasma-plasmashell.service`:
 
@@ -62,24 +65,23 @@ After changing QML or applet metadata, Plasma must reload the applet to read the
 systemctl --user restart plasma-plasmashell.service
 ```
 
-This restarts the desktop shell, not `nanoleaf-sync.service`.
+This restarts the desktop shell, not `wayleaf-4d.service`.
 
 ## Verification
 
-Run the device-independent checks from the repository root:
+Verification commands (run only when authorized; building may update `build/`):
 
 ```sh
 make
-./build/nanoleaf-sync --self-test
-./build/nanoleaf-sync --help
-./build/nanoleaf-sync --version
+./build/wayleaf-4d --self-test
+./build/wayleaf-4d --help
+./build/wayleaf-4d --version
+./build/wayleaf-4d --list-monitors
 ```
 
-`--self-test` uses temporary config data and loopback UDP. It checks settings and argument bounds, sampling, 34/40-segment alignment, and packet lengths; it does not prove portal access or controller behavior.
+`--self-test` runs local module checks, including configuration, argument bounds, sampling, layout mapping, KMS protocol validation, and capture transforms; it does not require the helper or contact a controller. `--capture-test --monitor NAME` exercises actual capture without controller credentials or UDP streaming, reports dimensions, frame count, and timing, and saves no images. `--capture-debug --monitor NAME` also requires saved controller credentials; for ten seconds it prints timing and per-zone target/output RGB values without sending UDP frames or saving images/settings. Sampled RGB can reveal screen content, so review diagnostic output before sharing. These capture modes use direct KMS and have no portal selection/restore token.
 
-For a manual capture check, `./build/nanoleaf-sync --capture-test` exercises the portal/PipeWire stream without controller credentials or UDP streaming; it may prompt for screen-capture permission and saves the portal restore token. `./build/nanoleaf-sync --capture-debug` requires saved controller credentials and a portal selection; for ten seconds it prints timing and per-zone target/output RGB values, but sends no UDP frames and saves no screen images or settings. Review its output before sharing because sampled colors reflect the screen.
-
-Before publishing a release, verify a fresh Plasma 6 Wayland install and real Nanoleaf streaming. The local self-test does not cover portal consent/restore or controller behavior.
+Before publishing a release, verify a Plasma 6 session, helper/GPU capture, and real Nanoleaf streaming. Do not infer display/game performance from synthetic or diagnostic runs.
 
 ## Shared-setting contract
 

@@ -2,7 +2,7 @@
 Type=Application
 Name=Wayleaf 4D
 Comment=Control Wayland screen-edge ambient lighting for Nanoleaf 4D
-Exec=nanoleaf-sync
+Exec=wayleaf-4d
 Terminal=false
 NoDisplay=true
 Categories=Utility;

@@ -5,7 +5,7 @@ After=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/nanoleaf-sync
+ExecStart=%h/.local/bin/wayleaf-4d
 Restart=no
 RestartForceExitStatus=75
 RestartSec=15s
