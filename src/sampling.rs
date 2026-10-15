@@ -582,14 +582,29 @@ impl Sampler {
                 count += 1;
             }
         }
-        let current_global = if count != 0 {
-            Color {
-                r: (sr / count as f64) as f32,
-                g: (sg / count as f64) as f32,
-                b: (sb / count as f64) as f32,
+        let center = Color {
+            r: (sr / count as f64) as f32,
+            g: (sg / count as f64) as f32,
+            b: (sb / count as f64) as f32,
+        };
+        let mut picture_r = 0.0f64;
+        let mut picture_g = 0.0f64;
+        let mut picture_b = 0.0f64;
+        // The sparse grid includes the captured-frame edges while the dense center sample keeps prior cut sensitivity.
+        for row in 0..4 {
+            let y = row * (height - 1) / 3;
+            for column in 0..4 {
+                let x = column * (width - 1) / 3;
+                let c = pixel(data, stride, x, y);
+                picture_r += c.r as f64;
+                picture_g += c.g as f64;
+                picture_b += c.b as f64;
             }
-        } else {
-            Color::default()
+        }
+        let current_global = Color {
+            r: (center.r + (picture_r / 16.0) as f32) * 0.5,
+            g: (center.g + (picture_g / 16.0) as f32) * 0.5,
+            b: (center.b + (picture_b / 16.0) as f32) * 0.5,
         };
         self.scene_cut = self.frames > 1 && {
             let dr = ((current_global.r - self.global.r) / 255.0) as f64;
@@ -705,7 +720,7 @@ impl Sampler {
             if peak_luma > 0.0 {
                 target = mix(target, peak, peak_mix);
             }
-            target = mix(target, current_global, center_bleed);
+            target = mix(target, center, center_bleed);
             if threshold > 0.0 {
                 let lum = luma(target);
                 if lum <= threshold {
@@ -1098,5 +1113,32 @@ mod tests {
             .sample(&data, w * 4, w, h, &cfg, Duration::from_millis(34))
             .unwrap();
         assert_eq!(sampler.active(), Rect::default());
+    }
+
+    #[test]
+    fn detects_cuts_that_change_only_the_picture_perimeter() {
+        let w = 64;
+        let h = 48;
+        let mut sampler = Sampler::new(Vec::new());
+        let cfg = Config::default();
+        let black = solid_frame(w, h, [0, 0, 0]);
+        sampler
+            .sample(&black, w * 4, w, h, &cfg, Duration::from_millis(34))
+            .unwrap();
+        assert!(!sampler.scene_cut());
+
+        let mut perimeter = black;
+        for y in 0..h {
+            for x in 0..w {
+                if x == 0 || x + 1 == w || y == 0 || y + 1 == h {
+                    perimeter[(y * w + x) * 4..(y * w + x) * 4 + 3]
+                        .copy_from_slice(&[255, 255, 255]);
+                }
+            }
+        }
+        sampler
+            .sample(&perimeter, w * 4, w, h, &cfg, Duration::from_millis(34))
+            .unwrap();
+        assert!(sampler.scene_cut());
     }
 }

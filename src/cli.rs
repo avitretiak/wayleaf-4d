@@ -23,6 +23,7 @@ pub struct Args {
 
 pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Args> {
     let args: Vec<String> = args.into_iter().collect();
+    validate_mode_flags(&args)?;
     if let Some(mode) = early_mode(&args) {
         return Ok(Args {
             config: Config::default(),
@@ -106,6 +107,35 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Args> {
         Mode::Run
     };
     Ok(Args { config, mode })
+}
+
+fn validate_mode_flags(args: &[String]) -> Result<()> {
+    let mut selected = None;
+    let mut i = 0;
+    while i < args.len() {
+        let mode = match args[i].as_str() {
+            "--help" | "-h" => Some(Mode::Help),
+            "--version" => Some(Mode::Version),
+            "--self-test" => Some(Mode::SelfTest),
+            "--pair" => Some(Mode::Pair),
+            "--device-info" => Some(Mode::DeviceInfo),
+            "--capture-test" => Some(Mode::CaptureTest),
+            "--capture-debug" => Some(Mode::CaptureDebug),
+            "--control" => Some(Mode::Control),
+            "--list-monitors" => Some(Mode::ListMonitors),
+            _ => None,
+        };
+        if let Some(mode) = mode {
+            if selected.is_some_and(|previous| previous != mode) {
+                return Err(AppError::new("conflicting command-line modes"));
+            }
+            selected = Some(mode);
+        } else if takes_value(args[i].as_str()) {
+            i += 1;
+        }
+        i += 1;
+    }
+    Ok(())
 }
 
 fn early_mode(args: &[String]) -> Option<Mode> {
@@ -260,6 +290,24 @@ mod tests {
             "top-left".into(),
         ]);
         assert!(args.is_err());
+    }
+
+    #[test]
+    fn conflicting_modes_fail_before_loading_config() {
+        let path = unique_path();
+        fs::write(&path, "invalid").expect("invalid test config");
+        let result = parse([
+            "--config".into(),
+            path.display().to_string(),
+            "--pair".into(),
+            "--control".into(),
+        ]);
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("conflicting modes were accepted"),
+        };
+        assert_eq!(error.message, "conflicting command-line modes");
+        let _ = fs::remove_file(path);
     }
 
     #[test]

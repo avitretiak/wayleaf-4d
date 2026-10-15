@@ -2,7 +2,6 @@ use crate::kms::{Monitor, Plane};
 use crate::{AppError, Result};
 use glow::HasContext;
 use libloading::Library;
-use std::cell::Cell;
 use std::ffi::{c_void, CStr, CString};
 use std::fs::OpenOptions;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -37,7 +36,33 @@ const DRM_FORMAT_ABGR16161616: u32 = fourcc(*b"AB48");
 const GL_VERTEX_SHADER: u32 = 0x8B31;
 const GL_FRAGMENT_SHADER: u32 = 0x8B30;
 const VERTEX_SHADER: &str = "#version 300 es\nprecision highp float;\nuniform vec4 dst;\nout vec2 uv;\nconst vec2 p[3] = vec2[3](vec2(0.0,0.0), vec2(2.0,0.0), vec2(0.0,2.0));\nvoid main(){ vec2 q=p[gl_VertexID]; uv=q; gl_Position=vec4(dst.xy+q*(dst.zw-dst.xy),0.0,1.0); }\n";
-const FRAGMENT_SHADER: &str = "#version 300 es\nprecision highp float;\nuniform sampler2D image; uniform vec4 src; uniform int rotation; uniform float hdr_peak_pq; uniform float hdr_white_pq; uniform float hdr_white_scale;\nin vec2 uv; out vec4 color;\nconst float PQ_M1=0.1593017578125; const float PQ_M2=78.84375; const float PQ_C1=0.8359375; const float PQ_C2=18.8515625; const float PQ_C3=18.6875;\nfloat pq_lum(float p){float e=pow(max(p,0.0),1.0/PQ_M2); return pow(max(e-PQ_C1,0.0)/(PQ_C2-PQ_C3*e),1.0/PQ_M1);}\nfloat lum_pq(float l){float x=pow(clamp(l,0.0,1.0),PQ_M1); return pow((PQ_C1+PQ_C2*x)/(1.0+PQ_C3*x),PQ_M2);}\nfloat eetf(float p){float target=hdr_white_pq/hdr_peak_pq; float knee=1.5*target-0.5; float e=min(p/hdr_peak_pq,1.0); if(knee<1.0 && e>knee){float t=(e-knee)/(1.0-knee); float t2=t*t; float t3=t2*t; e=(2.0*t3-3.0*t2+1.0)*knee+(t3-2.0*t2+t)*(1.0-knee)+(-2.0*t3+3.0*t2)*target;} return e*hdr_peak_pq;}\nvec3 tone(vec3 pq){vec3 l=vec3(pq_lum(pq.r),pq_lum(pq.g),pq_lum(pq.b)); float m=max(l.r,max(l.g,l.b)); if(m>0.0) l*=pq_lum(eetf(lum_pq(m)))/m; l=mat3(1.660491,-0.124550,-0.018151,-0.587641,1.132900,-0.100579,-0.072850,-0.008349,1.118730)*l; return pow(clamp(l*hdr_white_scale,0.0,1.0),vec3(1.0/2.2));}\nvoid main(){ vec2 q=uv; if(rotation==1) q=vec2(q.y,1.0-q.x); else if(rotation==2) q=vec2(1.0-q.x,1.0-q.y); else if(rotation==3) q=vec2(1.0-q.y,q.x); q.y=1.0-q.y; vec2 tc=src.xy+q*src.zw; vec4 px=texture(image,tc); if(hdr_peak_pq>0.0) px.rgb=tone(px.rgb); color=px; }\n";
+const FRAGMENT_SHADER: &str = r#"
+#version 300 es
+precision highp float;
+uniform sampler2D image;
+uniform vec4 src;
+uniform int rotation;
+uniform int hdr_eotf;
+uniform float hdr_peak_pq;
+uniform float hdr_white_pq;
+uniform float hdr_white_scale;
+uniform float hdr_peak_nits;
+in vec2 uv;
+out vec4 color;
+const float PQ_M1=0.1593017578125;
+const float PQ_M2=78.84375;
+const float PQ_C1=0.8359375;
+const float PQ_C2=18.8515625;
+const float PQ_C3=18.6875;
+float pq_lum(float p){float e=pow(max(p,0.0),1.0/PQ_M2); return pow(max(e-PQ_C1,0.0)/(PQ_C2-PQ_C3*e),1.0/PQ_M1);}
+float lum_pq(float l){float x=pow(clamp(l,0.0,1.0),PQ_M1); return pow((PQ_C1+PQ_C2*x)/(1.0+PQ_C3*x),PQ_M2);}
+float eetf(float p){float target=hdr_white_pq/hdr_peak_pq; float knee=1.5*target-0.5; float e=min(p/hdr_peak_pq,1.0); if(knee<1.0 && e>knee){float t=(e-knee)/(1.0-knee); float t2=t*t; float t3=t2*t; e=(2.0*t3-3.0*t2+1.0)*knee+(t3-2.0*t2+t)*(1.0-knee)+(-2.0*t3+3.0*t2)*target;} return e*hdr_peak_pq;}
+float rec709(float v){return v<0.018 ? 4.5*v : 1.099*pow(v,0.45)-0.099;}
+vec3 tone(vec3 pq){vec3 l=vec3(pq_lum(pq.r),pq_lum(pq.g),pq_lum(pq.b)); float m=max(l.r,max(l.g,l.b)); if(m>0.0) l*=pq_lum(eetf(lum_pq(m)))/m; l=mat3(1.660491,-0.124550,-0.018151,-0.587641,1.132900,-0.100579,-0.072850,-0.008349,1.118730)*l; l=clamp(l*hdr_white_scale,0.0,1.0); return vec3(rec709(l.r),rec709(l.g),rec709(l.b));}
+float hlg_scene(float e){return e<=0.5 ? e*e/3.0 : (exp((e-0.55991073)/0.17883277)+0.28466892)/12.0;}
+vec3 hlg_tone(vec3 signal){vec3 scene=vec3(hlg_scene(signal.r),hlg_scene(signal.g),hlg_scene(signal.b)); float y=dot(scene,vec3(0.2627,0.6780,0.0593)); float gamma=max(1.0,1.2+0.42*log(hdr_peak_nits/1000.0)/log(10.0)); vec3 nits=scene*(pow(max(y,0.0),gamma-1.0)*hdr_peak_nits); return tone(vec3(lum_pq(nits.r/10000.0),lum_pq(nits.g/10000.0),lum_pq(nits.b/10000.0)));}
+void main(){vec2 q=uv; if(rotation==1) q=vec2(q.y,1.0-q.x); else if(rotation==2) q=vec2(1.0-q.x,1.0-q.y); else if(rotation==3) q=vec2(1.0-q.y,q.x); q.y=1.0-q.y; vec2 tc=src.xy+q*src.zw; vec4 px=texture(image,tc); if(hdr_eotf==2) px.rgb=tone(px.rgb); else if(hdr_eotf==3) px.rgb=hlg_tone(px.rgb); color=px;}
+"#;
 
 pub struct Gpu {
     egl: Egl,
@@ -50,6 +75,8 @@ pub struct Gpu {
     dst_uniform: Option<glow::UniformLocation>,
     src_uniform: Option<glow::UniformLocation>,
     rotation_uniform: Option<glow::UniformLocation>,
+    hdr_eotf_uniform: Option<glow::UniformLocation>,
+    hdr_peak_nits_uniform: Option<glow::UniformLocation>,
     hdr_peak_uniform: Option<glow::UniformLocation>,
     hdr_white_uniform: Option<glow::UniformLocation>,
     hdr_scale_uniform: Option<glow::UniformLocation>,
@@ -98,6 +125,8 @@ impl Gpu {
             dst_uniform: None,
             src_uniform: None,
             rotation_uniform: None,
+            hdr_eotf_uniform: None,
+            hdr_peak_nits_uniform: None,
             hdr_peak_uniform: None,
             hdr_white_uniform: None,
             hdr_scale_uniform: None,
@@ -142,6 +171,8 @@ impl Gpu {
             self.dst_uniform = self.gl.get_uniform_location(program, "dst");
             self.src_uniform = self.gl.get_uniform_location(program, "src");
             self.rotation_uniform = self.gl.get_uniform_location(program, "rotation");
+            self.hdr_eotf_uniform = self.gl.get_uniform_location(program, "hdr_eotf");
+            self.hdr_peak_nits_uniform = self.gl.get_uniform_location(program, "hdr_peak_nits");
             self.hdr_peak_uniform = self.gl.get_uniform_location(program, "hdr_peak_pq");
             self.hdr_white_uniform = self.gl.get_uniform_location(program, "hdr_white_pq");
             self.hdr_scale_uniform = self.gl.get_uniform_location(program, "hdr_white_scale");
@@ -149,6 +180,8 @@ impl Gpu {
             if self.dst_uniform.is_none()
                 || self.src_uniform.is_none()
                 || self.rotation_uniform.is_none()
+                || self.hdr_eotf_uniform.is_none()
+                || self.hdr_peak_nits_uniform.is_none()
                 || self.hdr_peak_uniform.is_none()
                 || self.hdr_white_uniform.is_none()
                 || self.hdr_scale_uniform.is_none()
@@ -346,13 +379,16 @@ impl Gpu {
                 );
                 self.gl
                     .uniform_1_i32(self.rotation_uniform.as_ref(), plane.rotation as i32);
-                let (peak_pq, white_pq, white_scale) = hdr_uniforms(plane)?;
+                let (eotf, peak_pq, white_pq, white_scale, peak_nits) = hdr_uniforms(plane)?;
+                self.gl.uniform_1_i32(self.hdr_eotf_uniform.as_ref(), eotf);
                 self.gl
                     .uniform_1_f32(self.hdr_peak_uniform.as_ref(), peak_pq);
                 self.gl
                     .uniform_1_f32(self.hdr_white_uniform.as_ref(), white_pq);
                 self.gl
                     .uniform_1_f32(self.hdr_scale_uniform.as_ref(), white_scale);
+                self.gl
+                    .uniform_1_f32(self.hdr_peak_nits_uniform.as_ref(), peak_nits);
                 self.gl.draw_arrays(glow::TRIANGLES, 0, 3);
                 let gl_error = self.gl.get_error();
                 if gl_error != glow::NO_ERROR {
@@ -417,6 +453,7 @@ impl Gpu {
             pixel[6..8].copy_from_slice(&alpha.to_ne_bytes());
         }
         let mut baseline = [0u8; 4];
+        let hlg_output;
         let mut orientations_match = true;
         unsafe {
             gpu.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
@@ -457,6 +494,7 @@ impl Gpu {
             gpu.gl.active_texture(glow::TEXTURE0);
             gpu.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
             gpu.gl.uniform_1_i32(gpu.sampler_uniform.as_ref(), 0);
+            gpu.gl.uniform_1_i32(gpu.hdr_eotf_uniform.as_ref(), 2);
             gpu.gl
                 .uniform_4_f32(gpu.dst_uniform.as_ref(), -1.0, -1.0, 1.0, 1.0);
             gpu.gl
@@ -467,6 +505,8 @@ impl Gpu {
                 .uniform_1_f32(gpu.hdr_white_uniform.as_ref(), pq_encode(203.0));
             gpu.gl
                 .uniform_1_f32(gpu.hdr_scale_uniform.as_ref(), 10000.0 / 203.0);
+            gpu.gl
+                .uniform_1_f32(gpu.hdr_peak_nits_uniform.as_ref(), 446.0);
             for rotation in 0..4 {
                 gpu.gl.clear_color(0.0, 0.0, 0.0, 1.0);
                 gpu.gl.clear(glow::COLOR_BUFFER_BIT);
@@ -500,6 +540,55 @@ impl Gpu {
                     }
                 }
             }
+            for (pixel, level) in image.chunks_exact_mut(8).zip([0.75f32, 0.5, 0.25, 0.0]) {
+                let value = if normalized_16 {
+                    (level * 65535.0).round() as u16
+                } else {
+                    f32_to_f16(level)
+                };
+                for channel in 0..3 {
+                    pixel[channel * 2..channel * 2 + 2].copy_from_slice(&value.to_ne_bytes());
+                }
+            }
+            gpu.gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                (if normalized_16 {
+                    glow::RGBA16
+                } else {
+                    glow::RGBA16F
+                }) as i32,
+                2,
+                2,
+                0,
+                glow::RGBA,
+                if normalized_16 {
+                    glow::UNSIGNED_SHORT
+                } else {
+                    glow::HALF_FLOAT
+                },
+                glow::PixelUnpackData::Slice(Some(&image)),
+            );
+            gpu.gl.uniform_1_i32(gpu.hdr_eotf_uniform.as_ref(), 3);
+            gpu.gl
+                .uniform_1_f32(gpu.hdr_peak_nits_uniform.as_ref(), 1000.0);
+            gpu.gl
+                .uniform_1_f32(gpu.hdr_peak_uniform.as_ref(), pq_encode(1000.0));
+            gpu.gl.clear_color(0.0, 0.0, 0.0, 1.0);
+            gpu.gl.clear(glow::COLOR_BUFFER_BIT);
+            gpu.gl.uniform_1_i32(gpu.rotation_uniform.as_ref(), 0);
+            gpu.gl.draw_arrays(glow::TRIANGLES, 0, 3);
+            gpu.gl.read_pixels(
+                0,
+                0,
+                2,
+                2,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelPackData::Slice(Some(&mut gpu.rgba)),
+            );
+            flip_rows(&mut gpu.rgba, 8, 2);
+            hlg_output = [gpu.rgba[0], gpu.rgba[4], gpu.rgba[8], gpu.rgba[12]];
             gpu.gl.bind_vertex_array(None);
             gpu.gl.use_program(None);
             gpu.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
@@ -521,6 +610,13 @@ impl Gpu {
             pixel[0].abs_diff(pixel[1]) > 2 || pixel[1].abs_diff(pixel[2]) > 2 || pixel[3] < 250
         }) {
             return Err(AppError::new("synthetic HDR channel/alpha check failed"));
+        }
+        if hlg_output[0] <= 200
+            || hlg_output[0] <= hlg_output[1]
+            || hlg_output[1] <= hlg_output[2]
+            || hlg_output[2] <= hlg_output[3]
+        {
+            return Err(AppError::new("synthetic HLG decode/tone-map check failed"));
         }
         Ok(())
     }
@@ -619,16 +715,16 @@ fn is_supported_rgb(format: u32) -> bool {
     )
 }
 
-fn hdr_uniforms(plane: &Plane) -> Result<(f32, f32, f32)> {
+fn hdr_uniforms(plane: &Plane) -> Result<(i32, f32, f32, f32, f32)> {
     let Some(hdr) = plane.hdr.as_ref() else {
-        return Ok((0.0, 0.0, 1.0));
+        return Ok((0, 0.0, 0.0, 1.0, 0.0));
     };
     if hdr.metadata_type != 0 || hdr.infoframe_metadata_type != 0 {
         return Err(AppError::new("unsupported KMS HDR metadata type"));
     }
     match hdr.eotf {
-        0 => Ok((0.0, 0.0, 1.0)),
-        2 => {
+        0 => Ok((0, 0.0, 0.0, 1.0, 0.0)),
+        2 | 3 => {
             let white = 203.0f32;
             let reported_peak = if hdr.max_cll > 0 {
                 hdr.max_cll
@@ -642,7 +738,13 @@ fn hdr_uniforms(plane: &Plane) -> Result<(f32, f32, f32)> {
             })
             .max(white)
             .min(10000.0);
-            Ok((pq_encode(peak), pq_encode(white), 10000.0 / white))
+            Ok((
+                hdr.eotf as i32,
+                pq_encode(peak),
+                pq_encode(white),
+                10000.0 / white,
+                peak,
+            ))
         }
         eotf => Err(AppError::new(format!(
             "unsupported KMS HDR transfer function {eotf}"
@@ -668,6 +770,16 @@ fn f32_to_f16(value: f32) -> u16 {
 fn pq_decode(pq: f32) -> f32 {
     let e = pq.max(0.0).powf(1.0 / 78.84375);
     ((e - 0.8359375).max(0.0) / (18.851_563 - 18.6875 * e)).powf(1.0 / 0.159_301_76)
+}
+
+fn hlg_reference_luminance(signal: f32, peak_nits: f32) -> f32 {
+    let scene = if signal <= 0.5 {
+        signal * signal / 3.0
+    } else {
+        ((signal - 0.559_910_7) / 0.178_832_77).exp() / 12.0 + 0.284_668_92 / 12.0
+    };
+    let gamma = (1.2 + 0.42 * (peak_nits / 1000.0).log10()).max(1.0);
+    peak_nits * scene.powf(gamma)
 }
 
 fn output_size(width: u32, height: u32) -> Result<(usize, usize)> {
@@ -699,6 +811,32 @@ fn flip_rows(data: &mut [u8], stride: usize, height: usize) {
 
 const fn fourcc(bytes: [u8; 4]) -> u32 {
     u32::from_le_bytes(bytes)
+}
+const fn dma_buf_plane_attribute_keys(index: usize) -> [i32; 5] {
+    let index = index as i32;
+    [
+        EGL_DMA_BUF_PLANE0_FD_EXT + index * 3,
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT + index * 3,
+        EGL_DMA_BUF_PLANE0_PITCH_EXT + index * 3,
+        EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT + index * 2,
+        EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT + index * 2,
+    ]
+}
+
+fn modifier_import_enabled(modifier: u64, extensions: &str) -> Result<bool> {
+    if modifier == DRM_FORMAT_MOD_INVALID {
+        return Ok(false);
+    }
+    if extensions
+        .split_whitespace()
+        .any(|ext| ext == "EGL_EXT_image_dma_buf_import_modifiers")
+    {
+        Ok(true)
+    } else {
+        Err(AppError::new(format!(
+            "GPU EGL cannot import KMS DMA-BUF modifier 0x{modifier:016x}: EGL_EXT_image_dma_buf_import_modifiers is unavailable; refusing to discard the layout modifier"
+        )))
+    }
 }
 
 fn compile_shader(gl: &glow::Context, kind: u32, source: &str) -> Result<glow::NativeShader> {
@@ -743,6 +881,9 @@ fn self_test_inner() -> Result<()> {
     if (pq_decode(pq_encode(203.0)) - 203.0 / 10000.0).abs() > 0.0001 {
         return Err(AppError::new("PQ encode/decode check failed"));
     }
+    if (hlg_reference_luminance(0.75, 1000.0) - 203.0).abs() > 2.0 {
+        return Err(AppError::new("HLG EOTF reference-white check failed"));
+    }
     let mut rows = [1, 2, 3, 4, 5, 6, 7, 8];
     flip_rows(&mut rows, 4, 2);
     if rows != [5, 6, 7, 8, 1, 2, 3, 4] {
@@ -781,7 +922,6 @@ struct Egl {
     context: *mut c_void,
     surface: *mut c_void,
     egl_extensions: String,
-    no_modifiers_fallback: Cell<bool>,
     _gbm_library: Library,
     gbm_device: *mut c_void,
     gbm_device_destroy: GbmDeviceDestroy,
@@ -869,7 +1009,6 @@ impl Egl {
             context: std::ptr::null_mut(),
             surface: std::ptr::null_mut(),
             egl_extensions: String::new(),
-            no_modifiers_fallback: Cell::new(false),
             _gbm_library: gbm_library,
             gbm_device: std::ptr::null_mut(),
             gbm_device_destroy,
@@ -988,14 +1127,8 @@ impl Egl {
 
     fn import_image<'a>(&'a self, plane: &Plane) -> Result<EglImage<'a>> {
         let modifier = plane.modifier;
-        let has_modifier = modifier != DRM_FORMAT_MOD_INVALID;
-        let use_modifiers = has_modifier
-            && !self.no_modifiers_fallback.get()
-            && self
-                .egl_extensions
-                .split_whitespace()
-                .any(|ext| ext == "EGL_EXT_image_dma_buf_import_modifiers");
-        let make_attributes = |use_modifiers: bool| {
+        let use_modifiers = modifier_import_enabled(modifier, &self.egl_extensions)?;
+        let make_attributes = || {
             let mut attributes = [EGL_NONE; 64];
             let mut len = 0;
             let mut push = |key: i32, value: i32| {
@@ -1007,27 +1140,22 @@ impl Egl {
             push(EGL_HEIGHT, plane.height as i32);
             push(EGL_LINUX_DRM_FOURCC_EXT, plane.pixel_format as i32);
             for (index, buffer) in plane.buffers.iter().enumerate() {
-                let n = index as i32;
-                push(EGL_DMA_BUF_PLANE0_FD_EXT + n * 3, buffer.fd.as_raw_fd());
-                push(EGL_DMA_BUF_PLANE0_OFFSET_EXT + n * 3, buffer.offset as i32);
-                push(EGL_DMA_BUF_PLANE0_PITCH_EXT + n * 3, buffer.pitch as i32);
+                let [fd, offset, pitch, modifier_lo, modifier_hi] =
+                    dma_buf_plane_attribute_keys(index);
+                push(fd, buffer.fd.as_raw_fd());
+                push(offset, buffer.offset as i32);
+                push(pitch, buffer.pitch as i32);
                 if use_modifiers {
-                    push(
-                        EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT + n * 2,
-                        modifier as u32 as i32,
-                    );
-                    push(
-                        EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT + n * 2,
-                        (modifier >> 32) as u32 as i32,
-                    );
+                    push(modifier_lo, modifier as u32 as i32);
+                    push(modifier_hi, (modifier >> 32) as u32 as i32);
                 }
             }
             attributes[len] = EGL_NONE;
             attributes
         };
-        let mut attributes = make_attributes(use_modifiers);
+        let attributes = make_attributes();
         unsafe { while (self.get_error)() != EGL_SUCCESS {} }
-        let mut image = unsafe {
+        let image = unsafe {
             (self.create_image)(
                 self.display,
                 std::ptr::null_mut(),
@@ -1036,31 +1164,13 @@ impl Egl {
                 attributes.as_ptr(),
             )
         };
-        let mut error = unsafe { (self.get_error)() };
-        if (image.is_null() || error != EGL_SUCCESS) && use_modifiers {
-            if !image.is_null() {
-                unsafe { (self.destroy_image)(self.display, image) };
-            }
-            self.no_modifiers_fallback.set(true);
-            attributes = make_attributes(false);
-            unsafe { while (self.get_error)() != EGL_SUCCESS {} }
-            image = unsafe {
-                (self.create_image)(
-                    self.display,
-                    std::ptr::null_mut(),
-                    EGL_LINUX_DMA_BUF_EXT,
-                    std::ptr::null_mut(),
-                    attributes.as_ptr(),
-                )
-            };
-            error = unsafe { (self.get_error)() };
-        }
+        let error = unsafe { (self.get_error)() };
         if image.is_null() || error != EGL_SUCCESS {
             if !image.is_null() {
                 unsafe { (self.destroy_image)(self.display, image) };
             }
             return Err(AppError::new(format!(
-                "importing KMS DMA-BUF (format 0x{:08x}, modifier 0x{:016x}) failed (EGL error 0x{error:04x})",
+                "importing KMS DMA-BUF (format 0x{:08x}, modifier 0x{:016x}) failed (EGL error 0x{error:04x}); verify that the selected GPU supports this framebuffer layout (no modifier-less retry is attempted)",
                 plane.pixel_format, plane.modifier
             )));
         }
@@ -1130,4 +1240,86 @@ unsafe fn extension<T: Copy>(get_proc: GetProcAddress, name: &[u8]) -> Result<T>
 
 pub fn synthetic_render_test(monitor: &Monitor) -> Result<()> {
     Gpu::synthetic_render_test(monitor)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kms::HdrMetadata;
+
+    fn plane(hdr: Option<HdrMetadata>) -> Plane {
+        Plane {
+            buffers: Vec::new(),
+            width: 1,
+            height: 1,
+            pixel_format: 0,
+            modifier: DRM_FORMAT_MOD_INVALID,
+            connector_id: 0,
+            plane_type: 0,
+            rotation: 0,
+            src_x: 0,
+            src_y: 0,
+            src_w: 1,
+            src_h: 1,
+            dst_x: 0,
+            dst_y: 0,
+            dst_w: 1,
+            dst_h: 1,
+            zpos: 0,
+            hdr,
+        }
+    }
+
+    #[test]
+    fn egl_dma_buf_keys_cover_planes_zero_through_three() {
+        for (index, expected) in [
+            [0x3272, 0x3273, 0x3274, 0x3443, 0x3444],
+            [0x3275, 0x3276, 0x3277, 0x3445, 0x3446],
+            [0x3278, 0x3279, 0x327a, 0x3447, 0x3448],
+            [0x327b, 0x327c, 0x327d, 0x3449, 0x344a],
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert_eq!(dma_buf_plane_attribute_keys(index), *expected);
+        }
+    }
+
+    #[test]
+    fn hdr_metadata_selects_sdr_pq_and_hlg_without_fallback() {
+        assert_eq!(hdr_uniforms(&plane(None)).unwrap(), (0, 0.0, 0.0, 1.0, 0.0));
+        let metadata = |eotf| HdrMetadata {
+            metadata_type: 0,
+            infoframe_metadata_type: 0,
+            eotf,
+            max_luminance: 1000,
+            min_luminance: 0,
+            max_cll: 1000,
+            max_fall: 500,
+        };
+        let pq = hdr_uniforms(&plane(Some(metadata(2)))).unwrap();
+        let hlg = hdr_uniforms(&plane(Some(metadata(3)))).unwrap();
+        assert_eq!(pq.0, 2);
+        assert_eq!(hlg.0, 3);
+        assert_eq!(pq.1, hlg.1);
+        assert_eq!(pq.2, pq_encode(203.0));
+        assert_eq!(hlg.4, 1000.0);
+        assert!(hdr_uniforms(&plane(Some(metadata(1)))).is_err());
+        assert!(hdr_uniforms(&plane(Some(HdrMetadata {
+            metadata_type: 1,
+            ..metadata(2)
+        })))
+        .is_err());
+    }
+
+    #[test]
+    fn explicit_modifiers_are_never_dropped_without_egl_support() {
+        assert!(!modifier_import_enabled(DRM_FORMAT_MOD_INVALID, "").unwrap());
+        assert!(modifier_import_enabled(0, "").is_err());
+        assert!(modifier_import_enabled(
+            0,
+            "EGL_EXT_image_dma_buf_import EGL_EXT_image_dma_buf_import_modifiers"
+        )
+        .unwrap());
+    }
 }

@@ -18,6 +18,7 @@ const PAIR_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const PAIR_TIMEOUT: Duration = Duration::from_secs(2);
 const EXT_CONTROL_PAYLOAD: &[u8] =
     br#"{"write":{"command":"display","animType":"extControl","extControlVersion":"v2"}}"#;
+const POWER_OFF_PAYLOAD: &[u8] = br#"{"on":{"value":false}}"#;
 
 struct HttpResponse {
     status: u32,
@@ -290,6 +291,46 @@ pub fn enable_stream(cfg: &Config) -> Result<u16> {
     parse_stream_port(&body, port)
 }
 
+fn parse_selected_effect(body: &[u8]) -> Option<String> {
+    let raw = std::str::from_utf8(body).ok()?.trim();
+    let selected = match serde_json::from_str::<Value>(raw) {
+        Ok(Value::String(effect)) => effect,
+        Ok(Value::Object(object)) => object.get("select")?.as_str()?.to_owned(),
+        Ok(_) if raw.starts_with('{') || raw.starts_with('[') => return None,
+        _ => raw.to_owned(),
+    };
+    if selected.is_empty()
+        || selected.chars().any(char::is_control)
+        || matches!(selected.as_str(), "*Static*" | "*Dynamic*" | "*Solid*")
+        || selected.eq_ignore_ascii_case("extControl")
+    {
+        return None;
+    }
+    Some(selected)
+}
+
+pub fn selected_effect(cfg: &Config) -> Option<String> {
+    request(cfg, "/effects/select", "GET", None)
+        .ok()
+        .and_then(|body| parse_selected_effect(&body))
+}
+
+fn effect_selection_payload(effect: &str) -> Result<Vec<u8>> {
+    serde_json::to_vec(&serde_json::json!({"select": effect}))
+        .map_err(|_| AppError::new("cannot encode Nanoleaf effect selection"))
+}
+
+pub fn restore_effect(cfg: &Config, effect: &str) -> Result<()> {
+    let payload = effect_selection_payload(effect)?;
+    request(cfg, "/effects", "PUT", Some(&payload))?;
+    Ok(())
+}
+
+pub fn power_off(cfg: &Config) -> Result<()> {
+    request(cfg, "/state", "PUT", Some(POWER_OFF_PAYLOAD))?;
+    Ok(())
+}
+
 pub fn pair_device(cfg: &mut Config) -> Result<()> {
     let host = validate_host(&cfg.host)?;
     eprintln!("Hold the Nanoleaf 4D power button for 5 seconds, then pair within 30 seconds.");
@@ -311,7 +352,7 @@ pub fn pair_device(cfg: &mut Config) -> Result<()> {
                     .ok_or_else(|| AppError::new("pairing response has no valid auth_token"))?;
                 validate_token(token)?;
                 cfg.token = token.to_owned();
-                cfg.save()?;
+                cfg.save_credentials()?;
                 eprintln!("Paired with {host}; credentials saved.");
                 return Ok(());
             }
@@ -460,6 +501,25 @@ pub fn self_test() -> Result<()> {
         token: "saved-token".to_owned(),
         ..Config::default()
     };
+    expect(
+        POWER_OFF_PAYLOAD == br#"{"on":{"value":false}}"#
+            && api_url(&cfg, "/state", Some(&cfg.token))
+                .is_ok_and(|url| url.ends_with("/api/v1/saved-token/state")),
+        "device self-test: documented power-off request",
+    )?;
+    expect(
+        parse_selected_effect(b"\"Favorite scene\"").as_deref() == Some("Favorite scene")
+            && parse_selected_effect(b"Favorite scene").as_deref() == Some("Favorite scene")
+            && parse_selected_effect(b"\"*Static*\"").is_none()
+            && parse_selected_effect(b"\"extControl\"").is_none()
+            && parse_selected_effect(b"").is_none()
+            && parse_selected_effect(b"{}").is_none(),
+        "device self-test: restore only a saved selected effect",
+    )?;
+    expect(
+        effect_selection_payload("Favorite scene")? == br#"{"select":"Favorite scene"}"#,
+        "device self-test: selected-effect restore payload",
+    )?;
     expect(
         api_url(&cfg, "/new", None).is_ok_and(|url| url == "http://[::1]:16021/api/v1/new"),
         "device self-test: unauthenticated pairing URL",

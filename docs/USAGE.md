@@ -18,15 +18,13 @@ make
 make install-user
 ```
 
-`make install-user` installs the worker, Plasma applet, user service, D-Bus activation entry, and hidden desktop identity. It refuses to continue while the legacy `nanoleaf-sync.service` or CLI worker is active; stop that old stream yourself, then retry. It removes only the inactive legacy service/binaries, reloads D-Bus activation and systemd's user units, and does not enable, start, stop, or restart Wayleaf 4D. Existing config and credentials are not replaced.
+`make install-user` installs the worker, Plasma applet, user service, D-Bus activation entry, and hidden desktop identity. It refuses to continue while the legacy `nanoleaf-sync.service` or CLI worker is active; stop that old stream yourself, then retry. It removes only the inactive legacy service/binaries, reloads D-Bus activation and systemd's user units, and does not enable, start, stop, or restart Wayleaf 4D. The executable is replaced atomically, so installation does not interrupt a running stream; an already-running worker keeps its old code until its next start. Existing config and credentials are not replaced. Absolute `XDG_DATA_HOME` and `XDG_CONFIG_HOME` overrides are honored; absent or relative values use the standard home-directory defaults.
 
-Find **Wayleaf 4D** in the System Tray under **Hardware**, or add the widget to a panel/desktop through Plasma's **Add Widgets**. The widget starts stopped.
+Open **Wayleaf 4D** from the System Tray or add the widget to a panel with Plasma's **Add Widgets**. Pair through **Pair a Nanoleaf 4D**: discover it through Avahi or enter its IPv4 address. Enable **Settings → Connect to API** in the Nanoleaf app or hold the 4D power button for 5 seconds, then pair within 30 seconds.
 
-The status dot is green while the worker reports `running`, red on an error, and muted otherwise. Worker errors appear in the error banner; rejected live settings include the worker's D-Bus error name and message. Since extControl uses one-way UDP, green means the worker successfully sent a frame locally; it does not confirm receipt by the panels.
+The status dot is green while the worker reports `running`, red on an error, and muted otherwise. The Start/Stop switch controls the current sync session; **Start at login** is independent in the More options menu. Worker errors appear in the error banner. Since extControl uses one-way UDP, green means the worker successfully sent a frame locally; it does not confirm receipt by the panels.
 
-Open its **Device** tab. Search the local network through Avahi or enter the controller's IPv4 address manually. Enable **Settings → Connect to API** in the Nanoleaf app or hold the 4D power button for 5 seconds, then pair within the controller's 30-second pairing window. Turn sync off before pairing or disconnecting a device.
-
-The widget stores the API token in the owner-only config file and displays device name, model, serial number, firmware, and address. **Disconnect** removes only the saved address and token from this computer; it does not revoke API access on the controller.
+When unpaired, use **Pair a Nanoleaf 4D** to search the local network or enter a manual IPv4 address. Device details and **Disconnect** are in **More options**. Disconnect removes the saved address and token from this computer; it does not revoke controller authorization.
 
 Terminal pairing is also available:
 
@@ -36,17 +34,20 @@ wayleaf-4d --pair --ip 192.0.2.10
 
 Replace `192.0.2.10` with the controller's address.
 
-Turn on the widget and choose a monitor in **Main → Capture monitor**, then press **Apply monitor**. If synchronization is enabled, applying a different monitor restarts the worker on that display. Capture starts directly through KMS; no portal consent is requested and KDE's Screen Casting indicator is not shown. This bypasses the portal's per-session consent and visible capture indicator. The package-managed GSR helper can access scanout without that prompt, so enable sync only when you intentionally want sampled display colors sent to the Nanoleaf. Turning the switch off stops capture.
+After pairing, choose a capture monitor; the selection applies immediately. Use the Start/Stop switch to begin or end synchronization. **More options → About capture** explains that direct KMS capture bypasses portal consent and KDE's Screen Casting indicator; screen images are not saved. The package-managed GSR helper can access scanout without that prompt, so start sync only when you intend to send sampled display colors to the Nanoleaf.
+When the widget popup is open while sync is running, the LED-zone preview shows the sampled colors and controller IDs at up to 10 updates per second. Closing the popup disables preview updates; it does not stop synchronization.
+**HDR capture:** KMS planes with supported metadata use PQ (ST 2084) or HLG conversion and Rec.2020-to-Rec.709 tone mapping before producing the 8-bit RGB stream sent to the 4D. This is HDR-aware capture, not HDR output to the panels. Missing HDR metadata is treated as SDR; malformed or unsupported HDR metadata stops capture with an error rather than silently using SDR. Actual color accuracy depends on the monitor, driver, and KMS metadata.
 
 ## Start, stop, and login behavior
 
-The switch controls the user service and remembered login state:
+**Start/Stop** controls the current user-service session; **Start at login** controls only the remembered systemd enablement:
 
-- **On** enables and starts `wayleaf-4d.service`.
-- **Off** stops the worker and disables the service.
-- Logging out ends the graphical session. When enabled, the service starts at the next graphical login; when disabled, it stays off.
+- **Start** starts `wayleaf-4d.service` without changing the login preference.
+- **Stop** stops the worker and then best-effort turns the Nanoleaf off. A power-off failure does not prevent the worker from stopping and appears as a warning. Stop does not change the login preference.
+- **Start at login** can be changed without starting or stopping a currently running worker.
+- When the enabled service's graphical session ends, systemd stops that run; the login preference remains in effect for the next session.
 
-The worker exits with status 75 for failures it classifies as temporary; systemd retries that status after 15 seconds. Other errors are not retried. Fix the reported cause, then toggle sync off and on. Prefer the widget switch to manual `systemctl enable/disable` so displayed and systemd state remain synchronized. To stream directly from a terminal instead, run `wayleaf-4d --monitor NAME` (or use unambiguous auto-selection) and stop it with Ctrl-C; do not run it while the service is active, since only one worker can run at a time.
+The worker exits with status 75 for failures it classifies as temporary; systemd retries that status after 15 seconds. Other errors are not retried. Fix the reported cause, then use Run again. Prefer the widget controls to manual `systemctl enable/disable` so displayed and systemd state remain synchronized. To stream directly from a terminal instead, run `wayleaf-4d --monitor NAME` (or use unambiguous auto-selection) and stop it with Ctrl-C; do not run it while the service is active, since only one worker can run at a time.
 
 Check the service and current-boot logs with:
 
@@ -58,13 +59,16 @@ systemctl --user is-enabled wayleaf-4d.service
 
 The last command reports whether the service is configured to start at login.
 
+
 ## Controls and defaults
 
-The **Device** page searches local Nanoleaf mDNS records (Avahi) or accepts a manual IPv4 address, pairs, shows device details, and locally disconnects saved credentials. The **Main** page contains brightness, saturation, and response. **Tuning** contains sampling and image-handling controls. Sliders also accept numeric entry.
+The main popup keeps the sync switch and **Brightness** visible. Brightness is shown as 0–100% of the available output range (50% is neutral; the default 1.5× setting appears as 75%). The **Main** tab contains the live preview, presets, monitor selection, pairing, and device actions. The **Fine tune** tab contains the remaining sampling and color controls in a scrollable panel. Use the reset icon beside each slider value to restore its default; click a value to enter it exactly. Keyboard arrows adjust the focused slider, Shift+wheel adjusts a slider, and normal wheel scrolling moves through the list.
+
+**Subtle**, **Balanced**, and **Vivid** adjust only saturation, response, maximum step, edge depth, center blend, brightest-pixel blend, and capture/send rate. Balanced matches those settings' existing defaults. Fine-tuning one of them selects **Custom**; its last custom values are saved in the applet configuration and restored by **Custom**. Other controls and existing settings remain unchanged when choosing a preset.
 
 | Control | Config key | Range | Default | Effect |
 |---|---|---:|---:|---|
-| Brightness | `brightness` | 0–2 | 1.5 | Scales final LED brightness; 1.0 is neutral. |
+| Brightness | `brightness` | 0–2 (displayed 0–100%) | 1.5 (displayed 75%) | Scales final LED brightness; 1.0 is neutral. |
 | Saturation boost | `saturation_boost` | 0–3 | 1.5 | Emphasizes saturated pixels. |
 | Response | `smooth` | 0.05–1 | 0.35 | Higher values follow changes faster; lower values smooth more but add lag. |
 | Capture/send rate | `fps` | 1–10 Hz | 10 Hz | Requested frame rate; the implementation caps it at 10 Hz. |
@@ -82,11 +86,11 @@ Center blend, brightest-pixel blend, and feather depth can be set in the widget,
 
 ## Configuration and security
 
-The worker, widget, and CLI share `$XDG_CONFIG_HOME/nanoleaf-sync/config.json` (normally `~/.config/nanoleaf-sync/config.json`). It contains the controller IP, API token, and settings. New settings use the documented defaults when older config files omit them. Settings saves discard obsolete `corner`, `offset`, and `reverse` keys while preserving unrelated JSON values, including a legacy portal restore-token key if one exists; that token is not used for capture. The config file is stored with owner-only read/write permissions (mode `0600`); do not publish it, paste it into support requests, or commit it.
+The worker, widget, and CLI share `$XDG_CONFIG_HOME/nanoleaf-sync/config.json` (normally `~/.config/nanoleaf-sync/config.json`). Absolute `XDG_CONFIG_HOME` values are used; absent or relative values fall back to `~/.config`. The file contains the controller IP, API token, and settings. New settings use the documented defaults when older config files omit them. Settings saves discard obsolete `corner`, `offset`, and `reverse` keys while preserving unrelated JSON values, including a legacy portal restore-token key if one exists; that token is not used for capture. New writes use owner-only read/write permissions (mode `0600`); if an existing credential file is more permissive, the widget warns without silently changing its permissions. Do not publish it, paste it into support requests, or commit it.
 
 The Nanoleaf LAN API uses HTTP on port 16021, and the extControl stream uses UDP on the controller-reported port (60222 is the fallback). Keep the controller and host on a trusted local network; do not expose these services to the Internet. The token is sent to the controller as part of the local API request.
 
-The widget's **Disconnect** action removes only `ip` and `token`; settings and other JSON keys remain unchanged. Obsolete alignment keys are removed the next time settings are saved. Disconnect does not revoke the token on the controller. Revoke API access through the Nanoleaf controller/app if required.
+The widget's **Disconnect** action removes only `ip` and `token`; settings and other JSON keys remain unchanged. If sync is active, the action stops it and best-effort powers off the Nanoleaf first. A power-off failure is shown as a warning, but does not prevent local credential removal. Disconnect does not revoke the token on the controller. Revoke API access through the Nanoleaf controller/app if required.
 
 The helper can access the selected display's KMS scanout without a portal grant, consent dialog, or KDE Screen Casting indicator. Only the separately installed, package-managed GSR helper carries `CAP_SYS_ADMIN`; the worker/control process is not elevated and Wayleaf does not change capabilities. Frames are reduced and sampled in memory; only segment colors are sent to the controller, and no screen images are saved. `--capture-debug` prints sampled RGB values, which may disclose screen content in terminal logs; review that text before sharing it.
 
@@ -136,16 +140,29 @@ Each zone uses saturation-weighted averaging blended with its brightest-luma pix
 
 ## Remove
 
-Turn the widget off first; this stops streaming and disables login startup. Then remove the installed files (the config and credentials are intentionally kept):
+Stop sync using the widget first; explicit Stop best-effort turns off the Nanoleaf. If you do not want the service to start at the next login, turn **Start at login** off separately. Then remove the installed files (the config and credentials are intentionally kept):
 
 ```sh
-systemctl --user disable --now wayleaf-4d.service
-rm -rf "$HOME/.local/share/plasma/plasmoids/io.github.avitretiak.Wayleaf4D"
+data_home=${XDG_DATA_HOME:-}
+case $data_home in /*) ;; *) data_home="$HOME/.local/share";; esac
+config_home=${XDG_CONFIG_HOME:-}
+case $config_home in /*) ;; *) config_home="$HOME/.config";; esac
+systemctl --user disable wayleaf-4d.service
+rm -rf "$data_home/plasma/plasmoids/io.github.avitretiak.Wayleaf4D"
 rm -f "$HOME/.local/bin/wayleaf-4d" \
-  "$HOME/.local/share/applications/io.github.avitretiak.Wayleaf4D.desktop" \
-  "$HOME/.local/share/dbus-1/services/io.github.avitretiak.Wayleaf4D.Control.service" \
-  "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/wayleaf-4d.service"
+  "$data_home/icons/hicolor/scalable/apps/io.github.avitretiak.Wayleaf4D.svg" \
+  "$data_home/applications/io.github.avitretiak.Wayleaf4D.desktop" \
+  "$data_home/dbus-1/services/io.github.avitretiak.Wayleaf4D.Control.service" \
+  "$config_home/systemd/user/wayleaf-4d.service"
 systemctl --user daemon-reload
 ```
 
-To remove all local credentials and settings, remove `${XDG_CONFIG_HOME:-$HOME/.config}/nanoleaf-sync/`. A legacy portal restore-token value may be present in that file but is not used by current capture. No portal ScreenCast permission is used by Wayleaf.
+To remove all local credentials and settings, resolve the config directory the same way:
+
+```sh
+config_home=${XDG_CONFIG_HOME:-}
+case $config_home in /*) ;; *) config_home="$HOME/.config";; esac
+rm -rf "$config_home/nanoleaf-sync/"
+```
+
+A legacy portal restore-token value may be present there but is not used by current capture. No portal ScreenCast permission is used by Wayleaf.

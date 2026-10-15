@@ -20,6 +20,7 @@ const RESULT_MAX: i32 = 4;
 const REQUEST_GET_KMS: i32 = 1;
 const HDR_STATIC_METADATA_TYPE1: u32 = 0;
 const HDR_EOTF_SMPTE_ST2084: u8 = 2;
+const HDR_EOTF_HLG: u8 = 3;
 const MAX_ITEMS: usize = 8;
 const MAX_DMA_BUFS: usize = 4;
 const MAX_FDS: usize = MAX_ITEMS * MAX_DMA_BUFS;
@@ -226,11 +227,8 @@ impl KmsClient {
                 plane.dst_w = item.dst_w;
                 plane.dst_h = item.dst_h;
                 plane.zpos = item.zpos;
-                plane.hdr = if item.has_hdr_metadata == 1 {
-                    hdr_metadata(&item.hdr_metadata)
-                } else {
-                    None
-                };
+                plane.hdr =
+                    hdr_metadata((item.has_hdr_metadata == 1).then_some(&item.hdr_metadata))?;
                 for buffer_index in 0..nbufs {
                     let fd = received_fds.take(fd_index + buffer_index);
                     let descriptor = &item.dma_bufs[buffer_index];
@@ -445,16 +443,23 @@ pub fn self_test() -> Result<()> {
     response.items[0].hdr_metadata.hdmi_metadata_type1.eotf = HDR_EOTF_SMPTE_ST2084;
     if validate_response(&response)? != 1
         || validate_fd_count(1, 1).is_err()
-        || hdr_metadata(&response.items[0].hdr_metadata).is_none()
+        || hdr_metadata(None)?.is_some()
+        || hdr_metadata(Some(&response.items[0].hdr_metadata))?.is_none()
     {
         return Err(AppError::new(
-            "KMS protocol self-check rejected valid HDR metadata",
+            "KMS protocol self-check rejected valid or absent HDR metadata",
+        ));
+    }
+    response.items[0].hdr_metadata.hdmi_metadata_type1.eotf = HDR_EOTF_HLG;
+    if hdr_metadata(Some(&response.items[0].hdr_metadata))?.is_none() {
+        return Err(AppError::new(
+            "KMS protocol self-check rejected HLG metadata",
         ));
     }
     response.items[0].hdr_metadata.metadata_type = 1;
-    if hdr_metadata(&response.items[0].hdr_metadata).is_some() {
+    if hdr_metadata(Some(&response.items[0].hdr_metadata)).is_ok() {
         return Err(AppError::new(
-            "KMS protocol self-check exposed unsupported outer HDR metadata",
+            "KMS protocol self-check accepted unsupported outer HDR metadata",
         ));
     }
     response.items[0].hdr_metadata.metadata_type = HDR_STATIC_METADATA_TYPE1;
@@ -462,9 +467,9 @@ pub fn self_test() -> Result<()> {
         .hdr_metadata
         .hdmi_metadata_type1
         .metadata_type = 1;
-    if hdr_metadata(&response.items[0].hdr_metadata).is_some() {
+    if hdr_metadata(Some(&response.items[0].hdr_metadata)).is_ok() {
         return Err(AppError::new(
-            "KMS protocol self-check exposed unsupported infoframe metadata",
+            "KMS protocol self-check accepted unsupported infoframe metadata",
         ));
     }
     response.items[0]
@@ -472,9 +477,9 @@ pub fn self_test() -> Result<()> {
         .hdmi_metadata_type1
         .metadata_type = HDR_STATIC_METADATA_TYPE1 as u8;
     response.items[0].hdr_metadata.hdmi_metadata_type1.eotf = 1;
-    if hdr_metadata(&response.items[0].hdr_metadata).is_some() {
+    if hdr_metadata(Some(&response.items[0].hdr_metadata)).is_ok() {
         return Err(AppError::new(
-            "KMS protocol self-check exposed unsupported HDR EOTF",
+            "KMS protocol self-check accepted unsupported HDR EOTF",
         ));
     }
     response.items[0].hdr_metadata.hdmi_metadata_type1.eotf = HDR_EOTF_SMPTE_ST2084;
@@ -854,15 +859,23 @@ fn server_result_error(response: &WireResponse) -> AppError {
     }
 }
 
-fn hdr_metadata(metadata: &HdrOutputMetadata) -> Option<HdrMetadata> {
+fn hdr_metadata(metadata: Option<&HdrOutputMetadata>) -> Result<Option<HdrMetadata>> {
+    let Some(metadata) = metadata else {
+        return Ok(None);
+    };
     let frame = &metadata.hdmi_metadata_type1;
     if metadata.metadata_type != HDR_STATIC_METADATA_TYPE1
         || frame.metadata_type as u32 != HDR_STATIC_METADATA_TYPE1
-        || frame.eotf != HDR_EOTF_SMPTE_ST2084
     {
-        return None;
+        return Err(AppError::new("unsupported KMS HDR metadata type"));
     }
-    Some(HdrMetadata {
+    if !matches!(frame.eotf, 0 | HDR_EOTF_SMPTE_ST2084 | HDR_EOTF_HLG) {
+        return Err(AppError::new(format!(
+            "unsupported KMS HDR transfer function {}",
+            frame.eotf
+        )));
+    }
+    Ok(Some(HdrMetadata {
         metadata_type: metadata.metadata_type,
         infoframe_metadata_type: frame.metadata_type,
         eotf: frame.eotf,
@@ -870,7 +883,7 @@ fn hdr_metadata(metadata: &HdrOutputMetadata) -> Option<HdrMetadata> {
         min_luminance: frame.min_display_mastering_luminance,
         max_cll: frame.max_cll,
         max_fall: frame.max_fall,
-    })
+    }))
 }
 
 fn empty_wire_response() -> WireResponse {
@@ -1348,5 +1361,34 @@ impl Drop for DrmObjectProperties {
 impl Drop for DrmProperty {
     fn drop(&mut self) {
         unsafe { drmModeFreeProperty(self.0.as_ptr()) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn absent_supported_and_unsupported_hdr_metadata_are_distinct() {
+        assert_eq!(hdr_metadata(None).unwrap(), None);
+        let mut response = empty_wire_response();
+        let metadata = &mut response.items[0].hdr_metadata;
+        metadata.metadata_type = HDR_STATIC_METADATA_TYPE1;
+        metadata.hdmi_metadata_type1.metadata_type = HDR_STATIC_METADATA_TYPE1 as u8;
+        metadata.hdmi_metadata_type1.eotf = HDR_EOTF_SMPTE_ST2084;
+        assert_eq!(
+            hdr_metadata(Some(&*metadata)).unwrap().unwrap().eotf,
+            HDR_EOTF_SMPTE_ST2084
+        );
+        metadata.hdmi_metadata_type1.eotf = HDR_EOTF_HLG;
+        assert_eq!(
+            hdr_metadata(Some(&*metadata)).unwrap().unwrap().eotf,
+            HDR_EOTF_HLG
+        );
+        metadata.metadata_type = 1;
+        assert!(hdr_metadata(Some(&*metadata)).is_err());
+        metadata.metadata_type = HDR_STATIC_METADATA_TYPE1;
+        metadata.hdmi_metadata_type1.eotf = 1;
+        assert!(hdr_metadata(Some(&*metadata)).is_err());
     }
 }

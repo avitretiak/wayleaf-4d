@@ -28,6 +28,8 @@ const STATE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const BUS_CALL_TIMEOUT: Duration = Duration::from_secs(3);
 const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(15);
 const DISCOVERY_WINDOW: Duration = Duration::from_secs(5);
+const MAX_SETTINGS_BYTES: usize = 4 * 1024;
+type AvahiResolveServiceArgs = (i32, i32, String, String, String, i32, u32);
 type AvahiResolvedService = (
     i32,
     i32,
@@ -35,12 +37,12 @@ type AvahiResolvedService = (
     String,
     String,
     String,
-    u32,
+    i32,
     String,
     u16,
     Vec<Vec<u8>>,
+    u32,
 );
-
 struct Shared {
     state: Mutex<State>,
 }
@@ -49,15 +51,27 @@ struct State {
     config: Config,
     status: String,
     error: String,
+    running: bool,
     enabled: bool,
     busy: bool,
     worker_present: bool,
     device_connected: bool,
     device_busy: bool,
     device_info: Value,
+    device_info_stale: bool,
     discovered_devices: Vec<Value>,
     device_message: String,
+    preview_enabled: bool,
     monitors: Vec<kms::Monitor>,
+    monitor_error: String,
+    revision: u64,
+}
+
+struct WorkerSnapshot {
+    present: Option<bool>,
+    status: Option<std::result::Result<String, String>>,
+    settings: Option<std::result::Result<HashMap<String, OwnedValue>, String>>,
+    error: Option<String>,
 }
 
 impl State {
@@ -67,15 +81,20 @@ impl State {
             config,
             status: "stopped".into(),
             error: String::new(),
+            running: false,
             enabled: false,
             busy: false,
             worker_present: false,
             device_connected,
             device_busy: false,
             device_info: json!({}),
+            device_info_stale: false,
             discovered_devices: Vec::new(),
             device_message: String::new(),
             monitors,
+            monitor_error: String::new(),
+            preview_enabled: false,
+            revision: 0,
         }
     }
 
@@ -84,15 +103,18 @@ impl State {
             "settings": self.config.settings_json(),
             "status": self.status,
             "error": self.error,
+            "running": self.running,
             "enabled": self.enabled,
             "busy": self.busy,
             "deviceConnected": self.device_connected,
             "deviceBusy": self.device_busy,
             "deviceHost": self.config.host,
             "deviceInfo": self.device_info,
+            "deviceInfoStale": self.device_info_stale,
             "discoveredDevices": self.discovered_devices,
             "deviceMessage": self.device_message,
             "monitors": self.monitors,
+            "monitorError": self.monitor_error,
             "selectedMonitor": self.config.monitor,
         })
     }
@@ -112,7 +134,7 @@ pub fn run(config: Config) -> Result<()> {
     };
     let mut initial = State::new(config, monitors);
     if let Some(error) = monitor_error {
-        initial.error = error;
+        initial.monitor_error = error;
     }
     let shared = Arc::new(Shared {
         state: Mutex::new(initial),
@@ -159,7 +181,37 @@ impl ControlApi {
         serde_json::to_string(&state_lock(&self.shared).json()).unwrap_or_else(|_| "{}".into())
     }
 
+    #[zbus(name = "GetPreview")]
+    fn get_preview(&self) -> String {
+        if !state_lock(&self.shared).preview_enabled {
+            return "[]".into();
+        }
+        let Ok(connection) = session_connection() else {
+            return "[]".into();
+        };
+        worker_preview_on(&connection)
+    }
+
+    #[zbus(name = "SetPreviewEnabled")]
+    fn set_preview_enabled(&self, enabled: bool) {
+        state_lock(&self.shared).preview_enabled = enabled;
+        let Ok(connection) = session_connection() else {
+            return;
+        };
+        if !worker_present_on(&connection).unwrap_or(false) {
+            return;
+        }
+        if let Ok(proxy) = worker_proxy(&connection) {
+            let _: std::result::Result<(), zbus::Error> = proxy.call("SetPreviewEnabled", &enabled);
+        };
+    }
+
     fn set_settings(&self, settings_json: String) -> fdo::Result<()> {
+        if settings_json.len() > MAX_SETTINGS_BYTES {
+            return Err(fdo::Error::InvalidArgs(
+                "settings JSON exceeds the 4 KiB limit".into(),
+            ));
+        }
         let updates: Value = serde_json::from_str(&settings_json)
             .map_err(|_| fdo::Error::InvalidArgs("settings must be valid JSON".into()))?;
         if !updates.is_object() {
@@ -187,6 +239,7 @@ impl ControlApi {
                 return Ok(());
             }
             state.busy = true;
+            state.revision = state.revision.wrapping_add(1);
             state.error.clear();
         }
         spawn_task(
@@ -194,12 +247,13 @@ impl ControlApi {
             "wayleaf-control-settings",
             BusyKind::Control,
             move |shared| {
-                finish_control(&shared, apply_settings(&shared, &updates), None, None);
+                finish_control(&shared, apply_settings(&shared, &updates), None, None, None);
             },
         )
     }
 
-    fn set_enabled(&self, enabled: bool) -> fdo::Result<()> {
+    #[zbus(name = "Run")]
+    fn run(&self) -> fdo::Result<()> {
         {
             let mut state = state_lock(&self.shared);
             if state.busy || state.device_busy {
@@ -208,20 +262,69 @@ impl ControlApi {
                 ));
             }
             state.busy = true;
+            state.revision = state.revision.wrapping_add(1);
             state.error.clear();
-            state.status = if enabled { "starting" } else { "stopping" }.into();
+            state.status = "starting".into();
         }
         spawn_task(
             &self.shared,
-            "wayleaf-control-lifecycle",
+            "wayleaf-control-run",
             BusyKind::Control,
             move |shared| {
-                let result = set_enabled(&shared, enabled);
+                finish_control(&shared, run_worker(), Some(true), None, Some("starting"));
+            },
+        )
+    }
+
+    #[zbus(name = "Stop")]
+    fn stop(&self) -> fdo::Result<()> {
+        {
+            let mut state = state_lock(&self.shared);
+            if state.busy || state.device_busy {
+                return Err(fdo::Error::Failed(
+                    "another control operation is in progress".into(),
+                ));
+            }
+            state.busy = true;
+            state.revision = state.revision.wrapping_add(1);
+            state.error.clear();
+            state.status = "stopping".into();
+        }
+        spawn_task(
+            &self.shared,
+            "wayleaf-control-stop",
+            BusyKind::Control,
+            move |shared| match stop_worker_and_power_off(&shared) {
+                Ok(warning) => finish_stop(&shared, warning),
+                Err(error) => finish_control(&shared, Err(error), None, None, None),
+            },
+        )
+    }
+
+    #[zbus(name = "SetStartAtLogin")]
+    fn set_start_at_login(&self, enabled: bool) -> fdo::Result<()> {
+        {
+            let mut state = state_lock(&self.shared);
+            if state.busy || state.device_busy {
+                return Err(fdo::Error::Failed(
+                    "another control operation is in progress".into(),
+                ));
+            }
+            state.busy = true;
+            state.revision = state.revision.wrapping_add(1);
+            state.error.clear();
+        }
+        spawn_task(
+            &self.shared,
+            "wayleaf-control-login-setting",
+            BusyKind::Control,
+            move |shared| {
                 finish_control(
                     &shared,
-                    result,
+                    set_start_at_login(enabled),
+                    None,
                     Some(enabled),
-                    Some(if enabled { "starting" } else { "stopped" }),
+                    None,
                 );
             },
         )
@@ -249,8 +352,9 @@ impl ControlApi {
                 return Ok(());
             }
             state.busy = true;
+            state.revision = state.revision.wrapping_add(1);
             state.error.clear();
-            if state.worker_present || state.status == "running" || state.status == "starting" {
+            if state.running {
                 state.status = "stopping".into();
             }
         }
@@ -258,15 +362,7 @@ impl ControlApi {
             &self.shared,
             "wayleaf-control-monitor",
             BusyKind::Control,
-            move |shared| {
-                let result = select_monitor(&shared, &name);
-                let status = if state_lock(&shared).enabled {
-                    "starting"
-                } else {
-                    "stopped"
-                };
-                finish_control(&shared, result, None, Some(status));
-            },
+            move |shared| finish_control(&shared, select_monitor(&shared, &name), None, None, None),
         )
     }
 
@@ -279,6 +375,7 @@ impl ControlApi {
                 ));
             }
             state.device_busy = true;
+            state.revision = state.revision.wrapping_add(1);
             state.discovered_devices.clear();
             state.device_message = "Searching the local network for Nanoleaf devices…".into();
         }
@@ -296,6 +393,7 @@ impl ControlApi {
                         "Select your Nanoleaf 4D from the results.".into()
                     };
                     state.device_busy = false;
+                    state.revision = state.revision.wrapping_add(1);
                 }
                 Err(message) => finish_device(&shared, Err(message)),
             },
@@ -314,13 +412,14 @@ impl ControlApi {
                     "another control operation is in progress".into(),
                 ));
             }
-            if state.enabled || state.status != "stopped" {
+            if state.running || matches!(state.status.as_str(), "starting" | "running" | "stopping")
+            {
                 state.device_message =
                     "Turn sync off before pairing or forgetting a device.".into();
                 return Err(fdo::Error::Failed(state.device_message.clone()));
             }
             state.device_busy = true;
-            state.device_info = json!({});
+            state.revision = state.revision.wrapping_add(1);
             state.device_message = "Pairing. Hold the 4D power button for 5 seconds first…".into();
         }
         spawn_task(
@@ -348,7 +447,8 @@ impl ControlApi {
                 ));
             }
             state.device_busy = true;
-            state.device_info = json!({});
+            state.revision = state.revision.wrapping_add(1);
+            state.device_info_stale = true;
             state.device_message = "Loading device details…".into();
         }
         spawn_task(
@@ -357,19 +457,19 @@ impl ControlApi {
             BusyKind::Device,
             move |shared| {
                 let config = state_lock(&shared).config.clone();
-                let result = device::device_info(&config).map_err(|error| error.to_string());
+                let result = device::device_info(&config);
                 match result {
                     Ok(info) => {
                         let mut state = state_lock(&shared);
                         state.device_info = info;
+                        state.device_info_stale = false;
                         state.device_message = "Device details updated.".into();
                         state.device_busy = false;
+                        state.revision = state.revision.wrapping_add(1);
                     }
-                    Err(error) => finish_device(
+                    Err(_) => finish_device(
                         &shared,
-                        Err(format!(
-                            "Device is saved, but its details could not be loaded. {error}"
-                        )),
+                        Err("Device is saved, but its details could not be refreshed.".into()),
                     ),
                 }
             },
@@ -384,12 +484,14 @@ impl ControlApi {
                     "another control operation is in progress".into(),
                 ));
             }
-            if state.enabled || state.status != "stopped" {
+            if state.running || matches!(state.status.as_str(), "starting" | "running" | "stopping")
+            {
                 state.device_message =
                     "Turn sync off before pairing or forgetting a device.".into();
                 return Err(fdo::Error::Failed(state.device_message.clone()));
             }
             state.device_busy = true;
+            state.revision = state.revision.wrapping_add(1);
         }
         spawn_task(
             &self.shared,
@@ -402,8 +504,37 @@ impl ControlApi {
         )
     }
 
+    #[zbus(name = "StopAndForgetDevice")]
+    fn stop_and_forget_device_action(&self) -> fdo::Result<()> {
+        {
+            let mut state = state_lock(&self.shared);
+            if state.busy || state.device_busy {
+                return Err(fdo::Error::Failed(
+                    "another control operation is in progress".into(),
+                ));
+            }
+            if !state.device_connected {
+                return Err(fdo::Error::Failed("no Nanoleaf device is paired".into()));
+            }
+            state.device_busy = true;
+            state.revision = state.revision.wrapping_add(1);
+            state.device_message = "Stopping sync and disconnecting…".into();
+        }
+        spawn_task(
+            &self.shared,
+            "wayleaf-control-stop-and-forget",
+            BusyKind::Device,
+            move |shared| {
+                let result = stop_worker_and_forget_device(&shared);
+                finish_device(&shared, result);
+            },
+        )
+    }
+
     fn clear_error(&self) {
-        state_lock(&self.shared).error.clear();
+        let mut state = state_lock(&self.shared);
+        state.error.clear();
+        state.revision = state.revision.wrapping_add(1);
     }
 }
 
@@ -436,6 +567,7 @@ where
                     state.device_message = "Cannot start device operation.".into();
                 }
             }
+            state.revision = state.revision.wrapping_add(1);
             fdo::Error::Failed("cannot start background operation".into())
         })
 }
@@ -443,6 +575,7 @@ where
 fn finish_control(
     shared: &Shared,
     result: std::result::Result<(), String>,
+    running: Option<bool>,
     enabled: Option<bool>,
     success_status: Option<&str>,
 ) {
@@ -450,6 +583,9 @@ fn finish_control(
     state.busy = false;
     match result {
         Ok(()) => {
+            if let Some(running) = running {
+                state.running = running;
+            }
             if let Some(enabled) = enabled {
                 state.enabled = enabled;
             }
@@ -462,6 +598,17 @@ fn finish_control(
             state.error = error;
         }
     }
+    state.revision = state.revision.wrapping_add(1);
+}
+
+fn finish_stop(shared: &Shared, warning: Option<String>) {
+    let mut state = state_lock(shared);
+    state.busy = false;
+    state.running = false;
+    state.worker_present = false;
+    state.status = "stopped".into();
+    state.error = warning.unwrap_or_default();
+    state.revision = state.revision.wrapping_add(1);
 }
 
 fn finish_device(shared: &Shared, result: std::result::Result<(), String>) {
@@ -470,6 +617,7 @@ fn finish_device(shared: &Shared, result: std::result::Result<(), String>) {
     if let Err(message) = result {
         state.device_message = message;
     }
+    state.revision = state.revision.wrapping_add(1);
 }
 
 fn apply_settings(shared: &Shared, updates: &Value) -> std::result::Result<(), String> {
@@ -504,7 +652,9 @@ fn apply_settings(shared: &Shared, updates: &Value) -> std::result::Result<(), S
         candidate
             .apply_settings(updates)
             .map_err(|error| error.to_string())?;
-        candidate.save().map_err(|error| error.to_string())?;
+        candidate
+            .save_settings(updates)
+            .map_err(|error| error.to_string())?;
         let mut state = state_lock(shared);
         state.config = candidate;
         state.worker_present = false;
@@ -513,69 +663,180 @@ fn apply_settings(shared: &Shared, updates: &Value) -> std::result::Result<(), S
     }
 }
 
-fn set_enabled(shared: &Shared, enabled: bool) -> std::result::Result<(), String> {
+fn run_worker() -> std::result::Result<(), String> {
     let present = worker_present()?;
-    if enabled {
-        let active = systemctl_active()?;
-        let args: &[&str] = if present || active {
-            &["enable", SYSTEMD_UNIT]
-        } else {
-            &["enable", "--now", SYSTEMD_UNIT]
-        };
-        systemctl_ok(args, "could not enable and start wayleaf-4d.service")?;
-        let mut state = state_lock(shared);
-        state.worker_present = present;
-        return Ok(());
-    }
+    let active = systemctl_active()?;
     if present {
-        worker_stop()?;
+        return if active {
+            Ok(())
+        } else {
+            Err("a standalone CLI worker is running; stop it before starting the service".into())
+        };
     }
     systemctl_ok(
-        &["disable", "--now", SYSTEMD_UNIT],
-        "could not disable wayleaf-4d.service",
-    )?;
-    state_lock(shared).worker_present = false;
+        &["start", SYSTEMD_UNIT],
+        "could not start wayleaf-4d.service",
+    )
+}
+
+fn set_start_at_login(enabled: bool) -> std::result::Result<(), String> {
+    let action = if enabled { "enable" } else { "disable" };
+    systemctl_ok(
+        &[action, SYSTEMD_UNIT],
+        "could not change start-at-login setting",
+    )
+}
+
+fn stop_worker_and_power_off(shared: &Shared) -> std::result::Result<Option<String>, String> {
+    if worker_present()? {
+        worker_stop()?;
+    }
+    systemctl_ok(&["stop", SYSTEMD_UNIT], "could not stop wayleaf-4d.service")?;
+    wait_until_stopped()?;
+
+    {
+        let mut state = state_lock(shared);
+        state.running = false;
+        state.worker_present = false;
+        state.status = "stopped".into();
+    }
+
+    let config = state_lock(shared).config.clone();
+    Ok(device::power_off(&config)
+        .err()
+        .map(|_| "Sync stopped, but the Nanoleaf could not be powered off.".into()))
+}
+
+fn stop_worker_and_forget_device(shared: &Shared) -> std::result::Result<(), String> {
+    let worker_running = worker_present()?;
+    let service_running = systemctl_active()?;
+    if worker_running {
+        worker_stop()?;
+    }
+    if service_running {
+        systemctl_ok(&["stop", SYSTEMD_UNIT], "could not stop wayleaf-4d.service")?;
+    }
+    wait_until_stopped()?;
+
+    {
+        let mut state = state_lock(shared);
+        state.running = false;
+        state.worker_present = false;
+        state.status = "stopped".into();
+    }
+
+    let config = state_lock(shared).config.clone();
+    let warning = if worker_running || service_running {
+        device::power_off(&config).err().map(|_| {
+            "Warning: Sync stopped, but the Nanoleaf could not be powered off. The saved address and token were removed; controller authorization remains enabled."
+                .to_owned()
+        })
+    } else {
+        None
+    };
+    forget_device(shared)?;
+    state_lock(shared).device_message = warning.unwrap_or_default();
     Ok(())
+}
+
+fn wait_until_stopped() -> std::result::Result<(), String> {
+    let deadline = Instant::now() + SYSTEMCTL_TIMEOUT;
+    loop {
+        if !worker_present()? && !systemctl_active()? {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err("wayleaf-4d.service did not fully stop".into());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn select_monitor(shared: &Shared, name: &str) -> std::result::Result<(), String> {
     kms::select_monitor(name).map_err(|error| error.to_string())?;
-    let path = state_lock(shared).config.config_path.clone();
-    let present = worker_present()?;
-    let enabled = systemctl_enabled()?;
+    let previous = state_lock(shared).config.clone();
+    let update = json!({"monitor": name});
+    let mut candidate = previous.clone();
+    candidate
+        .apply_settings(&update)
+        .map_err(|error| error.to_string())?;
+
+    let was_enabled = systemctl_enabled()?;
     let active = systemctl_active()?;
-    if present {
-        worker_stop()?;
+    let present = worker_present()?;
+    let was_running = present || active;
+    {
+        let mut state = state_lock(shared);
+        state.running = was_running;
+        state.enabled = was_enabled;
+        state.worker_present = present;
     }
-    if active || enabled {
+    if present && !active {
+        return Err("cannot change the monitor while a standalone CLI worker is running".into());
+    }
+
+    if was_running {
+        if present {
+            worker_stop()?;
+        }
         systemctl_ok(
             &["stop", SYSTEMD_UNIT],
             "could not stop wayleaf-4d.service before changing monitor",
         )?;
+        wait_until_stopped()?;
+        let mut state = state_lock(shared);
+        state.running = false;
+        state.worker_present = false;
+        state.status = "stopped".into();
     }
-    let mut candidate = Config::load(&path).map_err(|error| error.to_string())?;
-    candidate
-        .apply_settings(&json!({"monitor": name}))
-        .map_err(|error| error.to_string())?;
-    candidate.save().map_err(|error| error.to_string())?;
+
+    if let Err(save_error) = previous.save_settings(&update) {
+        let recovery = if was_running {
+            systemctl_ok(
+                &["start", SYSTEMD_UNIT],
+                "could not restart previous worker",
+            )
+        } else {
+            Ok(())
+        };
+        let mut state = state_lock(shared);
+        if recovery.is_ok() && was_running {
+            state.running = true;
+            state.status = "starting".into();
+        }
+        if let Err(recovery_error) = recovery {
+            state.running = false;
+            state.worker_present = false;
+            return Err(format!(
+                "could not save monitor setting: {save_error}; could not restore previous running state: {recovery_error}"
+            ));
+        }
+        return Err(save_error.to_string());
+    }
+
+    let candidate = Config::load(&previous.config_path).unwrap_or(candidate);
     {
         let mut state = state_lock(shared);
         state.config = candidate;
-        state.enabled = enabled;
+        state.running = false;
         state.worker_present = false;
+        state.status = "stopped".into();
         state.device_connected = !state.config.host.is_empty() && !state.config.token.is_empty();
     }
-    if enabled {
+    if was_running {
         systemctl_ok(
             &["start", SYSTEMD_UNIT],
-            "could not restart wayleaf-4d.service with the selected monitor",
+            "monitor was saved but wayleaf-4d.service could not be restarted",
         )?;
+        let mut state = state_lock(shared);
+        state.running = true;
+        state.status = "starting".into();
     }
     Ok(())
 }
 
 fn pair_device(shared: &Shared, address: &str) -> std::result::Result<(), String> {
-    if worker_present()? || systemctl_enabled()? || systemctl_active()? {
+    if worker_present()? || systemctl_active()? {
         return Err("Turn sync off before pairing or forgetting a device.".into());
     }
     let mut config = state_lock(shared).config.clone();
@@ -588,10 +849,11 @@ fn pair_device(shared: &Shared, address: &str) -> std::result::Result<(), String
     match info {
         Ok(info) => {
             state.device_info = info;
+            state.device_info_stale = false;
             state.device_message = "Device paired. Device details updated.".into();
         }
         Err(_) => {
-            state.device_info = json!({});
+            state.device_info_stale = true;
             state.device_message = "Paired, but device details could not be loaded.".into();
         }
     }
@@ -599,7 +861,7 @@ fn pair_device(shared: &Shared, address: &str) -> std::result::Result<(), String
 }
 
 fn forget_device(shared: &Shared) -> std::result::Result<(), String> {
-    if worker_present()? || systemctl_enabled()? || systemctl_active()? {
+    if worker_present()? || systemctl_active()? {
         return Err("Turn sync off before pairing or forgetting a device.".into());
     }
     let path = state_lock(shared).config.config_path.clone();
@@ -609,95 +871,149 @@ fn forget_device(shared: &Shared) -> std::result::Result<(), String> {
     state.config.token.clear();
     state.device_connected = false;
     state.device_info = json!({});
+    state.device_info_stale = false;
     state.discovered_devices.clear();
-    state.device_message = "Saved credentials removed from this computer. API access on the controller was not revoked.".into();
     Ok(())
 }
 
 fn refresh_state(shared: &Shared) {
-    let enabled = systemctl_enabled().ok();
-    let connection = match session_connection() {
-        Ok(connection) => connection,
-        Err(_) => return,
+    let revision = state_lock(shared).revision;
+    let monitors = kms::monitors().map_err(|error| error.to_string());
+    let enabled = systemctl_enabled();
+    let active = systemctl_active();
+    let worker = match session_connection() {
+        Ok(connection) => match worker_present_on(&connection) {
+            Ok(true) => WorkerSnapshot {
+                present: Some(true),
+                status: Some(worker_status_on(&connection)),
+                settings: Some(worker_settings_on(&connection)),
+                error: None,
+            },
+            Ok(false) => WorkerSnapshot {
+                present: Some(false),
+                status: None,
+                settings: None,
+                error: None,
+            },
+            Err(error) => WorkerSnapshot {
+                present: None,
+                status: None,
+                settings: None,
+                error: Some(error),
+            },
+        },
+        Err(error) => WorkerSnapshot {
+            present: None,
+            status: None,
+            settings: None,
+            error: Some(error),
+        },
     };
-    let present = match worker_present_on(&connection) {
-        Ok(present) => present,
-        Err(_) => return,
-    };
-    let worker_status = if present {
-        Some(worker_status_on(&connection))
-    } else {
-        None
-    };
-    let worker_settings = if present {
-        Some(worker_settings_on(&connection))
-    } else {
-        None
-    };
-    let service_active = if !present && enabled == Some(true) {
-        systemctl_active().ok()
-    } else {
-        None
-    };
+    apply_refresh_snapshot(shared, revision, monitors, enabled, active, worker);
+}
 
+fn apply_refresh_snapshot(
+    shared: &Shared,
+    revision: u64,
+    monitors: std::result::Result<Vec<kms::Monitor>, String>,
+    enabled: std::result::Result<bool, String>,
+    active: std::result::Result<bool, String>,
+    worker: WorkerSnapshot,
+) {
+    let WorkerSnapshot {
+        present,
+        status: worker_status,
+        settings: worker_settings,
+        error: worker_error,
+    } = worker;
     let mut state = state_lock(shared);
-    if state.busy {
+    if state.revision != revision {
         return;
     }
-    if let Some(enabled) = enabled {
+    match monitors {
+        Ok(monitors) => {
+            state.monitors = monitors;
+            state.monitor_error.clear();
+        }
+        Err(error) => state.monitor_error = error,
+    }
+    if state.busy || state.device_busy {
+        return;
+    }
+    let enabled_error = enabled.as_ref().err().cloned();
+    if let Ok(enabled) = enabled {
         state.enabled = enabled;
     }
-    state.worker_present = present;
-    if present {
-        match worker_status.unwrap_or_else(|| Err("could not query worker status".into())) {
-            Ok(status) if matches!(status.as_str(), "starting" | "running" | "stopping") => {
-                state.status = status;
-                match worker_settings
-                    .unwrap_or_else(|| Err("could not query worker settings".into()))
-                {
-                    Ok(values) => match owned_settings_json(values) {
-                        Ok(values) => {
-                            let mut config = state.config.clone();
-                            if config.apply_settings(&values).is_ok() {
-                                state.config = config;
-                                state.device_connected =
-                                    !state.config.host.is_empty() && !state.config.token.is_empty();
-                            } else {
-                                state.status = "error".into();
-                                state.error = "worker returned unsupported settings".into();
+
+    let mut refresh_error = worker_error.or(enabled_error);
+    match present {
+        Some(true) => {
+            state.worker_present = true;
+            state.running = true;
+            match worker_status.unwrap_or_else(|| Err("could not query worker status".into())) {
+                Ok(status) if matches!(status.as_str(), "starting" | "running" | "stopping") => {
+                    state.status = status;
+                    match worker_settings
+                        .unwrap_or_else(|| Err("could not query worker settings".into()))
+                    {
+                        Ok(values) => match owned_settings_json(values) {
+                            Ok(values) => {
+                                let mut config = state.config.clone();
+                                if config.apply_settings(&values).is_ok() {
+                                    state.config = config;
+                                    state.device_connected = !state.config.host.is_empty()
+                                        && !state.config.token.is_empty();
+                                } else {
+                                    state.status = "error".into();
+                                    refresh_error =
+                                        Some("worker returned unsupported settings".into());
+                                }
                             }
-                        }
+                            Err(error) => {
+                                state.status = "error".into();
+                                refresh_error = Some(error);
+                            }
+                        },
                         Err(error) => {
                             state.status = "error".into();
-                            state.error = error;
+                            refresh_error = Some(error);
                         }
-                    },
-                    Err(error) => {
-                        state.status = "error".into();
-                        state.error = error;
                     }
                 }
-            }
-            Ok(_) => {
-                state.status = "error".into();
-                state.error = "worker reported an unknown status".into();
-            }
-            Err(error) => {
-                state.status = "error".into();
-                state.error = error;
+                Ok(_) => {
+                    state.status = "error".into();
+                    refresh_error = Some("worker reported an unknown status".into());
+                }
+                Err(error) => {
+                    state.status = "error".into();
+                    refresh_error = Some(error);
+                }
             }
         }
-    } else if !state.enabled {
-        state.status = "stopped".into();
-    } else {
-        match service_active {
-            Some(true) => state.status = "starting".into(),
-            Some(false) => {
-                state.status = "error".into();
-                state.error = "Wayleaf 4D service is not active; inspect journalctl --user -u wayleaf-4d.service".into();
+        Some(false) => {
+            state.worker_present = false;
+            match active {
+                Ok(true) => {
+                    state.running = true;
+                    state.status = "starting".into();
+                }
+                Ok(false) => {
+                    state.running = false;
+                    state.status = "stopped".into();
+                }
+                Err(error) => refresh_error = Some(error),
             }
-            None => {}
         }
+        None => {
+            if matches!(active, Ok(true)) {
+                state.running = true;
+                state.status = "starting".into();
+            }
+        }
+    }
+    if let Some(error) = refresh_error {
+        state.status = "error".into();
+        state.error = error;
     }
 }
 
@@ -729,6 +1045,19 @@ fn worker_present_on(connection: &Connection) -> std::result::Result<bool, Strin
 fn worker_proxy<'a>(connection: &'a Connection) -> std::result::Result<Proxy<'a>, String> {
     Proxy::new(connection, WORKER_NAME, WORKER_PATH, WORKER_INTERFACE)
         .map_err(|_| "cannot connect to worker D-Bus".to_owned())
+}
+
+fn worker_preview_on(connection: &Connection) -> String {
+    if !worker_present_on(connection).unwrap_or(false) {
+        return "[]".into();
+    }
+    let Ok(proxy) = worker_proxy(connection) else {
+        return "[]".into();
+    };
+    let _: std::result::Result<(), zbus::Error> = proxy.call("SetPreviewEnabled", &true);
+    proxy
+        .call("GetPreview", &())
+        .unwrap_or_else(|_| "[]".into())
 }
 
 fn worker_status_on(connection: &Connection) -> std::result::Result<String, String> {
@@ -935,6 +1264,7 @@ fn discover_devices() -> std::result::Result<Vec<Value>, String> {
 
     let deadline = Instant::now() + DISCOVERY_WINDOW;
     let mut devices = Vec::new();
+    let mut resolution_error = None;
     loop {
         if Instant::now() >= deadline {
             break;
@@ -956,23 +1286,27 @@ fn discover_devices() -> std::result::Result<Vec<Value>, String> {
         if service != NANOLEAF_SERVICE {
             continue;
         }
-        let resolved: std::result::Result<AvahiResolvedService, _> = server.call(
-            "ResolveService",
-            &(
-                interface,
-                protocol,
-                name.clone(),
-                service,
-                domain,
-                0_u32,
-                0_u32,
-            ),
-        );
-        if let Ok((_, _, _, _, _, _, _, address, _, _)) = resolved {
-            push_discovered(&mut devices, name, &address);
+        let args: AvahiResolveServiceArgs =
+            (interface, protocol, name.clone(), service, domain, -1, 0);
+        let resolved: std::result::Result<AvahiResolvedService, _> =
+            server.call("ResolveService", &args);
+        match resolved {
+            Ok((_, _, _, _, _, _, _, address, _, _, _)) => {
+                push_discovered(&mut devices, name, &address);
+            }
+            Err(error) => {
+                resolution_error.get_or_insert_with(|| {
+                    format!(
+                        "Avahi could not resolve Nanoleaf service {name}: {error}. Enter the device IP manually."
+                    )
+                });
+            }
         }
     }
     let _ = timer.join();
+    if let Some(error) = resolution_error {
+        return Err(error);
+    }
     Ok(devices)
 }
 
@@ -1037,6 +1371,76 @@ mod tests {
     }
 
     #[test]
+    fn closed_preview_returns_no_sample_data() {
+        let api = ControlApi {
+            shared: Arc::new(Shared {
+                state: Mutex::new(State::new(Config::default(), Vec::new())),
+            }),
+        };
+        assert_eq!(api.get_preview(), "[]");
+    }
+
+    #[test]
+    fn stop_and_forget_rejects_an_overlapping_control_operation() {
+        let mut state = State::new(Config::default(), Vec::new());
+        state.busy = true;
+        state.device_connected = true;
+        let api = ControlApi {
+            shared: Arc::new(Shared {
+                state: Mutex::new(state),
+            }),
+        };
+
+        assert!(api.stop_and_forget_device_action().is_err());
+        let state = state_lock(&api.shared);
+        assert!(state.busy);
+        assert!(!state.device_busy);
+        assert!(state.device_connected);
+    }
+
+    #[test]
+    fn oversized_settings_json_is_rejected_before_parsing() {
+        let api = ControlApi {
+            shared: Arc::new(Shared {
+                state: Mutex::new(State::new(Config::default(), Vec::new())),
+            }),
+        };
+        let error = api
+            .set_settings("x".repeat(MAX_SETTINGS_BYTES + 1))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            fdo::Error::InvalidArgs(message) if message == "settings JSON exceeds the 4 KiB limit"
+        ));
+    }
+
+    #[test]
+    fn avahi_resolve_service_signatures_match_installed_xml() {
+        assert_eq!(
+            <AvahiResolveServiceArgs as zbus::zvariant::Type>::SIGNATURE.to_string(),
+            "(iisssiu)"
+        );
+        assert_eq!(
+            <AvahiResolvedService as zbus::zvariant::Type>::SIGNATURE.to_string(),
+            "(iissssisqaayu)"
+        );
+    }
+
+    #[test]
+    fn run_state_and_login_preference_are_independent() {
+        for running in [false, true] {
+            for enabled in [false, true] {
+                let mut state = State::new(Config::default(), Vec::new());
+                state.running = running;
+                state.enabled = enabled;
+                let json = state.json();
+                assert_eq!(json["running"], running);
+                assert_eq!(json["enabled"], enabled);
+            }
+        }
+    }
+
+    #[test]
     fn state_json_never_contains_credentials() {
         let config = Config {
             host: "192.0.2.1".into(),
@@ -1058,5 +1462,88 @@ mod tests {
             assert!(f64::try_from(values.remove(key).unwrap()).is_ok());
         }
         assert_eq!(i32::try_from(values.remove("fps").unwrap()).unwrap(), 10);
+    }
+
+    fn test_monitor(name: &str) -> kms::Monitor {
+        kms::Monitor {
+            name: name.into(),
+            card_path: "/dev/dri/card0".into(),
+            connector_id: 1,
+            width: 1920,
+            height: 1080,
+        }
+    }
+
+    fn stopped_worker() -> WorkerSnapshot {
+        WorkerSnapshot {
+            present: Some(false),
+            status: None,
+            settings: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn stale_refresh_cannot_overwrite_completed_control_state() {
+        let shared = Shared {
+            state: Mutex::new(State::new(Config::default(), vec![test_monitor("DP-1")])),
+        };
+        {
+            let mut state = state_lock(&shared);
+            state.revision = 1;
+            state.running = true;
+            state.enabled = true;
+            state.worker_present = true;
+            state.status = "running".into();
+        }
+
+        apply_refresh_snapshot(
+            &shared,
+            0,
+            Ok(Vec::new()),
+            Ok(false),
+            Ok(false),
+            stopped_worker(),
+        );
+
+        let state = state_lock(&shared);
+        assert!(state.running);
+        assert!(state.enabled);
+        assert!(state.worker_present);
+        assert_eq!(state.status, "running");
+        assert_eq!(state.monitors.len(), 1);
+    }
+
+    #[test]
+    fn monitor_refresh_errors_keep_last_list_and_hotplug_refresh_replaces_it() {
+        let shared = Shared {
+            state: Mutex::new(State::new(Config::default(), vec![test_monitor("DP-1")])),
+        };
+
+        apply_refresh_snapshot(
+            &shared,
+            0,
+            Err("cannot enumerate DRM devices".into()),
+            Ok(false),
+            Ok(false),
+            stopped_worker(),
+        );
+        {
+            let state = state_lock(&shared);
+            assert_eq!(state.monitors.len(), 1);
+            assert_eq!(state.monitor_error, "cannot enumerate DRM devices");
+        }
+
+        apply_refresh_snapshot(
+            &shared,
+            0,
+            Ok(Vec::new()),
+            Ok(false),
+            Ok(false),
+            stopped_worker(),
+        );
+        let state = state_lock(&shared);
+        assert!(state.monitors.is_empty());
+        assert!(state.monitor_error.is_empty());
     }
 }

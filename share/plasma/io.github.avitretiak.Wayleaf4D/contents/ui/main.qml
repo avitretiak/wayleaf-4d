@@ -1,3 +1,5 @@
+pragma ComponentBehavior: Bound
+
 import QtQuick
 import org.kde.plasma.plasmoid
 import org.kde.plasma.core as PlasmaCore
@@ -9,11 +11,11 @@ PlasmoidItem {
     property alias syncBackend: backend
 
     toolTipMainText: "Wayleaf 4D"
-    toolTipSubText: backend.status === "running"
-        ? "Screen synchronization is on"
-        : backend.status === "error" ? "Screen synchronization needs attention"
-            : backend.status === "stopping" ? "Screen synchronization is stopping"
-                : backend.enabled ? "Screen synchronization is starting" : "Screen synchronization is off"
+    toolTipSubText: backend.status === "error" || backend.error.length > 0 ? "Screen synchronization needs attention"
+        : backend.status === "stopping" ? "Screen synchronization is stopping"
+            : backend.status === "starting" ? "Screen synchronization is starting"
+                : backend.running ? "Screen synchronization is on"
+                    : "Screen synchronization is stopped"
     Plasmoid.status: PlasmaCore.Types.ActiveStatus
 
     compactRepresentation: Item {
@@ -43,10 +45,10 @@ PlasmoidItem {
                 radius: width / 2
                 anchors.right: parent.right
                 anchors.bottom: parent.bottom
-                color: root.syncBackend.status === "running" ? Kirigami.Theme.positiveTextColor
-                    : root.syncBackend.status === "error" ? Kirigami.Theme.negativeTextColor
-                        : root.syncBackend.status === "starting" ? Kirigami.Theme.neutralTextColor
-                            : Kirigami.Theme.disabledTextColor
+                color: root.syncBackend.status === "error" || root.syncBackend.error.length > 0 ? Kirigami.Theme.negativeTextColor
+                    : root.syncBackend.status === "starting" || root.syncBackend.status === "stopping"
+                        ? Kirigami.Theme.neutralTextColor
+                        : root.syncBackend.running ? Kirigami.Theme.positiveTextColor : Kirigami.Theme.disabledTextColor
                 border.width: 1
                 border.color: Kirigami.Theme.backgroundColor
             }
@@ -55,7 +57,10 @@ PlasmoidItem {
             onTapped: root.expanded = !root.expanded
         }
     }
-    fullRepresentation: FullRepresentation { backend: root.syncBackend }
+    fullRepresentation: FullRepresentation {
+        backend: root.syncBackend
+        expanded: root.expanded
+    }
 
     Backend {
         id: backend

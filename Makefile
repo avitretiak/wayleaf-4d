@@ -1,9 +1,9 @@
 APP_ID = io.github.avitretiak.Wayleaf4D
 PLASMA_PACKAGE = share/plasma/$(APP_ID)
-USER_SHARE = $(HOME)/.local/share
+USER_SHARE = $(if $(filter /%,$(XDG_DATA_HOME)),$(XDG_DATA_HOME),$(HOME)/.local/share)
 PLASMA_DIR = $(USER_SHARE)/plasma/plasmoids/$(APP_ID)
 USER_ICON_DIR = $(USER_SHARE)/icons/hicolor/scalable/apps
-USER_CONFIG = $(if $(XDG_CONFIG_HOME),$(XDG_CONFIG_HOME),$(HOME)/.config)
+USER_CONFIG = $(if $(filter /%,$(XDG_CONFIG_HOME)),$(XDG_CONFIG_HOME),$(HOME)/.config)
 USER_BIN = $(HOME)/.local/bin
 BUILD_DIR = build
 CARGO_TARGET_DIR = $(BUILD_DIR)/cargo
@@ -13,7 +13,7 @@ DBUS_SERVICE = $(USER_SHARE)/dbus-1/services/io.github.avitretiak.Wayleaf4D.Cont
 .PHONY: all clean install-user
 all: $(WORKER)
 
-$(WORKER): Cargo.toml Cargo.lock $(wildcard src/*.rs)
+$(WORKER): Makefile Cargo.toml Cargo.lock $(wildcard src/*.rs)
 	cargo build --release --locked --target-dir $(CARGO_TARGET_DIR)
 	cp $(CARGO_TARGET_DIR)/release/wayleaf-4d $@
 
@@ -36,7 +36,8 @@ install-user: all
 		systemctl --user disable nanoleaf-sync.service; \
 	fi
 	rm -f "$(USER_CONFIG)/systemd/user/nanoleaf-sync.service" "$(USER_BIN)/nanoleaf-sync" "$(USER_BIN)/nanoleaf-sync-tray"
-	install -Dm755 $(WORKER) "$(USER_BIN)/wayleaf-4d"
+	install -Dm755 $(WORKER) "$(USER_BIN)/wayleaf-4d.new"
+	mv -f -- "$(USER_BIN)/wayleaf-4d.new" "$(USER_BIN)/wayleaf-4d"
 	install -d "$(PLASMA_DIR)"
 	cp -R "$(PLASMA_PACKAGE)/." "$(PLASMA_DIR)/"
 	install -Dm644 "$(PLASMA_PACKAGE)/contents/ambient-light.svg" "$(USER_ICON_DIR)/$(APP_ID).svg"

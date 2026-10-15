@@ -2,6 +2,7 @@ use crate::{AppError, Result};
 use serde_json::{json, Map, Value};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -99,34 +100,50 @@ impl Config {
 
     pub fn save(&self) -> Result<()> {
         self.validate()?;
-        let mut root = match read_root(&self.config_path)? {
-            Some(root) => {
-                let mut check = Self {
-                    config_path: self.config_path.clone(),
-                    ..Self::default()
-                };
-                load_values(&mut check, &root)?;
-                check.validate()?;
-                root
+        update_root(&self.config_path, true, |object, _| {
+            for key in ["corner", "offset", "reverse"] {
+                object.remove(key);
             }
-            None => Value::Object(Map::new()),
-        };
-        let object = root
-            .as_object_mut()
-            .ok_or_else(|| AppError::new("config root must be an object"))?;
-        for key in ["corner", "offset", "reverse"] {
-            object.remove(key);
-        }
-        if !self.host.is_empty() {
-            object.insert("ip".into(), Value::String(self.host.clone()));
-        }
-        if !self.token.is_empty() {
-            object.insert("token".into(), Value::String(self.token.clone()));
-        }
-        write_known_settings(object, self);
-        let data = serde_json::to_vec_pretty(&root)
-            .map_err(|_| AppError::new("cannot encode configuration"))?;
-        write_atomic(&self.config_path, &data)
+            if !self.host.is_empty() {
+                object.insert("ip".into(), Value::String(self.host.clone()));
+            }
+            if !self.token.is_empty() {
+                object.insert("token".into(), Value::String(self.token.clone()));
+            }
+            write_known_settings(object, self);
+            Ok(())
+        })
+    }
+
+    pub fn save_settings(&self, settings: &Value) -> Result<()> {
+        update_root(&self.config_path, true, |object, current| {
+            for key in ["corner", "offset", "reverse"] {
+                object.remove(key);
+            }
+            let mut next = current.clone();
+            next.apply_settings(settings)?;
+            let values = next.settings_json();
+            for key in settings
+                .as_object()
+                .ok_or_else(|| AppError::new("settings must be a JSON object"))?
+                .keys()
+            {
+                object.insert(key.clone(), values[key].clone());
+            }
+            Ok(())
+        })
+    }
+
+    pub fn save_credentials(&self) -> Result<()> {
+        update_root(&self.config_path, true, |object, _| {
+            if !self.host.is_empty() {
+                object.insert("ip".into(), Value::String(self.host.clone()));
+            }
+            if !self.token.is_empty() {
+                object.insert("token".into(), Value::String(self.token.clone()));
+            }
+            Ok(())
+        })
     }
 
     pub fn settings_json(&self) -> Value {
@@ -179,23 +196,83 @@ impl Config {
 }
 
 pub fn forget_device(path: &Path) -> Result<()> {
-    let Some(mut root) = read_root(path)? else {
-        return Ok(());
-    };
-    let mut check = Config {
-        config_path: path.to_path_buf(),
-        ..Config::default()
-    };
-    load_values(&mut check, &root)?;
-    check.validate()?;
-    let object = root
-        .as_object_mut()
-        .ok_or_else(|| AppError::new("config root must be an object"))?;
-    object.remove("ip");
-    object.remove("token");
-    let data = serde_json::to_vec_pretty(&root)
-        .map_err(|_| AppError::new("cannot encode configuration"))?;
-    write_atomic(path, &data)
+    update_root(path, false, |object, _| {
+        object.remove("ip");
+        object.remove("token");
+        Ok(())
+    })
+}
+
+fn update_root(
+    path: &Path,
+    create_if_missing: bool,
+    update: impl FnOnce(&mut Map<String, Value>, &Config) -> Result<()>,
+) -> Result<()> {
+    with_config_lock(path, || {
+        let mut root = match read_root(path)? {
+            Some(root) => root,
+            None if create_if_missing => Value::Object(Map::new()),
+            None => return Ok(()),
+        };
+        let mut current = Config {
+            config_path: path.to_path_buf(),
+            ..Config::default()
+        };
+        load_values(&mut current, &root)?;
+        current.validate()?;
+        update(
+            root.as_object_mut()
+                .ok_or_else(|| AppError::new("config root must be an object"))?,
+            &current,
+        )?;
+        let data = serde_json::to_vec_pretty(&root)
+            .map_err(|_| AppError::new("cannot encode configuration"))?;
+        write_atomic(path, &data)
+    })
+}
+
+fn lock_path(path: &Path) -> Result<PathBuf> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| AppError::new("invalid config file path"))?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut name = std::ffi::OsString::from(".");
+    name.push(file_name);
+    name.push(".lock");
+    Ok(parent.join(name))
+}
+
+fn with_config_lock<T>(path: &Path, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700);
+    builder
+        .create(parent)
+        .map_err(|_| AppError::new("cannot create config directory"))?;
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(lock_path(path)?)
+        .map_err(|_| AppError::new("cannot open config lock"))?;
+    loop {
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            break;
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return Err(AppError::new("cannot lock config file"));
+        }
+    }
+    let _lock = lock;
+    operation()
 }
 
 fn in_range(value: f32, min: f32, max: f32) -> bool {
@@ -210,8 +287,21 @@ fn read_root(path: &Path) -> Result<Option<Value>> {
     };
     let root: Value =
         serde_json::from_str(&text).map_err(|_| AppError::new("invalid config JSON"))?;
-    if !root.is_object() {
-        return Err(AppError::new("config root must be an object"));
+    let object = root
+        .as_object()
+        .ok_or_else(|| AppError::new("config root must be an object"))?;
+    let has_credentials = ["ip", "token"].iter().any(|key| {
+        object
+            .get(*key)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+    });
+    let group_or_other_readable =
+        fs::metadata(path).is_ok_and(|metadata| metadata.permissions().mode() & 0o044 != 0);
+    if has_credentials && group_or_other_readable {
+        eprintln!(
+            "warning: config file is readable by group or other while credentials are present"
+        );
     }
     Ok(Some(root))
 }
@@ -447,7 +537,10 @@ pub fn self_test() -> Result<()> {
         }
         Ok(())
     })();
-    let _ = fs::remove_file(path);
+    let _ = fs::remove_file(&path);
+    if let Ok(lock) = lock_path(&path) {
+        let _ = fs::remove_file(lock);
+    }
     result
 }
 
@@ -524,7 +617,63 @@ mod tests {
             .expect("config remains");
         assert!(root.get("ip").is_none() && root.get("token").is_none());
         assert_eq!(root["portal_restore_token"], "unrelated");
-        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(&path);
+        if let Ok(lock) = lock_path(&path) {
+            let _ = fs::remove_file(lock);
+        }
+    }
+
+    #[test]
+    fn concurrent_settings_and_credentials_writers_merge() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let path = test_path();
+        write_atomic(
+            &path,
+            br#"{"ip":"192.0.2.10","token":"old-token","monitor":"HDMI-A-1","brightness":0.6,"future":{"kept":true},"corner":"bottom-right","offset":26,"reverse":true}"#,
+        )
+        .expect("seed config");
+        let settings_writer = Config::load(&path).expect("load settings writer");
+        let mut credentials_writer = Config::load(&path).expect("load credentials writer");
+        credentials_writer.host = "192.0.2.20".into();
+        credentials_writer.token = "new-token".into();
+        let barrier = Arc::new(Barrier::new(3));
+        let settings_barrier = Arc::clone(&barrier);
+        let settings = thread::spawn(move || {
+            settings_barrier.wait();
+            settings_writer.save_settings(&json!({"monitor":"DP-3"}))
+        });
+        let credentials_barrier = Arc::clone(&barrier);
+        let credentials = thread::spawn(move || {
+            credentials_barrier.wait();
+            credentials_writer.save_credentials()
+        });
+        barrier.wait();
+        settings
+            .join()
+            .expect("settings writer thread")
+            .expect("save settings");
+        credentials
+            .join()
+            .expect("credentials writer thread")
+            .expect("save credentials");
+
+        let root = read_root(&path)
+            .expect("read merged config")
+            .expect("merged config exists");
+        assert_eq!(root["monitor"], "DP-3");
+        assert_eq!(root["brightness"], 0.6);
+        assert_eq!(root["ip"], "192.0.2.20");
+        assert_eq!(root["token"], "new-token");
+        assert_eq!(root["future"], json!({"kept": true}));
+        assert!(["corner", "offset", "reverse"]
+            .iter()
+            .all(|key| root.get(key).is_none()));
+        let _ = fs::remove_file(&path);
+        if let Ok(lock) = lock_path(&path) {
+            let _ = fs::remove_file(lock);
+        }
     }
 
     #[test]
@@ -543,6 +692,9 @@ mod tests {
         };
         assert!(!error.message.contains(&config.token));
         assert_eq!(fs::read(&path).expect("read invalid config"), invalid);
-        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(&path);
+        if let Ok(lock) = lock_path(&path) {
+            let _ = fs::remove_file(lock);
+        }
     }
 }

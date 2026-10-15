@@ -13,13 +13,13 @@ make
 make install-user
 ```
 
-Open **Wayleaf 4D** from the System Tray or add the widget to a panel with Plasma's **Add Widgets**. In its **Device** tab, discover the controller through Avahi or enter its IPv4 address. Enable **Settings → Connect to API** in the Nanoleaf app or hold the 4D power button for 5 seconds, then pair within 30 seconds:
+Open **Wayleaf 4D** from the System Tray or add the widget to a panel with Plasma's **Add Widgets**. Pair through **Pair a Nanoleaf 4D**: discover it through Avahi or enter its IPv4 address, enable **Settings → Connect to API** in the Nanoleaf app or hold the 4D power button for 5 seconds, then pair within 30 seconds:
 
 ```sh
 wayleaf-4d --pair --ip 192.0.2.10
 ```
 
-Turn on the widget and choose a display under **Main → Capture monitor**, then press **Apply monitor**. Capture uses direct KMS; it does not request portal consent or show KDE's Screen Casting indicator. The GSR helper runs with its package-managed `CAP_SYS_ADMIN` capability; the Wayleaf worker stays unprivileged. This grants capture without the portal's consent/indicator, so enable sync only when you intend to share the selected display's sampled colors with the Nanoleaf. Installation does not enable or start the worker by itself. Run `wayleaf-4d --version` to check the worker build.
+Select a capture monitor in the widget; the selection applies immediately. Use the Start/Stop switch to control sync. Direct KMS capture bypasses portal consent and KDE's Screen Casting indicator; no screen images are saved. The package-managed GSR helper accesses scanout without that prompt, so start sync only when you intend to send sampled display colors to the Nanoleaf. Installation does not enable or start the worker by itself. Run `wayleaf-4d --version` to check the worker build.
 
 See the [User Guide](docs/USAGE.md) for settings, privacy, troubleshooting, and removal instructions.
 

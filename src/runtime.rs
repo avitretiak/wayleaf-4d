@@ -1,7 +1,11 @@
 use crate::capture::Capture;
-use crate::device::{connect_udp, enable_stream, encode_packet, panel_layout, send_packet};
+use crate::device::{
+    connect_udp, enable_stream, encode_packet, panel_layout, restore_effect, selected_effect,
+    send_packet,
+};
 use crate::sampling::{make_zones, Sampler, Zone};
 use crate::{AppError, Config, Result};
+use serde::Serialize;
 use serde_json::{Map, Number, Value};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::flag;
@@ -29,11 +33,54 @@ struct WorkerState {
     stopping: bool,
 }
 
+#[derive(Clone, Copy, Serialize)]
+struct PreviewSegment {
+    id: u16,
+    edge: &'static str,
+    position: f32,
+    span: f32,
+    r: u8,
+    g: u8,
+    b: u8,
+}
+
+fn preview_segment(zone: &Zone, color: crate::sampling::Color) -> PreviewSegment {
+    let width = zone.x1 - zone.x0;
+    let height = zone.y1 - zone.y0;
+    let center_x = (zone.x0 + zone.x1) * 0.5;
+    let center_y = (zone.y0 + zone.y1) * 0.5;
+    let mut edge = ("top", center_x, width);
+    let mut edge_distance = zone.y0;
+    for (distance, candidate) in [
+        (1.0 - zone.x1, ("right", center_y, height)),
+        (1.0 - zone.y1, ("bottom", center_x, width)),
+        (zone.x0, ("left", center_y, height)),
+    ] {
+        if distance < edge_distance {
+            edge = candidate;
+            edge_distance = distance;
+        }
+    }
+    let (edge, position, span) = edge;
+    let byte = |value: f32| value.round().clamp(0.0, 255.0) as u8;
+    PreviewSegment {
+        id: zone.id,
+        edge,
+        position,
+        span,
+        r: byte(color.r),
+        g: byte(color.g),
+        b: byte(color.b),
+    }
+}
+
 struct Shared {
     state: Mutex<WorkerState>,
     changed: Condvar,
     stop: Arc<AtomicBool>,
     sent: AtomicBool,
+    preview_enabled: AtomicBool,
+    preview: Mutex<Vec<PreviewSegment>>,
 }
 
 impl Shared {
@@ -47,9 +94,55 @@ impl Shared {
             changed: Condvar::new(),
             stop: Arc::new(AtomicBool::new(false)),
             sent: AtomicBool::new(false),
+            preview_enabled: AtomicBool::new(false),
+            preview: Mutex::new(Vec::new()),
         }
     }
 
+    fn preview_json(&self) -> String {
+        if !self.preview_enabled.load(Ordering::Acquire) {
+            return "[]".into();
+        }
+        let preview = self
+            .preview
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        serde_json::to_string(&*preview).unwrap_or_else(|_| "[]".into())
+    }
+
+    fn update_preview(&self, zones: &[Zone], colors: &[crate::sampling::Color]) {
+        if !self.preview_enabled.load(Ordering::Acquire) {
+            return;
+        }
+        let mut preview = self
+            .preview
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        preview.clear();
+        if zones.len() != colors.len() {
+            return;
+        }
+        preview.reserve(zones.len());
+        preview.extend(
+            zones
+                .iter()
+                .zip(colors)
+                .map(|(zone, color)| preview_segment(zone, *color)),
+        );
+    }
+
+    fn set_preview_enabled(&self, enabled: bool) {
+        self.preview_enabled.store(enabled, Ordering::Release);
+        if !enabled {
+            self.preview
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clear();
+        }
+    }
+}
+
+impl Shared {
     fn lock(&self) -> MutexGuard<'_, WorkerState> {
         self.state.lock().unwrap_or_else(|error| error.into_inner())
     }
@@ -129,7 +222,7 @@ impl WorkerInterface {
         &self,
         settings: HashMap<String, OwnedValue>,
     ) -> std::result::Result<(), WorkerError> {
-        let patch = settings_from_dbus(settings)?;
+        let patch = Value::Object(settings_from_dbus(settings)?);
         let mut state = self.shared.lock();
         if state.stopping || self.shared.is_stopping() {
             return Err(WorkerError::InvalidSettings(
@@ -137,14 +230,14 @@ impl WorkerInterface {
             ));
         }
         let mut next = state.config.clone();
-        next.apply_settings(&Value::Object(patch))
+        next.apply_settings(&patch)
             .map_err(|error| WorkerError::InvalidSettings(error.message))?;
         if next.monitor != state.config.monitor {
             return Err(WorkerError::InvalidSettings(
                 "monitor changes require a worker restart".to_owned(),
             ));
         }
-        next.save()
+        next.save_settings(&patch)
             .map_err(|error| WorkerError::Failed(error.message))?;
         state.config = next;
         state.revision = state.revision.wrapping_add(1);
@@ -161,6 +254,16 @@ impl WorkerInterface {
         } else {
             "starting"
         }
+    }
+
+    #[zbus(name = "GetPreview")]
+    fn get_preview(&self) -> String {
+        self.shared.preview_json()
+    }
+
+    #[zbus(name = "SetPreviewEnabled")]
+    fn set_preview_enabled(&self, enabled: bool) {
+        self.shared.set_preview_enabled(enabled);
     }
 
     #[zbus(name = "Stop")]
@@ -299,90 +402,118 @@ pub fn run(mut config: Config) -> Result<()> {
     if shared.is_stopping() {
         return Ok(());
     }
-    let port = enable_stream(&config)?;
+
+    let previous_effect = selected_effect(&config);
     if shared.is_stopping() {
         return Ok(());
     }
-    let socket = connect_udp(&config.host, port)?;
-    let mut packet = [0_u8; 322];
-    let mut revision = 0;
-    let mut interval = frame_interval(config.fps);
-    let mut next_frame = Instant::now();
-    let mut previous_frame = None;
-    eprintln!(
-        "Streaming {} Nanoleaf 4D segments to {}:{}",
-        zones.len(),
-        config.host,
-        port
-    );
+    let port = match enable_stream(&config) {
+        Ok(port) => port,
+        Err(error) => {
+            restore_after_stream(&config, previous_effect.as_deref());
+            return Err(error);
+        }
+    };
 
-    while !shared.is_stopping() {
-        if refresh_config(
+    let result = (|| {
+        if shared.is_stopping() {
+            return Ok(());
+        }
+        let socket = connect_udp(&config.host, port)?;
+        let mut packet = [0_u8; 322];
+        let mut revision = 0;
+        let mut interval = frame_interval(config.fps);
+        let mut next_frame = Instant::now();
+        let mut previous_frame = None;
+        eprintln!(
+            "Streaming {} Nanoleaf 4D segments to {}:{}",
+            zones.len(),
+            config.host,
+            port
+        );
+
+        while !shared.is_stopping() {
+            if refresh_config(
+                &shared,
+                &panels,
+                &mut config,
+                &mut zones,
+                &mut sampler,
+                &mut revision,
+            )? {
+                interval = frame_interval(config.fps);
+                next_frame = Instant::now();
+            }
+            if !shared.wait_until(revision, next_frame) {
+                break;
+            }
+            if shared.is_stopping() {
+                break;
+            }
+            if refresh_config(
+                &shared,
+                &panels,
+                &mut config,
+                &mut zones,
+                &mut sampler,
+                &mut revision,
+            )? {
+                interval = frame_interval(config.fps);
+                next_frame = Instant::now();
+                continue;
+            }
+
+            let frame = capture.frame()?;
+            let sampled_at = Instant::now();
+            if shared.is_stopping() {
+                break;
+            }
+            let elapsed = previous_frame
+                .map(|previous: Instant| sampled_at.saturating_duration_since(previous))
+                .unwrap_or_else(|| Duration::from_secs_f64(1.0 / 30.0));
+            let colors = sampler.sample(
+                frame.data,
+                frame.stride,
+                frame.width,
+                frame.height,
+                &config,
+                elapsed,
+            )?;
+            shared.update_preview(&zones, colors);
+            let packet_len = encode_packet(&zones, colors, &mut packet)?;
+            if shared.is_stopping() {
+                break;
+            }
+            send_packet(&socket, &packet[..packet_len])?;
+            shared.sent.store(true, Ordering::Release);
+            previous_frame = Some(sampled_at);
+            next_frame = next_deadline(next_frame, Instant::now(), interval);
+        }
+
+        // Synchronize with any SetSettings transaction that began before Stop.
+        refresh_config(
             &shared,
             &panels,
             &mut config,
             &mut zones,
             &mut sampler,
             &mut revision,
-        )? {
-            interval = frame_interval(config.fps);
-            next_frame = Instant::now();
-        }
-        if !shared.wait_until(revision, next_frame) {
-            break;
-        }
-        if shared.is_stopping() {
-            break;
-        }
-        if refresh_config(
-            &shared,
-            &panels,
-            &mut config,
-            &mut zones,
-            &mut sampler,
-            &mut revision,
-        )? {
-            interval = frame_interval(config.fps);
-            next_frame = Instant::now();
-            continue;
-        }
-
-        let frame = capture.frame()?;
-        let sampled_at = Instant::now();
-        if shared.is_stopping() {
-            break;
-        }
-        let elapsed = previous_frame
-            .map(|previous: Instant| sampled_at.saturating_duration_since(previous))
-            .unwrap_or_else(|| Duration::from_secs_f64(1.0 / 30.0));
-        let colors = sampler.sample(
-            frame.data,
-            frame.stride,
-            frame.width,
-            frame.height,
-            &config,
-            elapsed,
         )?;
-        let packet_len = encode_packet(&zones, colors, &mut packet)?;
-        if shared.is_stopping() {
-            break;
-        }
-        send_packet(&socket, &packet[..packet_len])?;
-        shared.sent.store(true, Ordering::Release);
-        previous_frame = Some(sampled_at);
-        next_frame = next_deadline(next_frame, Instant::now(), interval);
-    }
+        Ok(())
+    })();
+    restore_after_stream(&config, previous_effect.as_deref());
+    result
+}
 
-    // Synchronize with any SetSettings transaction that began before Stop.
-    refresh_config(
-        &shared,
-        &panels,
-        &mut config,
-        &mut zones,
-        &mut sampler,
-        &mut revision,
-    )?;
-    Ok(())
+fn restore_after_stream(config: &Config, effect: Option<&str>) {
+    if let Some(effect) = effect {
+        if let Err(error) = restore_effect(config, effect) {
+            eprintln!(
+                "Warning: could not restore the previous Nanoleaf effect: {}",
+                error.message
+            );
+        }
+    }
 }
 
 fn refresh_config(
@@ -653,9 +784,86 @@ pub fn self_test() -> Result<()> {
             "runtime self-test: capture timing percentiles",
         ));
     }
+    preview_self_test()?;
 
     shutdown_self_test()?;
     settings_transaction_self_test()?;
+    Ok(())
+}
+
+fn preview_self_test() -> Result<()> {
+    use crate::sampling::{Color, Zone};
+
+    let shared = Shared::new(Config::default());
+    let zones = [
+        Zone {
+            id: 34,
+            x0: 0.1,
+            x1: 0.2,
+            y0: 0.9,
+            y1: 1.0,
+        },
+        Zone {
+            id: 3,
+            x0: 0.0,
+            x1: 0.08,
+            y0: 0.2,
+            y1: 0.3,
+        },
+    ];
+    let colors = [
+        Color {
+            r: 10.0,
+            g: 20.0,
+            b: 30.0,
+        },
+        Color {
+            r: 40.0,
+            g: 50.0,
+            b: 60.0,
+        },
+    ];
+    shared.update_preview(&zones, &colors);
+    if shared.preview_json() != "[]" {
+        return Err(AppError::new(
+            "runtime self-test: preview updated while disabled",
+        ));
+    }
+    shared.set_preview_enabled(true);
+    shared.update_preview(&zones, &colors);
+    let preview: Value = serde_json::from_str(&shared.preview_json())
+        .map_err(|_| AppError::new("runtime self-test: preview serialization failed"))?;
+    let values = preview
+        .as_array()
+        .filter(|values| values.len() == 2)
+        .ok_or_else(|| AppError::new("runtime self-test: preview segment count"))?;
+    let bottom_position = values[0]["position"].as_f64().unwrap_or(-1.0);
+    let left_position = values[1]["position"].as_f64().unwrap_or(-1.0);
+    if values[0]["id"] != 34
+        || values[0]["edge"] != "bottom"
+        || (bottom_position - 0.15).abs() > 0.001
+        || values[0]["r"] != 10
+        || values[1]["id"] != 3
+        || values[1]["edge"] != "left"
+        || (left_position - 0.25).abs() > 0.001
+        || values[1]["b"] != 60
+    {
+        return Err(AppError::new(
+            "runtime self-test: preview lost panel IDs, edge geometry, or colors",
+        ));
+    }
+    shared.set_preview_enabled(false);
+    if shared.preview_json() != "[]"
+        || !shared
+            .preview
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_empty()
+    {
+        return Err(AppError::new(
+            "runtime self-test: disabled preview retained a published snapshot",
+        ));
+    }
     Ok(())
 }
 

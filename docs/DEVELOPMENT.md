@@ -46,9 +46,9 @@ The Plasma `DBusMessage` constructor takes `interface` in its map, even though i
 
 ## Build and runtime dependencies
 
-Build requires Rust 2021 support (`rustc` and Cargo), GNU Make, and development/linker support for system libcurl and libdrm. Cargo resolves the locked Rust dependencies in `Cargo.lock`. No C++ compiler, Qt development packages, or portal/PipeWire/GStreamer capture stack are needed to build this project.
+Build requires Rust 2021 support, Rust 1.89 or newer (`rustc` and Cargo), GNU Make, and development/linker support for system libcurl and libdrm. Cargo resolves the locked Rust dependencies in `Cargo.lock`; the locked `uuid` dependency requires Rust 1.89. No C++ compiler, Qt development packages, or portal/PipeWire/GStreamer capture stack are needed to build this project.
 
-Runtime capture requires `/usr/bin/gsr-kms-server` from GPU Screen Recorder version 6.1.4 (the package-managed helper carries `CAP_SYS_ADMIN`; Wayleaf does not set or change capabilities and its worker stays unprivileged). It also requires working EGL, OpenGL ES 3, GBM, libdrm, and DRM/GPU drivers supporting the monitor's scanout formats. The implementation dynamically loads `libEGL.so.1`, `libGLESv2.so.2`, and `libgbm.so.1` and links libdrm. No portal consent or Screen Casting indicator is involved. Plasma 6 and a systemd user manager are required for the widget/service toggle; system Avahi D-Bus is optional for discovery, with manual IPv4 entry available.
+Runtime capture requires `/usr/bin/gsr-kms-server` from GPU Screen Recorder version 6.1.4 (the package-managed helper carries `CAP_SYS_ADMIN`; Wayleaf does not set or change capabilities and its worker stays unprivileged). It also requires working EGL, OpenGL ES 3, GBM, libdrm, and DRM/GPU drivers supporting the monitor's scanout formats. The implementation dynamically loads `libEGL.so.1`, `libGLESv2.so.2`, and `libgbm.so.1` and links libdrm. No portal consent or Screen Casting indicator is involved. Plasma 6 and a systemd user manager are required for the widget/service controls; system Avahi D-Bus is optional for discovery, with manual IPv4 entry available.
 
 ## Build and install
 
@@ -57,15 +57,15 @@ make
 make install-user
 ```
 
-`make` builds the Rust worker under `build/` using Cargo's locked release build. `make install-user` installs under `~/.local/`, installs the user service under `$XDG_CONFIG_HOME/systemd/user/`, registers and reloads the D-Bus-activated control process, and runs `systemctl --user daemon-reload`. It refuses to continue while the legacy `nanoleaf-sync.service` or CLI worker is active; it never stops an active stream. It disables/removes only the inactive legacy service and binaries, does not enable, start, stop, or restart Wayleaf 4D, and does not overwrite Nanoleaf config. `make clean` removes `build/`.
+`make` builds the Rust worker under `build/` using Cargo's locked release build. `make install-user` installs under `XDG_DATA_HOME` (default `~/.local/share`) and the user service under `XDG_CONFIG_HOME/systemd/user/` (default `~/.config/systemd/user/`), registers/reloads D-Bus activation, and runs `systemctl --user daemon-reload`. Absolute XDG overrides are honored; relative values use the standard defaults. Installation refuses to continue while the legacy `nanoleaf-sync.service` or CLI worker is active; it never stops an active stream. It disables/removes only the inactive legacy service and binaries, does not enable, start, stop, or restart Wayleaf 4D, and does not overwrite Nanoleaf config. `make clean` removes `build/`.
 
-After changing QML or applet metadata, Plasma must reload the applet to read the new files. Log out and back in, or restart the Plasma shell on sessions providing `plasma-plasmashell.service`:
+Installing a new binary atomically replaces the executable and does not start, stop, or restart the worker or control service. A running worker and any already-activated control process keep using their old loaded code; the new worker binary takes effect on its next start, and updated QML requires a Plasma reload. This lets installation complete without interrupting a live stream, but does not fully activate the update. When you choose to switch versions, press **Stop** first (it best-effort powers off the Nanoleaf), then restart the old control process while no pairing/device operation is active: inspect its PID with `busctl --user status io.github.avitretiak.Wayleaf4D.Control`, send `TERM` to that PID, and let the next widget request activate the installed binary. Reload QML after the install; log out and back in, or restart the Plasma shell on sessions providing `plasma-plasmashell.service`:
 
 ```sh
 systemctl --user restart plasma-plasmashell.service
 ```
 
-This restarts the desktop shell, not `wayleaf-4d.service`.
+This restarts the desktop shell, not `wayleaf-4d.service`. Do not restart the worker, control process, or shell while uninterrupted streaming is required; defer activation until a user-chosen Stop window.
 
 ## Verification
 
@@ -85,4 +85,4 @@ Before publishing a release, verify a Plasma 6 session, helper/GPU capture, and 
 
 ## Shared-setting contract
 
-The worker `Config`, the QML backend defaults and normalizer, the visible controls, and the settings table in `docs/USAGE.md` describe one shared JSON schema. When changing a setting, update all of them together and keep ranges/defaults aligned. Live changes cross the session D-Bus interface; the worker saves accepted settings to the shared config file.
+The worker `Config`, the QML backend defaults and normalizer, the visible controls, and the settings table in `docs/USAGE.md` describe one shared JSON schema. When changing a setting, update all of them together and keep ranges/defaults aligned. Live changes cross the session D-Bus interface; the worker merges accepted setting keys into the latest config file rather than replacing controller credentials or unrelated settings.
