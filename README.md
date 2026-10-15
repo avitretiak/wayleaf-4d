@@ -2,7 +2,7 @@
 
 Mirror display colors to a Nanoleaf 4D from KDE Plasma. The Wayleaf 4D widget is the primary interface: choose 1D static color, 2D one screen-wide color, 3D ten coarse edge zones, or 4D per-panel edge mirroring. The `wayleaf-4d` CLI remains available for pairing, diagnostics, and standalone streaming.
 
-![Wayleaf 4D Plasma widget showing active 4D sync controls and a live edge preview](docs/wayleaf-4d.png)
+<img src="docs/wayleaf-4d.png" width="400" alt="Wayleaf 4D Plasma widget showing active 4D sync controls and a live edge preview">
 
 ## Requirements
 
