@@ -7,7 +7,7 @@ Wayleaf 4D sends lighting to the controller in one of four modes: 1D static colo
 - Linux with DRM/KMS and working EGL, OpenGL ES 3, GBM, libdrm, and GPU drivers that support the display's scanout formats.
 - The installed `/usr/bin/gsr-kms-server` helper from GPU Screen Recorder 6.1.4. The package-managed helper has `CAP_SYS_ADMIN`; Wayleaf's worker remains unprivileged. Do not set capabilities on Wayleaf or run its worker as root.
 - A Nanoleaf 4D reachable on the local network. Avahi mDNS discovery is optional; manual IPv4 entry remains available. API pairing must be enabled on the controller.
-- Plasma 6 and a systemd user manager for the widget's service toggle. Build dependencies are listed in [Development](DEVELOPMENT.md).
+- Plasma 6 and a systemd user manager for the widget's service toggle. Build dependencies are listed in the [Implementation reference](DEVELOPMENT.md).
 
 ## Install and first run
 

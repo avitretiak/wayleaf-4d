@@ -4,9 +4,11 @@ Wayleaf 4D mirrors display colors to Nanoleaf 4D panels. Choose 1D static-color 
 
 The Plasma 6 widget controls a user-level worker service. The `wayleaf-4d` CLI remains available for pairing, diagnostics, and standalone streaming.
 
+Release notes: [0.2.0](docs/RELEASE_NOTES-0.2.0.md).
+
 ## Quick start
 
-Requirements and source-build dependencies are listed in [Development](docs/DEVELOPMENT.md). For a Plasma 6 Wayland session:
+Requirements and source-build dependencies are listed in the [Implementation reference](docs/DEVELOPMENT.md). For a Plasma 6 Wayland session:
 
 ```sh
 make

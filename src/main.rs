@@ -1,7 +1,7 @@
 use std::process::ExitCode;
 use wayleaf_4d::{cli, config, control, device, kms, runtime, sampling, AppError, Config, Result};
 
-const VERSION: &str = "0.1.0-beta";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() -> ExitCode {
     match dispatch() {

@@ -1,4 +1,4 @@
-# Development
+# Implementation reference
 
 ## Architecture
 
@@ -41,51 +41,16 @@ Mode selects the worker's color-to-panel path while preserving discovered contro
 | `share/applications/io.github.avitretiak.Wayleaf4D.desktop` | Hidden desktop identity installed with the applet. |
 | `docs/USAGE.md` | End-user setup, operation, settings, diagnostics, and removal. |
 
-QML uses Plasma's native asynchronous session-D-Bus interface; there is no C++/Qt plugin build. `make` builds the Rust binary as `build/wayleaf-4d`. `make install-user` installs it with the QML applet, D-Bus activation file, and worker unit. A Plasma reload may be needed after QML changes; this is separate from the worker and does not require restarting `wayleaf-4d.service`.
+QML uses Plasma's native asynchronous session-D-Bus interface. The control process owns service and device-management actions; the worker owns capture, sampling, frame scheduling, and UDP streaming. The CLI shares `Config` and can run diagnostics or a standalone stream.
 
-The popup keeps the header, sync switch, mode selector, and brightness pinned above its mode-specific content. 1D presents static-color swatches and no monitor or fine-tuning controls; 2D–4D present the relevant Look presets and a collapsible Fine tune section. Its edge glow is a live mode-appropriate preview; monitor selection is in the footer for capture modes, alongside device identity. Preview updates are limited to 10 Hz and are published only while the popup is expanded. Keep these controls on the existing QML/D-Bus settings path and use Plasma/Kirigami-native components; do not introduce a parallel protocol or build dependency.
+The popup keeps status, the sync switch, mode selector, and brightness visible while showing mode-specific settings. Its live edge preview uses worker-published colors at up to 10 Hz while expanded: one color in 1D and 2D, 10 zones in 3D, and per-panel colors in 4D.
 
-The Plasma `DBusMessage` constructor takes `interface` in its map, even though its QML property is named `iface`.
+## Dependencies
 
-## Build and runtime dependencies
-
-Build requires Rust 2021 support, Rust 1.89 or newer (`rustc` and Cargo), GNU Make, and development/linker support for system libcurl and libdrm. Cargo resolves the locked Rust dependencies in `Cargo.lock`; the locked `uuid` dependency requires Rust 1.89. No C++ compiler, Qt development packages, or portal/PipeWire/GStreamer capture stack are needed to build this project.
+Build requires Rust and Cargo 1.89 or newer, GNU Make, and development/linker support for system libcurl and libdrm. Cargo resolves the locked Rust dependencies in `Cargo.lock`. No C++ compiler, Qt development packages, or portal/PipeWire/GStreamer capture stack are required.
 
 Runtime capture requires `/usr/bin/gsr-kms-server` from GPU Screen Recorder version 6.1.4 (the package-managed helper carries `CAP_SYS_ADMIN`; Wayleaf does not set or change capabilities and its worker stays unprivileged). It also requires working EGL, OpenGL ES 3, GBM, libdrm, and DRM/GPU drivers supporting the monitor's scanout formats. The implementation dynamically loads `libEGL.so.1`, `libGLESv2.so.2`, and `libgbm.so.1` and links libdrm. No portal consent or Screen Casting indicator is involved. Plasma 6 and a systemd user manager are required for the widget/service controls; system Avahi D-Bus is optional for discovery, with manual IPv4 entry available.
 
-## Build and install
+## Configuration and runtime settings
 
-```sh
-make
-make install-user
-```
-
-`make` builds the Rust worker under `build/` using Cargo's locked release build. `make install-user` installs under `XDG_DATA_HOME` (default `~/.local/share`) and the user service under `XDG_CONFIG_HOME/systemd/user/` (default `~/.config/systemd/user/`), registers/reloads D-Bus activation, and runs `systemctl --user daemon-reload`. Absolute XDG overrides are honored; relative values use the standard defaults. Installation refuses to continue while the legacy `nanoleaf-sync.service` or CLI worker is active; it never stops an active stream. It disables/removes only the inactive legacy service and binaries, does not enable, start, stop, or restart Wayleaf 4D, and does not overwrite Nanoleaf config. `make clean` removes `build/`.
-
-Installing a new binary atomically replaces the executable and does not start, stop, or restart the worker or control service. A running worker and any already-activated control process keep using their old loaded code; the new worker binary takes effect on its next start, and updated QML requires a Plasma reload. This lets installation complete without interrupting a live stream, but does not fully activate the update. When you choose to switch versions, press **Stop** first (it best-effort powers off the Nanoleaf), then restart the old control process while no pairing/device operation is active: inspect its PID with `busctl --user status io.github.avitretiak.Wayleaf4D.Control`, send `TERM` to that PID, and let the next widget request activate the installed binary. Reload QML after the install; log out and back in, or restart the Plasma shell on sessions providing `plasma-plasmashell.service`:
-
-```sh
-systemctl --user restart plasma-plasmashell.service
-```
-
-This restarts the desktop shell, not `wayleaf-4d.service`. Do not restart the worker, control process, or shell while uninterrupted streaming is required; defer activation until a user-chosen Stop window.
-
-## Verification
-
-Verification commands (run only when authorized; building may update `build/`):
-
-```sh
-make
-./build/wayleaf-4d --self-test
-./build/wayleaf-4d --help
-./build/wayleaf-4d --version
-./build/wayleaf-4d --list-monitors
-```
-
-`--self-test` runs local module checks, including configuration, argument bounds, sampling, layout mapping, KMS protocol validation, and capture transforms; it does not require the helper or contact a controller. `--capture-test --monitor NAME` exercises actual capture without controller credentials or UDP streaming, reports dimensions, frame count, and timing, and saves no images. `--capture-debug --monitor NAME` also requires saved controller credentials; for ten seconds it prints timing and per-zone target/output RGB values without sending UDP frames or saving images/settings. Sampled RGB can reveal screen content, so review diagnostic output before sharing. These capture modes use direct KMS and have no portal selection/restore token.
-
-Before publishing a release, verify a Plasma 6 session, helper/GPU capture, and real Nanoleaf streaming. Do not infer display/game performance from synthetic or diagnostic runs.
-
-## Shared-setting contract
-
-The worker `Config`, the QML backend defaults and normalizer, the visible controls, and the settings table in `docs/USAGE.md` describe one shared JSON schema, including `mode` (`1D`, `2D`, `3D`, `4D`) and validated `static_color` (`#RRGGBB`). Defaults are `4D` and `#ffffff`; both values persist through config and the existing settings/D-Bus path. When changing a setting, update all of them together and keep ranges/defaults aligned. Live changes cross the session D-Bus interface; the worker merges accepted setting keys into the latest config file rather than replacing controller credentials or unrelated settings.
+The control process and worker use `$XDG_CONFIG_HOME/nanoleaf-sync/config.json` (normally `~/.config/nanoleaf-sync/config.json`). The QML backend mirrors worker defaults and normalizes setting values; live changes cross session D-Bus. The worker validates updates and merges accepted setting keys into the latest config, preserving controller credentials and unrelated JSON. The shared schema includes `mode` (`1D`, `2D`, `3D`, `4D`) and validated `static_color` (`#RRGGBB`), defaulting to `4D` and `#ffffff`.

@@ -1,6 +1,6 @@
 [package]
 name = "wayleaf-4d"
-version = "0.1.0-beta"
+version = "0.2.0"
 edition = "2021"
 
 license = "GPL-3.0-or-later"
