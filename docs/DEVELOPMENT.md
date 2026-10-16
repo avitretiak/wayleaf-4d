@@ -21,6 +21,8 @@ flowchart LR
 
 The control process handles settings and device management without capturing the screen. In modes 2D–4D, the worker requests the installed GPU Screen Recorder KMS helper (GSR 6.1.4); EGL/OpenGL ES on GBM composes supported planes and reduces them before CPU sampling. Mode 1D sends its configured static color without screen capture. Only the package-managed helper carries `CAP_SYS_ADMIN`; the worker and control process remain unprivileged. Direct KMS capture does not request portal consent or display KDE's Screen Casting indicator, so synchronization must be enabled deliberately.
 
+DRM enumeration selects only connected connectors with an active CRTC. If the configured monitor is absent, KMS returns no primary plane, or the helper temporarily returns an empty successful response, the worker reports a temporary capture failure (exit status 75); the user service retries after 15 seconds. This lets display/KMS recovery resume sync without a widget toggle. Invalid or ambiguous monitor selections and protocol incompatibilities remain permanent startup errors.
+
 The capture shader converts top-origin KMS source coordinates to the imported texture's Y convention after applying plane rotation. `glReadPixels` rows are then flipped once into top-down RGBA for sampling.
 
 The worker assigns colors to discovered controller IDs according to the selected mode; sampling behavior and panel-layout geometry are detailed in [Sampling and panel layouts](#sampling-and-panel-layouts).
@@ -52,7 +54,7 @@ Stopped previews use 30% opacity. Without live colors, 1D uses its static color 
 
 Corner colors interpolate by angle around the rounded turn. The hero separator uses the theme text color at 20% opacity.
 
-`SteppedSlider.qml` is the shared native Qt Quick Controls `Slider` used for mode and Look selection: values 0–3, unit steps, and `SnapAlways`, with a quarter-width selection pill and four labels. Clicks, dragging, keyboard arrows, and external value changes share the same binding. `FullRepresentation.qml` receives the backend and applet configuration explicitly from `main.qml`; it saves the current custom settings before applying a preset and persists Custom's selection identity separately. Preset matching uses displayed slider steps rather than exact `f32` equality. Only Custom exposes fine tuning, and resetting it does not switch the Look back to Balanced.
+`SteppedSlider.qml` is the shared native Qt Quick Controls `Slider` used for mode and Look selection: values 0–3, unit steps, and `SnapAlways`, with a quarter-width selection pill and four labels. Clicks, dragging, keyboard arrows, and external value changes share the same binding. `FullRepresentation.qml` receives the backend and applet configuration explicitly from `main.qml`; it saves current Custom settings before applying a preset and persists Custom's selection identity separately. Preset matching uses displayed slider steps rather than exact `f32` equality. Only Custom exposes directly visible fine tuning; resetting numeric settings restores Balanced defaults without switching the Look back to Balanced. Strip alignment is in Device details, available from the footer or More options, and remains independent of Looks.
 
 ## Build and capture internals
 
@@ -84,7 +86,7 @@ QT_QUICK_CONTROLS_STYLE=org.kde.desktop QT_STYLE_OVERRIDE=Breeze \
 /usr/lib/qt6/bin/qmltestrunner -input tests/qml
 ```
 
-These checks cover Look clicks/dragging/keyboard input, Custom-to-preset round-trips, popup recreation, `f32` preset matching, Custom-only fine-tune visibility, and alignment independence from presets/custom-look persistence. Alignment controls are exercised with keyboard input and their group reset. Software rendering is sufficient for state/input tests; verify shader appearance separately in a native Plasma/Qt Quick window.
+These checks cover Look clicks/dragging/keyboard input, Custom-to-preset round-trips, popup recreation, `f32` preset matching, Custom-only fine-tune visibility, and alignment independence from presets/custom-look persistence. Alignment controls are exercised with keyboard input and their group reset. Balanced is the new-install and reset-all default; reset-all selects Balanced. Saturation is 1.25 for Balanced, 1.0 for Subtle, and 1.9 for Vivid. Saved legacy preset selections retain their old values unless reset. Software rendering is sufficient for state/input tests; shader appearance can be checked separately in a native Plasma/Qt Quick window.
 
 
 ## Sampling and panel layouts
@@ -102,7 +104,7 @@ The `positionData` sequence supplies traversal order. Coordinate changes determi
 
 The calibrated 40-panel NL69 layout uses dedicated sampling rectangles, including corners 1.5 times the edge depth, when its ordered live coordinates match the reference. Other layouts use their reported geometry. Worker startup fetches the layout; setting changes rebuild zones from that worker's cached panels. A physical count or layout change requires a worker restart.
 
-Alignment settings are `start_corner`, `reverse_direction`, and `perimeter_offset`. Default `bottom_center` selects anchor index zero and leaves the reported ID assignment unchanged, even when the strip's physical start is not centered. Other anchors use live corner positions; calibrated 40-panel anchors are 7, 15, 28, and 35. For rectangle index `i`, the output ID is `panels[(anchor + offset + direction*i).rem_euclid(n)].id`, where direction is +1 normally and −1 when reversed. Geometry and edge ownership stay fixed. Offsets validate in −39…39 and reduce modulo the current count when mapping. Alignment is independent of Look presets and saved Custom values. Configuration compatibility rules are documented in the [User Guide](USAGE.md#configuration-and-security).
+Alignment settings are `start_corner`, `reverse_direction`, and `perimeter_offset`. Default `bottom_center` selects anchor index zero and leaves the reported ID assignment unchanged. Other anchors use live corner positions; calibrated 40-panel anchors are 7, 15, 28, and 35. For rectangle index `i`, the output ID is `panels[(anchor + offset + direction*i).rem_euclid(n)].id`, where direction is +1 normally and −1 when reversed. Geometry and edge ownership stay fixed. Offsets validate in −39…39 and reduce modulo the current count when mapping. Alignment is independent of Look presets and saved Custom values. Legacy key migration and configuration compatibility rules are documented in the [User Guide](USAGE.md#configuration-and-security).
 
 `GetPanelCount` is read-only on both worker and control D-Bus interfaces. The control method forwards the worker's cached startup count, or zero when unavailable; it is not a persisted setting and cannot be set through `SetSettings`. QML polls it independently of the mode-specific preview count.
 
@@ -110,4 +112,4 @@ Alignment settings are `start_corner`, `reverse_direction`, and `perimeter_offse
 
 ## Configuration and runtime settings
 
-The control process and worker use `$XDG_CONFIG_HOME/nanoleaf-sync/config.json` (normally `~/.config/nanoleaf-sync/config.json`). The QML backend mirrors worker defaults and normalizes setting values; live changes cross session D-Bus. The worker validates updates and merges accepted setting keys into the latest config, preserving controller credentials and unrelated JSON. The shared schema includes `mode` (`1D`, `2D`, `3D`, `4D`) and validated `static_color` (`#RRGGBB`), defaulting to `4D` and `#ffffff`.
+The control process and worker use `$XDG_CONFIG_HOME/nanoleaf-sync/config.json` (normally `~/.config/nanoleaf-sync/config.json`). The QML backend mirrors worker defaults and normalizes setting values; live changes cross session D-Bus. The worker validates updates and merges accepted setting keys into the latest config, preserving controller credentials and unrelated JSON. The shared schema includes `mode` (`1D`, `2D`, `3D`, `4D`) and validated `static_color` (`#RRGGBB`), defaulting to `4D` and `#ffffff`. Alignment uses the canonical `start_corner`, `reverse_direction`, and `perimeter_offset` keys; the read-only detected panel count is fetched from the worker and is not persisted.

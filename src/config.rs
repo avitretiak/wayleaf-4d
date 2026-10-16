@@ -62,7 +62,7 @@ impl Default for Config {
             brightness: 1.5,
             smooth: 0.35,
             black_threshold: 0.01,
-            saturation_boost: 1.0,
+            saturation_boost: 1.25,
             letterbox: true,
             midtone_lift: false,
             strict_black: false,
@@ -766,8 +766,33 @@ mod tests {
     }
 
     #[test]
+    fn saturation_default_and_saved_values_are_preserved() {
+        let missing_path = test_path();
+        let missing = Config::load(&missing_path).expect("load missing config");
+        assert_eq!(missing.saturation_boost, 1.25);
+
+        let path = test_path();
+        write_atomic(&path, br#"{"saturation_boost":1.0}"#).expect("seed saved saturation");
+        let saved = Config::load(&path).expect("load saved saturation");
+        assert_eq!(saved.saturation_boost, 1.0);
+        saved
+            .save_settings(&json!({"monitor":"DP-3"}))
+            .expect("save unrelated setting");
+        let reloaded = Config::load(&path).expect("reload saved saturation");
+        assert_eq!(reloaded.saturation_boost, 1.0);
+
+        for path in [&missing_path, &path] {
+            let _ = fs::remove_file(path);
+            if let Ok(lock) = lock_path(path) {
+                let _ = fs::remove_file(lock);
+            }
+        }
+    }
+
+    #[test]
     fn alignment_settings_validate_and_round_trip() {
         let mut config = Config::default();
+        assert_eq!(config.saturation_boost, 1.25);
         assert_eq!(config.start_corner, "bottom_center");
         assert!(!config.reverse_direction);
         assert_eq!(config.perimeter_offset, 0);

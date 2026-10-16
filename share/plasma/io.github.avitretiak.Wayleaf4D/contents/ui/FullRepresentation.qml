@@ -19,12 +19,11 @@ Item {
     property bool customSettingsPersisted: false
     property bool userTouchedSettings: false
     property string selectedPreset: "Custom"
-    property bool fineTuneExpanded: Boolean(configuration.fineTuneExpanded)
     readonly property var looks: ["Subtle", "Balanced", "Vivid", "Custom"]
     readonly property var presetKeys: ["saturation_boost", "smooth", "max_step", "edge_depth", "feather_depth", "center_bleed", "peak_mix", "black_threshold", "fps"]
     readonly property var legacyPresetKeys: ["saturation_boost", "smooth", "max_step", "edge_depth", "center_bleed", "peak_mix", "fps"]
     readonly property var settingDefaults: ({
-        saturation_boost: 1.0, smooth: 0.35, max_step: 12, edge_depth: 8,
+        saturation_boost: 1.25, smooth: 0.35, max_step: 12, edge_depth: 8,
         feather_depth: 5, center_bleed: 0, peak_mix: 15, black_threshold: 0.01,
         fps: 10, letterbox: true, midtone_lift: false, strict_black: false,
         start_corner: "bottom_center", reverse_direction: false, perimeter_offset: 0
@@ -60,15 +59,23 @@ Item {
 
     function presetValues(name) {
         if (name === "Subtle")
-            return ({ saturation_boost: 0.8, smooth: 0.25, max_step: 8, edge_depth: 8,
+            return ({ saturation_boost: 1.0, smooth: 0.25, max_step: 8, edge_depth: 8,
                 feather_depth: 5, center_bleed: 0, peak_mix: 5, black_threshold: 0.01, fps: 10 })
         if (name === "Balanced")
-            return ({ saturation_boost: 1.0, smooth: 0.35, max_step: 12, edge_depth: 8,
+            return ({ saturation_boost: 1.25, smooth: 0.35, max_step: 12, edge_depth: 8,
                 feather_depth: 5, center_bleed: 0, peak_mix: 15, black_threshold: 0.01, fps: 10 })
         if (name === "Vivid")
             return ({ saturation_boost: 1.9, smooth: 0.5, max_step: 18, edge_depth: 8,
                 feather_depth: 5, center_bleed: 0, peak_mix: 25, black_threshold: 0.01, fps: 10 })
         return null
+    }
+
+    function legacyPresetValues(name) {
+        const values = presetValues(name)
+        if (values) {
+            values.saturation_boost = name === "Subtle" ? 0.8 : name === "Balanced" ? 1.0 : 1.9
+        }
+        return values
     }
 
     function valuesFromSettings(settings) {
@@ -92,6 +99,12 @@ Item {
         const expected = presetValues(preset)
         return expected !== null && sameValues(values, expected)
     }
+
+    function sameLegacyPreset(values, preset) {
+        const expected = legacyPresetValues(preset)
+        return expected !== null && sameValues(values, expected)
+    }
+
 
     function validCustomSettings(values) {
         if (!values || typeof values !== "object" || Array.isArray(values))
@@ -172,11 +185,15 @@ Item {
         const current = valuesFromSettings(backend.settings)
         if (!customSettingsPersisted)
             customSettings = current
+        const savedLabel = String(configuration.selectedPreset || "")
+        const named = ["Subtle", "Balanced", "Vivid"].find(function(name) {
+            return savedLabel === name && (samePreset(current, name) || sameLegacyPreset(current, name))
+        })
         selectedPreset = configuration.selectedPreset === "Custom"
             && customSettingsPersisted && sameValues(current, customSettings) ? "Custom"
-                : samePreset(current, "Balanced") ? "Balanced"
-                    : samePreset(current, "Subtle") ? "Subtle"
-                        : samePreset(current, "Vivid") ? "Vivid" : "Custom"
+                : named || ["Balanced", "Subtle", "Vivid"].find(function(name) {
+                    return samePreset(current, name) || sameLegacyPreset(current, name)
+                }) || "Custom"
     }
 
     function noteFineTuneEdit(key, value) {
@@ -203,7 +220,6 @@ Item {
         const values = name === "Custom" ? customSettings : presetValues(name)
         if (name === "Custom") {
             saveCustomSettings(values)
-            fineTuneExpanded = true
         }
         for (const key of presetKeys)
             backend.setSetting(key, values[key])
@@ -243,8 +259,8 @@ Item {
         }
         saveCustomSettings(values)
         userTouchedSettings = true
-        selectedPreset = "Custom"
-        configuration.selectedPreset = "Custom"
+        selectedPreset = "Balanced"
+        configuration.selectedPreset = "Balanced"
         for (const key of fineTuneKeys)
             backend.setSetting(key, settingDefaults[key])
     }
@@ -335,7 +351,6 @@ Item {
     }
 
     onExpandedChanged: syncPreview()
-    onFineTuneExpandedChanged: configuration.fineTuneExpanded = fineTuneExpanded
     Connections {
         target: root.backend
         function onRunningChanged() { root.syncPreview() }
@@ -369,13 +384,14 @@ Item {
                 mode: root.mode
                 modeDescription: root.modeDescription(root.mode)
                 zonesByEdge: root.zoneColors
-                onMoreRequested: overflowMenu.open()
+                onMoreRequested: (anchor) => overflowMenu.popup(anchor, 0, anchor.height)
             }
         }
 
 
         ScrollView {
             id: bodyScroll
+            objectName: "body-controls-scroll"
             Layout.fillWidth: true
             Layout.fillHeight: true
             Layout.minimumHeight: 0
@@ -497,66 +513,6 @@ Item {
                     }
                 }
 
-                ColumnLayout {
-                    objectName: "alignment-controls"
-                    Layout.fillWidth: true
-                    visible: root.mode === "4D"
-                    enabled: !root.backend.busy && !root.backend.deviceBusy
-                    spacing: Kirigami.Units.smallSpacing
-                    RowLayout {
-                        Layout.fillWidth: true
-                        Label { text: "Strip alignment"; font.bold: true; Layout.fillWidth: true }
-                        ToolButton {
-                            objectName: "alignment-reset"
-                            text: "Reset"
-                            enabled: root.groupModified(["start_corner", "reverse_direction", "perimeter_offset"])
-                            onClicked: {
-                                root.backend.setSetting("start_corner", "bottom_center")
-                                root.backend.setSetting("reverse_direction", false)
-                                root.backend.setSetting("perimeter_offset", 0)
-                            }
-                            Accessible.name: "Reset strip alignment"
-                        }
-                    }
-                    Label {
-                        text: root.backend.detectedPanelCount > 0
-                            ? "Detected panels: " + root.backend.detectedPanelCount
-                            : "Detected panels: unavailable"
-                        Accessible.name: text
-                    }
-                    RowLayout {
-                        Layout.fillWidth: true
-                        Label { text: "Start corner"; Layout.fillWidth: true }
-                        ComboBox {
-                            objectName: "alignment-start-corner"
-                            model: ["Bottom center", "Bottom left", "Top left", "Top right", "Bottom right"]
-                            currentIndex: ["bottom_center", "bottom_left", "top_left", "top_right", "bottom_right"].indexOf(root.backend.settings.start_corner)
-                            onActivated: root.backend.setSetting("start_corner",
-                                ["bottom_center", "bottom_left", "top_left", "top_right", "bottom_right"][currentIndex])
-                            Accessible.name: "4D panel start corner"
-                        }
-                    }
-                    CheckBox {
-                        objectName: "alignment-reverse-direction"
-                        text: "Reverse panel direction"
-                        checked: Boolean(root.backend.settings.reverse_direction)
-                        onToggled: root.backend.setSetting("reverse_direction", checked)
-                        Accessible.name: "Reverse 4D panel direction"
-                    }
-                    RowLayout {
-                        Layout.fillWidth: true
-                        Label { text: "Perimeter offset"; Layout.fillWidth: true }
-                        SpinBox {
-                            objectName: "alignment-perimeter-offset"
-                            from: -39
-                            to: 39
-                            value: Math.max(-39, Math.min(39, Number(root.backend.settings.perimeter_offset) || 0))
-                            editable: true
-                            onValueModified: root.backend.setSetting("perimeter_offset", value)
-                            Accessible.name: "4D perimeter offset"
-                        }
-                    }
-                }
 
                 ColumnLayout {
                     Layout.fillWidth: true
@@ -585,13 +541,11 @@ Item {
                     spacing: Kirigami.Units.smallSpacing
                     RowLayout {
                         Layout.fillWidth: true
-                        ToolButton {
+                        Label {
                             Layout.fillWidth: true
-                            text: (root.fineTuneExpanded ? "▾" : "▸") + "  Fine tune · " + root.fineTuneCount + " settings"
-                            flat: true
-                            onClicked: root.fineTuneExpanded = !root.fineTuneExpanded
-                            Accessible.name: "Fine tune, " + root.fineTuneCount + " settings"
-                            Accessible.description: root.fineTuneExpanded ? "Hide fine-tune settings" : "Show fine-tune settings"
+                            text: "Fine tune · " + root.fineTuneCount + " settings"
+                            Accessible.name: text
+                            Accessible.description: "Fine-tune settings"
                         }
                         ToolButton {
                             text: "Reset all"
@@ -603,7 +557,6 @@ Item {
                     }
                     ColumnLayout {
                         Layout.fillWidth: true
-                        visible: root.fineTuneExpanded
                         enabled: !root.backend.busy && !root.backend.deviceBusy && root.backend.status !== "starting" && root.backend.status !== "stopping"
                         spacing: Kirigami.Units.smallSpacing
 
@@ -624,7 +577,7 @@ Item {
                             SettingSlider {
                                 backend: root.backend; Layout.fillWidth: true; settingKey: "saturation_boost"
                                 label: "Saturation"; description: "Emphasizes saturated screen colors."
-                                minimum: 0; maximum: 3; decimals: 2; defaultValue: 1.5
+                                minimum: 0; maximum: 3; decimals: 2; defaultValue: 1.25
                                 onValueEdited: (key, value) => root.noteFineTuneEdit(key, value)
                             }
                             SettingSlider {
@@ -969,6 +922,7 @@ Item {
                 ToolTip.visible: hovered
             }
             Button {
+                objectName: "device-details-button"
                 icon.name: "network-wired-symbolic"
                 text: root.backend.deviceConnected ? String(root.backend.deviceInfo.name || "Nanoleaf 4D") : "Not paired"
                 enabled: root.backend.deviceConnected || root.backend.deviceInfoStale
@@ -981,6 +935,7 @@ Item {
     }
     Menu {
         id: overflowMenu
+        objectName: "overflow-menu"
         MenuItem {
             text: "Device details…"
             enabled: root.backend.deviceConnected || root.backend.deviceInfoStale || Object.keys(root.backend.deviceInfo).length > 0
@@ -1027,42 +982,134 @@ Item {
 
     Dialog {
         id: deviceDialog
-        title: "Nanoleaf 4D details"
+        objectName: "device-details-dialog"
+        title: "Device details"
+        width: Math.max(0, Math.min(root.width - 2 * Kirigami.Units.largeSpacing, Kirigami.Units.gridUnit * 20))
+        height: Math.min(implicitHeight, root.popupHeightLimit, Math.max(0, root.height - 2 * Kirigami.Units.largeSpacing))
+        x: (root.width - width) / 2
+        y: (root.height - height) / 2
         modal: true
         standardButtons: Dialog.Close
-        contentItem: ColumnLayout {
-            width: Kirigami.Units.gridUnit * 20
-            Label {
-                Layout.fillWidth: true
-                visible: root.backend.deviceInfoStale
-                text: "Details are stale; refresh to retry."
-                wrapMode: Text.Wrap
-                color: Kirigami.Theme.neutralTextColor
-            }
-            Repeater {
-                model: [
-                    { label: "Name", key: "name" }, { label: "Model", key: "model" },
-                    { label: "Serial", key: "serialNo" }, { label: "Firmware", key: "firmwareVersion" },
-                    { label: "Address", key: "host" }
-                ]
-                delegate: TextField {
-                    required property var modelData
+        contentItem: ScrollView {
+            id: deviceDetailsScroll
+            objectName: "device-details-scroll"
+            padding: Kirigami.Units.largeSpacing
+            contentWidth: availableWidth
+            contentHeight: detailsColumn.implicitHeight + 2 * padding
+            clip: true
+            ScrollBar.vertical.policy: ScrollBar.AsNeeded
+            ColumnLayout {
+                id: detailsColumn
+                x: deviceDetailsScroll.padding
+                y: deviceDetailsScroll.padding
+                width: Math.max(0, deviceDetailsScroll.availableWidth - 2 * deviceDetailsScroll.padding)
+                spacing: Kirigami.Units.smallSpacing
+                Label {
                     Layout.fillWidth: true
-                    visible: modelData.key === "host" ? root.backend.deviceHost.length > 0
-                        : String(root.backend.deviceInfo[modelData.key] || "").length > 0
-                    text: modelData.label + ": " + (modelData.key === "host" ? root.backend.deviceHost
-                        : String(root.backend.deviceInfo[modelData.key] || ""))
-                    readOnly: true
-                    selectByMouse: true
-                    Accessible.name: modelData.label
-                    Accessible.description: "Read-only device detail; select and copy the value."
+                    visible: root.backend.deviceInfoStale
+                    text: "Details are stale; refresh to retry."
+                    wrapMode: Text.Wrap
+                    color: Kirigami.Theme.neutralTextColor
                 }
-            }
-            Button {
-                Layout.alignment: Qt.AlignLeft
-                text: root.backend.deviceBusy ? "Refreshing…" : "Refresh details"
-                enabled: root.backend.deviceConnected && !root.backend.deviceBusy
-                onClicked: root.backend.refreshDeviceInfo()
+                Repeater {
+                    model: [
+                        { label: "Name", key: "name" }, { label: "Model", key: "model" },
+                        { label: "Serial", key: "serialNo" }, { label: "Firmware", key: "firmwareVersion" },
+                        { label: "Address", key: "host" }
+                    ]
+                    delegate: TextField {
+                        required property var modelData
+                        Layout.fillWidth: true
+                        visible: modelData.key === "host" ? root.backend.deviceHost.length > 0
+                            : String(root.backend.deviceInfo[modelData.key] || "").length > 0
+                        text: modelData.label + ": " + (modelData.key === "host" ? root.backend.deviceHost
+                            : String(root.backend.deviceInfo[modelData.key] || ""))
+                        readOnly: true
+                        selectByMouse: true
+                        Accessible.name: modelData.label
+                        Accessible.description: "Read-only device detail; select and copy the value."
+                    }
+                }
+                Rectangle {
+                    visible: root.mode === "4D"
+                    Layout.preferredHeight: 1
+                    color: Kirigami.Theme.disabledTextColor
+                    opacity: 0.35
+                    Accessible.ignored: true
+                }
+                ColumnLayout {
+                    objectName: "alignment-controls"
+                    Layout.fillWidth: true
+                    visible: root.mode === "4D"
+                    spacing: Kirigami.Units.smallSpacing
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Label { text: "Strip alignment"; font.bold: true; Layout.fillWidth: true }
+                        Button {
+                            objectName: "alignment-reset"
+                            text: "Reset"
+                            enabled: !root.backend.busy && !root.backend.deviceBusy
+                                && root.groupModified(["start_corner", "reverse_direction", "perimeter_offset"])
+                            onClicked: {
+                                root.backend.setSetting("start_corner", "bottom_center")
+                                root.backend.setSetting("reverse_direction", false)
+                                root.backend.setSetting("perimeter_offset", 0)
+                            }
+                        }
+                    }
+                    Label {
+                        objectName: "detected-panel-count"
+                        text: "Detected panels: " + (root.backend.detectedPanelCount > 0
+                            ? root.backend.detectedPanelCount : "unavailable")
+                        color: Kirigami.Theme.disabledTextColor
+                        Accessible.name: text
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Label { text: "Start corner"; Layout.preferredWidth: 100 * root.u }
+                        ComboBox {
+                            objectName: "alignment-start-corner"
+                            Layout.fillWidth: true
+                            Layout.minimumWidth: 0
+                            model: ["Bottom center", "Bottom left", "Top left", "Top right", "Bottom right"]
+                            currentIndex: ["bottom_center", "bottom_left", "top_left", "top_right", "bottom_right"].indexOf(root.backend.settings.start_corner)
+                            enabled: !root.backend.busy && !root.backend.deviceBusy
+                            onActivated: root.backend.setSetting("start_corner",
+                                ["bottom_center", "bottom_left", "top_left", "top_right", "bottom_right"][currentIndex])
+                            Accessible.name: "Start corner"
+                        }
+                    }
+                    CheckBox {
+                        objectName: "alignment-reverse-direction"
+                        text: "Reverse panel direction"
+                        checked: Boolean(root.backend.settings.reverse_direction)
+                        enabled: !root.backend.busy && !root.backend.deviceBusy
+                        onToggled: root.backend.setSetting("reverse_direction", checked)
+                        Accessible.name: "Reverse panel direction"
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Label { text: "Perimeter offset"; Layout.preferredWidth: 100 * root.u }
+                        SpinBox {
+                            objectName: "alignment-perimeter-offset"
+                            from: -39
+                            to: 39
+                            value: Math.max(-39, Math.min(39, Number(root.backend.settings.perimeter_offset) || 0))
+                            editable: true
+                            enabled: !root.backend.busy && !root.backend.deviceBusy
+                            onValueModified: root.backend.setSetting("perimeter_offset", value)
+                            Accessible.name: "Perimeter offset"
+                        }
+                        Item { Layout.fillWidth: true }
+                    }
+                }
+
+                Button {
+                    Layout.alignment: Qt.AlignLeft
+                    text: root.backend.deviceBusy ? "Refreshing…" : "Refresh details"
+                    enabled: root.backend.deviceConnected && !root.backend.busy && !root.backend.deviceBusy
+                    onClicked: root.backend.refreshDeviceInfo()
+                }
             }
         }
     }

@@ -19,7 +19,7 @@ TestCase {
     })
     readonly property var defaults: ({
         mode: "4D", static_color: "#ffffff", brightness: 1.5,
-        saturation_boost: 1.0, smooth: 0.35, max_step: 12, edge_depth: 8,
+        saturation_boost: 1.25, smooth: 0.35, max_step: 12, edge_depth: 8,
         feather_depth: 5, center_bleed: 0, peak_mix: 15, black_threshold: 0.01,
         fps: 10, letterbox: true, midtone_lift: false, strict_black: false,
         start_corner: "bottom_center", reverse_direction: false, perimeter_offset: 0
@@ -70,7 +70,6 @@ TestCase {
         id: savedState
         property string customSettings: ""
         property string selectedPreset: ""
-        property bool fineTuneExpanded: false
     }
 
     Component {
@@ -92,6 +91,12 @@ TestCase {
 
     function closePopup() {
         if (popup) {
+            const deviceDialog = findChild(popup, "device-details-dialog")
+            if (deviceDialog && deviceDialog.visible) {
+                deviceDialog.close()
+                tryCompare(deviceDialog, "visible", false)
+                wait(0)
+            }
             popup.destroy()
             popup = null
             wait(0)
@@ -101,12 +106,15 @@ TestCase {
     function init() {
         savedState.customSettings = ""
         savedState.selectedPreset = ""
-        savedState.fineTuneExpanded = false
         backendState.settings = normalized(Object.assign({}, defaults, customValues))
         openPopup()
     }
 
-    function cleanup() { closePopup() }
+    function cleanup() {
+        backendState.busy = false
+        backendState.deviceBusy = false
+        closePopup()
+    }
 
     function verifyCustomValues() {
         for (const key of Object.keys(customValues)) {
@@ -122,27 +130,69 @@ TestCase {
         tryCompare(popup, "selectedPreset", ["Subtle", "Balanced", "Vivid", "Custom"][index])
     }
 
+
+    function test_overflow_menu_anchors_to_actual_button() {
+        const button = findChild(popup, "more-options-button")
+        const menu = findChild(popup, "overflow-menu")
+        verify(button !== null)
+        verify(menu !== null)
+        mouseClick(button)
+        tryCompare(menu, "visible", true)
+        const buttonTopLeft = button.mapToItem(testCase, 0, 0)
+        const buttonBottomRight = button.mapToItem(testCase, button.width, button.height)
+        const menuTopLeft = menu.contentItem.mapToItem(testCase, 0, 0)
+        const menuBottomRight = menu.contentItem.mapToItem(testCase,
+            menu.contentItem.width, menu.contentItem.height)
+        verify(menu.visible)
+        verify(menuTopLeft.x >= 0 && menuTopLeft.y >= 0
+            && menuBottomRight.x <= testCase.width && menuBottomRight.y <= testCase.height,
+            "Visible menu must remain within the available viewport")
+        const opensBelow = menuTopLeft.y >= buttonBottomRight.y
+        const opensAbove = menuBottomRight.y <= buttonTopLeft.y
+        verify(opensBelow || opensAbove, "Menu must open adjacent to the activated button")
+        verify(menuTopLeft.x < buttonBottomRight.x && menuBottomRight.x > buttonTopLeft.x,
+            "Menu popup must stay horizontally anchored to the activated button")
+        menu.close()
+
+    }
+    function verifyCustomControls(mode) {
+        const keys = mode === "2D"
+            ? ["saturation_boost", "smooth", "fps"]
+            : mode === "3D"
+                ? ["saturation_boost", "smooth", "edge_depth", "max_step", "peak_mix", "fps"]
+                : ["saturation_boost", "smooth", "midtone_lift", "edge_depth", "feather_depth", "max_step",
+                    "center_bleed", "peak_mix", "black_threshold", "letterbox", "strict_black", "fps"]
+        compare(popup.fineTuneCount, keys.length)
+        for (const key of keys) {
+            const isSwitch = key === "midtone_lift" || key === "letterbox" || key === "strict_black"
+            const objectName = "setting-" + key + (isSwitch ? "" : "-slider")
+            const control = findChild(popup, objectName)
+            verify(control !== null && control.visible, mode + " Custom control not visible: " + objectName)
+        }
+    }
+
     function test_custom_survives_balanced_and_popup_reopen() {
-        compare(popup.selectedPreset, "Custom")
+        verifyCustomControls("4D")
         selectLook(1)
         compare(backendState.settings.peak_mix, 15)
         const snapshot = JSON.parse(savedState.customSettings)
         for (const key of Object.keys(customValues))
             verify(Math.abs(snapshot[key] - customValues[key]) < 0.000001, key)
         selectLook(3)
+        verifyCustomControls("4D")
         verifyCustomValues()
-        verify(popup.fineTuneExpanded)
         selectLook(1)
         closePopup()
         openPopup()
         compare(popup.selectedPreset, "Balanced")
         selectLook(3)
+        verifyCustomControls("4D")
         verifyCustomValues()
     }
 
     function test_each_preset_hides_fine_tuning_and_preserves_custom() {
         const names = ["Subtle", "Balanced", "Vivid"]
-        const expectedSaturation = [0.8, 1.0, 1.9]
+        const expectedSaturation = [1.0, 1.25, 1.9]
         for (let i = 0; i < names.length; ++i) {
             selectLook(i)
             verify(!findChild(popup, "fine-tune-controls").visible, names[i])
@@ -154,6 +204,47 @@ TestCase {
             verify(findChild(popup, "fine-tune-controls").visible)
             verifyCustomValues()
         }
+    }
+    function test_legacy_named_preset_keeps_saved_values() {
+        closePopup()
+        savedState.selectedPreset = "Subtle"
+        backendState.settings = normalized(Object.assign({}, defaults, {
+            saturation_boost: 0.8, smooth: 0.25, max_step: 8, peak_mix: 5
+        }))
+        openPopup()
+        compare(popup.selectedPreset, "Subtle")
+        compare(backendState.settings.saturation_boost, 0.8)
+    }
+    function test_legacy_balanced_preset_keeps_saved_values() {
+        closePopup()
+        savedState.selectedPreset = "Balanced"
+        backendState.settings = normalized(Object.assign({}, defaults, {
+            saturation_boost: 1.0
+        }))
+        openPopup()
+        compare(popup.selectedPreset, "Balanced")
+        compare(backendState.settings.saturation_boost, 1.0)
+    }
+
+
+    function test_legacy_preset_values_without_saved_label_are_recognized() {
+        closePopup()
+        savedState.selectedPreset = ""
+        backendState.settings = normalized(Object.assign({}, defaults, {
+            saturation_boost: 0.8, smooth: 0.25, max_step: 8, peak_mix: 5
+        }))
+        openPopup()
+        compare(popup.selectedPreset, "Subtle")
+        compare(backendState.settings.saturation_boost, 0.8)
+    }
+
+    function test_stale_named_preset_label_does_not_override_custom_values() {
+        closePopup()
+        savedState.selectedPreset = "Subtle"
+        backendState.settings = normalized(Object.assign({}, defaults, { saturation_boost: 2.1 }))
+        openPopup()
+        compare(popup.selectedPreset, "Custom")
+        compare(backendState.settings.saturation_boost, 2.1)
     }
 
     function test_keyboard_and_drag_round_trip() {
@@ -188,12 +279,29 @@ TestCase {
         selectLook(1)
         selectLook(3)
         popup.resetAllFineTune()
+        compare(popup.selectedPreset, "Balanced")
+        verify(!findChild(popup, "fine-tune-controls").visible)
+        selectLook(3)
         compare(popup.selectedPreset, "Custom")
         verify(findChild(popup, "fine-tune-controls").visible)
         closePopup()
         openPopup()
         compare(popup.selectedPreset, "Custom")
         compare(backendState.settings.peak_mix, 15)
+    }
+
+    function test_reset_uses_balanced_defaults() {
+        selectLook(1)
+        selectLook(3)
+        popup.resetAllFineTune()
+        compare(backendState.settings.saturation_boost, 1.25)
+        compare(popup.selectedPreset, "Balanced")
+        verify(!findChild(popup, "fine-tune-controls").visible)
+        closePopup()
+        openPopup()
+        compare(popup.selectedPreset, "Balanced")
+        compare(backendState.settings.saturation_boost, 1.25)
+        verify(!findChild(popup, "fine-tune-controls").visible)
     }
 
     function test_custom_edit_survives_immediate_preset_switch() {
@@ -212,31 +320,66 @@ TestCase {
     function test_custom_fine_tuning_follows_capture_mode() {
         selectLook(1)
         selectLook(3)
+        verifyCustomControls("4D")
         backendState.setSetting("mode", "1D")
         verify(!findChild(popup, "fine-tune-controls").visible)
         for (const mode of ["2D", "3D", "4D"]) {
             backendState.setSetting("mode", mode)
             verify(findChild(popup, "fine-tune-controls").visible, mode)
+            verifyCustomControls(mode)
         }
     }
 
     function test_alignment_survives_look_changes_and_group_reset() {
-        const controls = findChild(popup, "alignment-controls")
+        popup.width = 260
+        mouseClick(findChild(popup, "device-details-button"))
+        wait(0)
+        const alignment = findChild(popup, "alignment-controls")
+        verify(alignment.visible)
+        const dialog = findChild(popup, "device-details-dialog")
+        const detailsScroll = findChild(popup, "device-details-scroll")
+        verify(dialog.width <= popup.width && dialog.height <= popup.height)
+        verify(detailsScroll.width > 0 && detailsScroll.height > 0)
+        verify(detailsScroll.padding > 0)
+        verify(detailsScroll.width <= dialog.width && detailsScroll.height <= dialog.height)
+        verify(detailsScroll.availableWidth > 2 * detailsScroll.padding)
+        const alignmentPosition = alignment.mapToItem(detailsScroll, 0, 0)
+        verify(alignmentPosition.x >= detailsScroll.padding && alignmentPosition.y >= detailsScroll.padding)
+        verify(alignment.width <= detailsScroll.availableWidth - 2 * detailsScroll.padding)
+        const bodyScroll = findChild(popup, "body-controls-scroll")
+        const saturation = findChild(popup, "setting-saturation_boost-slider")
+        const saturationTopLeft = saturation.mapToItem(bodyScroll, 0, 0)
+        verify(saturation.width > 0 && saturationTopLeft.x >= 0
+            && saturationTopLeft.x + saturation.width <= bodyScroll.width)
         const corner = findChild(popup, "alignment-start-corner")
         const reverse = findChild(popup, "alignment-reverse-direction")
         const offset = findChild(popup, "alignment-perimeter-offset")
+        const cornerRow = corner.parent
+        const cornerPosition = corner.mapToItem(cornerRow, 0, 0)
+        verify(corner.width > 0 && cornerPosition.x >= 0
+            && cornerPosition.x + corner.width <= cornerRow.width)
+        const offsetRow = offset.parent
+        const offsetPosition = offset.mapToItem(offsetRow, 0, 0)
+        verify(offset.width > 0 && offsetPosition.x >= 0
+            && offsetPosition.x + offset.width <= offsetRow.width)
         corner.forceActiveFocus()
         keyClick(Qt.Key_Down)
         keyClick(Qt.Key_Down)
         compare(backendState.settings.start_corner, "top_left")
         reverse.forceActiveFocus()
         keyClick(Qt.Key_Space)
+        backendState.setSetting("perimeter_offset", 39)
+        compare(offset.value, 39)
+        offset.forceActiveFocus()
+        keyClick(Qt.Key_Up)
+        compare(backendState.settings.perimeter_offset, 39)
+        backendState.setSetting("perimeter_offset", 0)
         offset.forceActiveFocus()
         keyClick(Qt.Key_Up)
         compare(backendState.settings.perimeter_offset, 1)
         for (const look of ["Subtle", "Balanced", "Vivid", "Custom"]) {
             popup.choosePreset(look)
-            verify(controls.visible)
+            verify(alignment.visible)
             compare(backendState.settings.start_corner, "top_left")
             compare(backendState.settings.reverse_direction, true)
             compare(backendState.settings.perimeter_offset, 1)
@@ -252,7 +395,16 @@ TestCase {
         compare(backendState.settings.brightness, brightness)
         for (const mode of ["1D", "2D", "3D"]) {
             backendState.setSetting("mode", mode)
-            verify(!controls.visible)
+            verify(!alignment.visible)
         }
+        backendState.setSetting("mode", "4D")
+        verify(alignment.visible)
+        backendState.detectedPanelCount = 0
+        const detectedCount = findChild(popup, "detected-panel-count")
+        verify(detectedCount.visible)
+        backendState.busy = true
+        verify(!corner.enabled)
+        verify(!offset.enabled)
+        verify(!findChild(popup, "alignment-reset").enabled)
     }
 }

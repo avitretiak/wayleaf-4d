@@ -300,7 +300,7 @@ impl Gpu {
             }
         }
         let primary = primary.ok_or_else(|| {
-            AppError::new(format!(
+            AppError::temporary(format!(
                 "KMS returned no primary plane for monitor {}",
                 monitor.name
             ))

@@ -2,6 +2,8 @@
 
 Mirror display colors to a Nanoleaf 4D from KDE Plasma. The Wayleaf 4D widget is the primary interface: choose 1D static color, 2D one screen-wide color, 3D ten coarse edge zones, or 4D per-panel edge mirroring. The `wayleaf-4d` CLI remains available for pairing, diagnostics, and standalone streaming.
 
+Strip mapping uses the controller's reported panel count and layout, not a nominal 34-panel split. 4D panel-ID alignment is independent of Looks and available in Device details from the footer or **More options**. Subtle, Balanced, and Vivid use saturation values of 1.0, 1.25, and 1.9 respectively; new-install and reset defaults select Balanced. The applet's brightness slider scales Wayleaf's RGB output separately from the Nanoleaf's global brightness. See the [User Guide](docs/USAGE.md).
+
 <img src="docs/wayleaf-4d.png" width="400" alt="Illustrative rainbow preview of Wayleaf 4D's Plasma popup, with four-way Mode and Look sliders and an exterior glow">
 
 ## Requirements
@@ -45,7 +47,7 @@ Modes 2D–4D use direct KMS capture through the GSR helper. The helper composit
 
 - [User Guide](docs/USAGE.md): detailed controls, service behavior, configuration, CLI, diagnostics, and removal.
 - [Implementation reference](docs/DEVELOPMENT.md): architecture and implementation details.
-- [Release notes](docs/RELEASE_NOTES-0.3.4.md).
+- [Release notes](docs/RELEASE_NOTES.md).
 
 ## Credits
 

@@ -13,7 +13,7 @@ Item {
         mode: "4D",
         static_color: "#ffffff",
         brightness: 1.5,
-        saturation_boost: 1.0,
+        saturation_boost: 1.25,
         fps: 10,
         smooth: 0.35,
         black_threshold: 0.01,

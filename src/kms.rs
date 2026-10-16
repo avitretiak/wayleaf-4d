@@ -502,11 +502,14 @@ pub fn self_test() -> Result<()> {
         width: 1920,
         height: 1080,
     };
+    let no_monitor_is_temporary = matches!(select_from("", &[]), Err(error) if error.temporary);
+    let missing_monitor_is_temporary = matches!(select_from("missing", std::slice::from_ref(&monitor)), Err(error) if error.temporary);
+    let ambiguous_monitor_is_permanent = matches!(select_from("DP-1", &[monitor.clone(), monitor.clone()]), Err(error) if !error.temporary);
     if select_from("", std::slice::from_ref(&monitor))?.connector_id != monitor.connector_id
         || select_from("DP-1", std::slice::from_ref(&monitor))?.connector_id != monitor.connector_id
-        || select_from("", &[]).is_ok()
-        || select_from("missing", std::slice::from_ref(&monitor)).is_ok()
-        || select_from("DP-1", &[monitor.clone(), monitor]).is_ok()
+        || !no_monitor_is_temporary
+        || !missing_monitor_is_temporary
+        || !ambiguous_monitor_is_permanent
     {
         return Err(AppError::new("KMS monitor selection self-check failed"));
     }
@@ -556,7 +559,9 @@ fn validate_monitor(monitor: &Monitor) -> Result<()> {
 fn select_from(name: &str, available: &[Monitor]) -> Result<Monitor> {
     if name.is_empty() {
         return match available {
-            [] => Err(AppError::new("no connected active DRM monitors were found")),
+            [] => Err(AppError::temporary(
+                "no connected active DRM monitors were found",
+            )),
             [monitor] => Ok(monitor.clone()),
             _ => Err(AppError::new(format!(
                 "multiple active monitors are available; choose one with --monitor NAME: {}",
@@ -570,7 +575,7 @@ fn select_from(name: &str, available: &[Monitor]) -> Result<Monitor> {
     }
     let mut matches = available.iter().filter(|monitor| monitor.name == name);
     let Some(first) = matches.next() else {
-        return Err(AppError::new(format!(
+        return Err(AppError::temporary(format!(
             "monitor {name:?} is not connected and active; refresh the monitor list"
         )));
     };
@@ -825,7 +830,7 @@ fn validate_response(response: &WireResponse) -> Result<usize> {
         fd_count += item.num_dma_bufs as usize;
     }
     if response.result == RESULT_OK && response.num_items == 0 {
-        return Err(AppError::new(
+        return Err(AppError::temporary(
             "KMS protocol error: helper returned an empty successful response",
         ));
     }
@@ -1367,6 +1372,20 @@ impl Drop for DrmProperty {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_successful_response_is_temporary() {
+        let mut response = empty_wire_response();
+        response.version = PROTOCOL_VERSION;
+        response.result = RESULT_OK;
+
+        let error = validate_response(&response).unwrap_err();
+        assert!(error.temporary);
+        assert_eq!(
+            error.message,
+            "KMS protocol error: helper returned an empty successful response"
+        );
+    }
 
     #[test]
     fn absent_supported_and_unsupported_hdr_metadata_are_distinct() {

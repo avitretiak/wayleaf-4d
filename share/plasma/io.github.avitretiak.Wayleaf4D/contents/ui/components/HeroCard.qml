@@ -11,7 +11,7 @@ Rectangle {
     required property string mode
     required property string modeDescription
     required property var zonesByEdge
-    signal moreRequested()
+    signal moreRequested(var anchor)
 
     readonly property real u: Kirigami.Units.gridUnit / 16
     readonly property real brightness: Math.max(0, Math.min(2, Number(backend.settings.brightness)))
@@ -132,6 +132,7 @@ Rectangle {
     }
     ToolButton {
         id: moreButton
+        objectName: "more-options-button"
         x: root.width - width - 18 * root.u
         y: 18 * root.u
         icon.name: "overflow-menu"
@@ -141,7 +142,7 @@ Rectangle {
         Accessible.name: "More options"
         ToolTip.text: "More options"
         ToolTip.visible: hovered
-        onClicked: root.moreRequested()
+        onClicked: root.moreRequested(moreButton)
     }
 
     Kirigami.Icon {
