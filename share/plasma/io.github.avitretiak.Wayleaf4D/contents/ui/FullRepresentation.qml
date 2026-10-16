@@ -5,14 +5,15 @@ import QtQuick.Window
 import QtQuick.Controls
 import QtQuick.Layouts
 import QtQuick.Dialogs
-import QtQuick.Effects
 import org.kde.kirigami as Kirigami
 import org.kde.plasma.plasmoid
+import "components" as Components
 
 Item {
     id: root
     required property var backend
     required property bool expanded
+    readonly property real u: Kirigami.Units.gridUnit / 16
 
     property var customSettings: ({})
     property bool customSettingsPersisted: false
@@ -46,9 +47,12 @@ Item {
             : mode === "3D" ? ["saturation_boost", "smooth", "max_step", "edge_depth", "peak_mix", "fps"]
                 : ["saturation_boost", "smooth", "midtone_lift", "edge_depth", "feather_depth", "max_step", "center_bleed", "peak_mix", "black_threshold", "letterbox", "strict_black", "fps"]
     readonly property int fineTuneCount: fineTuneKeys.length
+    readonly property var zoneColors: groupedZones()
 
-    implicitWidth: Kirigami.Units.gridUnit * 20
-    implicitHeight: Math.min(content.implicitHeight, popupHeightLimit)
+    implicitWidth: 320 * u
+    implicitHeight: Math.min(content.implicitHeight + 40 * u, popupHeightLimit)
+    Layout.minimumWidth: 320 * u
+    Layout.minimumHeight: 320 * u
     Accessible.name: "Wayleaf 4D controls"
     clip: true
 
@@ -143,14 +147,16 @@ Item {
     function statusText() {
         if (backend.error.length > 0 || backend.status === "error")
             return backend.error.length > 0 ? "Error · " + backend.error : "Synchronization needs attention"
-        if (backend.status === "starting") return "Starting synchronization…"
-        if (backend.status === "stopping") return "Stopping synchronization…"
+        if (backend.status === "starting") return "Starting…"
+        if (backend.status === "stopping") return "Stopping…"
         if (backend.running && mode === "1D") return "On · " + colorName()
         if (backend.running) return "Syncing · " + Number(backend.settings.fps) + " Hz · " + backend.selectedMonitor
         return backend.deviceConnected ? "Off · " + modeDescription(mode) : "No Nanoleaf 4D paired"
     }
 
     function syncPreview() {
+        if (!backend)
+            return
         backend.setPreviewEnabled(expanded && backend.running && mode !== "1D")
     }
 
@@ -224,21 +230,63 @@ Item {
             backend.setSetting(key, settingDefaults[key])
     }
 
-    function uniformZones() {
-        const live = mode !== "1D" && backend.previewZones.length > 0 ? backend.previewZones[0] : null
-        const fallback = mode !== "1D" && !live
-        const channels = live ? [Number(live.r), Number(live.g), Number(live.b)]
-            : [Math.round(staticColor.r * 255), Math.round(staticColor.g * 255), Math.round(staticColor.b * 255)]
-        return ["top", "right", "bottom", "left"].map(function(edge) {
-            return { edge: edge, position: 0.5, span: 1, r: channels[0], g: channels[1], b: channels[2], fallback: fallback }
+    function zoneWithColor(zone, rgb, live) {
+        const result = {
+            edge: String(zone.edge),
+            position: Math.max(0, Math.min(1, Number(zone.position))),
+            span: zone.span === undefined ? 1 : Number(zone.span),
+            r: live ? Math.max(0, Math.min(255, Math.round(Number(rgb[0])))) : Math.round(Kirigami.Theme.disabledTextColor.r * 255),
+            g: live ? Math.max(0, Math.min(255, Math.round(Number(rgb[1])))) : Math.round(Kirigami.Theme.disabledTextColor.g * 255),
+            b: live ? Math.max(0, Math.min(255, Math.round(Number(rgb[2])))) : Math.round(Kirigami.Theme.disabledTextColor.b * 255),
+            fallback: !live
+        }
+        if (zone.id !== undefined && zone.id !== null)
+            result.id = zone.id
+        return result
+    }
+
+    function zonesForMode() {
+        const preview = root.backend.previewZones
+        const staticRgb = [
+            Math.round(root.staticColor.r * 255),
+            Math.round(root.staticColor.g * 255),
+            Math.round(root.staticColor.b * 255)
+        ]
+        if (root.mode === "1D")
+            return root.edgeZones([1, 1, 1, 1]).map(function(zone) { return root.zoneWithColor(zone, staticRgb, true) })
+        if (root.mode === "2D") {
+            const live = preview.length > 0
+            const rgb = live ? [preview[0].r, preview[0].g, preview[0].b] : staticRgb
+            return root.edgeZones([1, 1, 1, 1]).map(function(zone) { return root.zoneWithColor(zone, rgb, live) })
+        }
+        if (root.mode === "3D") {
+            if (preview.length > 0)
+                return preview.map(function(zone) { return root.zoneWithColor(zone, [zone.r, zone.g, zone.b], true) })
+            return root.coarseZones().map(function(zone) { return root.zoneWithColor(zone, [0, 0, 0], false) })
+        }
+        const live = preview.length > 0
+        const zones = live ? preview : root.staticZones()
+        return zones.map(function(zone) {
+            return root.zoneWithColor(zone, [zone.r, zone.g, zone.b], live)
         })
+    }
+
+    function groupedZones() {
+        const groups = { top: [], right: [], bottom: [], left: [] }
+        for (const zone of root.zonesForMode()) {
+            if (groups[zone.edge])
+                groups[zone.edge].push(zone)
+        }
+        for (const edge of ["top", "right", "bottom", "left"])
+            groups[edge].sort(function(a, b) { return a.position - b.position })
+        return groups
     }
 
     function edgeZones(counts) {
         const zones = []
         const addEdge = function(edge, count) {
             for (let i = 0; i < count; ++i)
-                zones.push({ edge: edge, position: (i + 0.5) / count, span: 1 / count,
+                zones.push({ edge: edge, position: (i + 0.5) / count,
                     r: 0, g: 0, b: 0, fallback: true })
         }
         addEdge("top", counts[0])
@@ -249,7 +297,7 @@ Item {
     }
 
     function staticZones() {
-        return edgeZones([8, 6, 8, 6])
+        return edgeZones([9, 6, 13, 6])
     }
 
     function coarseZones() {
@@ -282,241 +330,27 @@ Item {
     ColumnLayout {
         id: content
         anchors.fill: parent
-        anchors.margins: Kirigami.Units.smallSpacing * 2
-        spacing: Kirigami.Units.smallSpacing
+        anchors.margins: 20 * root.u
+        spacing: 20 * root.u
 
         Item {
-            id: glowFrame
+            id: heroArea
             objectName: "live-preview"
             Layout.fillWidth: true
-            Layout.preferredHeight: headerContent.implicitHeight + 48
-            implicitHeight: headerContent.implicitHeight + 48
-            property var visibleZones: !root.expanded ? []
-                : root.mode === "1D" || root.mode === "2D" ? root.uniformZones()
-                    : root.mode === "3D" ? (root.backend.previewZones.length > 0 ? root.backend.previewZones : root.coarseZones())
-                        : root.backend.previewZones.length > 0 ? root.backend.previewZones : root.staticZones()
-            Item {
-                id: glowStrips
-                anchors.fill: parent
-                Accessible.ignored: true
-                opacity: root.backend.running ? 0.95 : 0.3
+            visible: root.expanded
+            implicitHeight: heroCard.implicitHeight
+            Layout.minimumHeight: implicitHeight
+            Components.HeroCard {
+                id: heroCard
                 visible: root.expanded
-                layer.enabled: root.expanded
-                layer.effect: MultiEffect {
-                    blurEnabled: true
-                    blur: 0.65
-                    blurMax: 3
-                }
-                Repeater {
-                    model: glowFrame.visibleZones
-                    delegate: Item {
-                        id: zoneLight
-                        required property var modelData
-                        readonly property string edge: String(modelData.edge)
-                        readonly property real segmentSpan: Math.max(0, Number(modelData.span))
-                        readonly property real position: Math.max(0, Math.min(1, Number(modelData.position)))
-                        readonly property real start: Math.max(0, position - segmentSpan / 2)
-                        readonly property real end: Math.min(1, position + segmentSpan / 2)
-                        readonly property real span: Math.max(0, end - start)
-                        readonly property real edgeLength: edge === "top" || edge === "bottom" ? glowFrame.width - 32 : glowFrame.height - 32
-                        readonly property real brightness: Math.max(0, Math.min(1.35, Number(root.backend.settings.brightness) / 1.5))
-                        readonly property bool liveZone: !Boolean(modelData.fallback)
-                        readonly property color colorAtBrightness: Qt.rgba(
-                            Math.min(1, Number(modelData.r) / 255 * brightness),
-                            Math.min(1, Number(modelData.g) / 255 * brightness),
-                            Math.min(1, Number(modelData.b) / 255 * brightness), 1)
-                        property color segmentColor: !root.backend.running || (root.mode !== "1D" && !liveZone)
-                            ? Kirigami.Theme.disabledTextColor
-                            : root.mode === "1D"
-                                ? Qt.rgba(Math.min(1, root.staticColor.r * brightness), Math.min(1, root.staticColor.g * brightness), Math.min(1, root.staticColor.b * brightness), 1)
-                                : colorAtBrightness
-                        x: edge === "top" || edge === "bottom" ? 16 + edgeLength * start : edge === "right" ? glowFrame.width - 14 : 8
-                        y: edge === "left" || edge === "right" ? 16 + edgeLength * start : edge === "bottom" ? glowFrame.height - 14 : 8
-                        width: edge === "top" || edge === "bottom" ? Math.max(4, edgeLength * span - 4) : 4
-                        height: edge === "left" || edge === "right" ? Math.max(4, edgeLength * span - 4) : 4
-                        ToolTip.visible: root.mode === "4D" && zoneHover.hovered
-                        ToolTip.text: "Controller zone " + modelData.id + " · " + edge + " · " + Math.round(position * 100) + "%"
-                        HoverHandler { id: zoneHover }
-                        Behavior on segmentColor {
-                            ColorAnimation { duration: Kirigami.Units.longDuration === 0 ? 0 : 80 }
-                        }
-                        Rectangle {
-                            anchors.fill: parent
-                            anchors.margins: -3
-                            color: zoneLight.segmentColor
-                            opacity: 0.24
-                            radius: Math.min(width, height) / 2
-                        }
-                        Rectangle {
-                            anchors.fill: parent
-                            color: zoneLight.segmentColor
-                            radius: Math.min(width, height) / 2
-                        }
-                    }
-                }
-            }
-            ColumnLayout {
-                id: headerContent
-                anchors.fill: parent
-                anchors.margins: 24
-                spacing: Kirigami.Units.largeSpacing
-
-                RowLayout {
-                    Layout.fillWidth: true
-                    spacing: Kirigami.Units.smallSpacing
-                    Rectangle {
-                        Layout.alignment: Qt.AlignVCenter
-                        Layout.preferredWidth: 9
-                        Layout.preferredHeight: 9
-                        radius: width / 2
-                        color: root.backend.error.length > 0 || root.backend.status === "error" ? Kirigami.Theme.negativeTextColor
-                            : root.backend.status === "starting" || root.backend.status === "stopping" ? Kirigami.Theme.neutralTextColor
-                                : root.backend.running ? Kirigami.Theme.positiveTextColor : Kirigami.Theme.disabledTextColor
-                        Accessible.ignored: true
-                    }
-                    ColumnLayout {
-                        Layout.fillWidth: true
-                        spacing: 0
-                        Label { text: "Wayleaf 4D"; font.bold: true }
-                        Label {
-                            Layout.fillWidth: true
-                            text: root.statusText()
-                            color: root.backend.error.length > 0 || root.backend.status === "error" ? Kirigami.Theme.negativeTextColor : Kirigami.Theme.disabledTextColor
-                            font: Kirigami.Theme.smallFont
-                            elide: Text.ElideMiddle
-                            Accessible.name: text
-                            Accessible.role: root.backend.error.length > 0 ? Accessible.AlertMessage : Accessible.StaticText
-                        }
-                    }
-                    Switch {
-                        id: syncSwitch
-                        objectName: "sync-switch"
-                        text: root.backend.running ? "Stop" : "Start"
-                        checked: root.backend.running
-                        enabled: root.backend.deviceConnected && (root.mode === "1D" || root.backend.selectedMonitor.length > 0)
-                            && !root.backend.busy && !root.backend.deviceBusy
-                            && root.backend.status !== "starting" && root.backend.status !== "stopping"
-                        onClicked: {
-                            if (checked !== root.backend.running)
-                                checked ? root.backend.run() : root.backend.stop()
-                        }
-                        Accessible.name: "Start or stop output"
-                        Accessible.description: checked ? "On. Toggle to stop output." : !root.backend.deviceConnected
-                            ? "Disabled until a Nanoleaf 4D is paired."
-                            : root.mode !== "1D" && root.backend.selectedMonitor.length === 0
-                                ? "Disabled until a capture monitor is selected." : "Off. Toggle to start output."
-                        ToolTip.text: Accessible.description
-                        ToolTip.visible: hovered
-                    }
-                    ToolButton {
-                        icon.name: "overflow-menu"
-                        display: AbstractButton.IconOnly
-                        Accessible.name: "More options"
-                        ToolTip.text: "More options"
-                        ToolTip.visible: hovered
-                        onClicked: overflowMenu.open()
-                        Menu {
-                            id: overflowMenu
-                            MenuItem {
-                                text: "Device details…"
-                                enabled: root.backend.deviceConnected || root.backend.deviceInfoStale || Object.keys(root.backend.deviceInfo).length > 0
-                                onTriggered: deviceDialog.open()
-                            }
-                            MenuItem {
-                                text: "Retry settings"
-                                visible: root.backend.settingsPending && root.backend.settingsError.length > 0
-                                enabled: root.backend.settingsRetryAvailable
-                                onTriggered: root.backend.retrySettings()
-                            }
-                            MenuItem {
-                                text: "Start at login"
-                                objectName: "start-at-login-switch"
-                                checkable: true
-                                checked: root.backend.startAtLogin
-                                enabled: !root.backend.busy && !root.backend.deviceBusy
-                                onTriggered: root.backend.setStartAtLogin(checked)
-                            }
-                            MenuItem { text: "About capture…"; onTriggered: aboutDialog.open() }
-                            MenuItem { text: "Diagnostics and help…"; onTriggered: diagnosticsDialog.open() }
-                            MenuSeparator {}
-                            MenuItem {
-                                text: root.backend.running ? "Stop sync and disconnect…" : "Disconnect…"
-                                enabled: true
-                                onTriggered: disconnectDialog.open()
-                            }
-                        }
-                    }
-                }
-
-                RowLayout {
-                    Layout.fillWidth: true
-                    spacing: Kirigami.Units.smallSpacing
-                    Kirigami.Icon {
-                        source: "brightness-high"
-                        implicitWidth: Kirigami.Units.iconSizes.small
-                        implicitHeight: implicitWidth
-                        Accessible.ignored: true
-                    }
-                    SettingSlider {
-                        backend: root.backend
-                        Layout.fillWidth: true
-                        settingKey: "brightness"
-                        label: "Brightness"
-                        description: "Scales the output brightness."
-                        minimum: 0
-                        maximum: 2
-                        decimals: 0
-                        valueMultiplier: 50
-                        displayMultiplier: 50
-                        suffix: "%"
-                        defaultValue: 1.5
-                        objectName: "control-brightness"
-                    }
-                }
-
-                RowLayout {
-                    Layout.fillWidth: true
-                    spacing: Kirigami.Units.smallSpacing
-                    ButtonGroup { id: modeGroup; exclusive: true }
-                    Repeater {
-                        id: modeRepeater
-                        model: ["1D", "2D", "3D", "4D"]
-                        delegate: Button {
-                            required property string modelData
-                            readonly property int modeIndex: ["1D", "2D", "3D", "4D"].indexOf(modelData)
-                            ButtonGroup.group: modeGroup
-                            Layout.fillWidth: true
-                            text: modelData
-                            checkable: true
-                            checked: root.mode === modelData
-                            highlighted: checked
-                            enabled: !root.backend.busy && !root.backend.deviceBusy
-                            onClicked: root.backend.setSetting("mode", modelData)
-                            Accessible.name: modelData + " mode"
-                            Accessible.description: root.modeDescription(modelData)
-                            ToolTip.text: Accessible.description
-                            ToolTip.visible: hovered || activeFocus
-                            Keys.onLeftPressed: {
-                                if (modeIndex > 0) {
-                                    root.backend.setSetting("mode", ["1D", "2D", "3D", "4D"][modeIndex - 1])
-                                    modeRepeater.itemAt(modeIndex - 1).forceActiveFocus()
-                                }
-                            }
-                            Keys.onRightPressed: {
-                                if (modeIndex < 3) {
-                                    root.backend.setSetting("mode", ["1D", "2D", "3D", "4D"][modeIndex + 1])
-                                    modeRepeater.itemAt(modeIndex + 1).forceActiveFocus()
-                                }
-                            }
-                        }
-                    }
-                }
-                Label {
-                    Layout.fillWidth: true
-                    text: root.modeDescription(root.mode)
-                    color: Kirigami.Theme.disabledTextColor
-                    font: Kirigami.Theme.smallFont
-                }
+                width: heroArea.width
+                height: implicitHeight
+                backend: root.backend
+                statusText: root.statusText()
+                mode: root.mode
+                modeDescription: root.modeDescription(root.mode)
+                zonesByEdge: root.zoneColors
+                onMoreRequested: overflowMenu.open()
             }
         }
 
@@ -1069,6 +903,36 @@ Item {
                 ToolTip.text: root.backend.deviceHost
                 ToolTip.visible: hovered && root.backend.deviceConnected
             }
+        }
+    }
+    Menu {
+        id: overflowMenu
+        MenuItem {
+            text: "Device details…"
+            enabled: root.backend.deviceConnected || root.backend.deviceInfoStale || Object.keys(root.backend.deviceInfo).length > 0
+            onTriggered: deviceDialog.open()
+        }
+        MenuItem {
+            text: "Retry settings"
+            visible: root.backend.settingsPending && root.backend.settingsError.length > 0
+            enabled: root.backend.settingsRetryAvailable
+            onTriggered: root.backend.retrySettings()
+        }
+        MenuItem {
+            text: "Start at login"
+            objectName: "start-at-login-switch"
+            checkable: true
+            checked: root.backend.startAtLogin
+            enabled: !root.backend.busy && !root.backend.deviceBusy
+            onTriggered: root.backend.setStartAtLogin(checked)
+        }
+        MenuItem { text: "About capture…"; onTriggered: aboutDialog.open() }
+        MenuItem { text: "Diagnostics and help…"; onTriggered: diagnosticsDialog.open() }
+        MenuSeparator {}
+        MenuItem {
+            text: root.backend.running ? "Stop sync and disconnect…" : "Disconnect…"
+            enabled: true
+            onTriggered: disconnectDialog.open()
         }
     }
 

@@ -10,8 +10,25 @@ CARGO_TARGET_DIR = $(BUILD_DIR)/cargo
 WORKER = $(BUILD_DIR)/wayleaf-4d
 DBUS_SERVICE = $(USER_SHARE)/dbus-1/services/io.github.avitretiak.Wayleaf4D.Control.service
 
-.PHONY: all clean install-user
-all: $(WORKER)
+.PHONY: all clean install-user shaders check-shaders
+all: check-shaders $(WORKER)
+
+SHADER_DIR = $(PLASMA_PACKAGE)/contents/shaders
+SHADER_COMPILER = /usr/lib/qt6/bin/qsb
+
+check-shaders:
+	@for pair in "$(SHADER_DIR)/glow_ring.vert $(SHADER_DIR)/glow_ring.vert.qsb" "$(SHADER_DIR)/glow_ring.frag $(SHADER_DIR)/glow_ring.frag.qsb"; do \
+		set -- $$pair; \
+		if [ ! -f "$$2" ] || [ "$$1" -nt "$$2" ]; then \
+			echo "Missing or stale shader package: $$2" >&2; \
+			echo "Run 'make shaders' to regenerate it." >&2; \
+			exit 1; \
+		fi; \
+	done
+
+shaders:
+	$(SHADER_COMPILER) --qt6 -o $(SHADER_DIR)/glow_ring.vert.qsb $(SHADER_DIR)/glow_ring.vert
+	$(SHADER_COMPILER) --qt6 -o $(SHADER_DIR)/glow_ring.frag.qsb $(SHADER_DIR)/glow_ring.frag
 
 $(WORKER): Makefile Cargo.toml Cargo.lock $(wildcard src/*.rs)
 	cargo build --release --locked --target-dir $(CARGO_TARGET_DIR)
