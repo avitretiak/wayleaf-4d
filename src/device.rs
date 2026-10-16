@@ -9,7 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const MAX_PANELS: usize = 40;
-const MIN_PANELS: usize = 4;
+const MIN_PANELS: usize = 1;
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const NORMAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const NORMAL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -227,13 +227,12 @@ fn parse_panel_layout(body: &[u8]) -> Result<Vec<PanelPosition>> {
         .and_then(Value::as_u64)
         .and_then(|count| usize::try_from(count).ok())
         .filter(|count| (MIN_PANELS..=MAX_PANELS).contains(count))
-        .ok_or_else(|| AppError::new("Nanoleaf 4D layout must contain 4..40 segments"))?;
+        .ok_or_else(|| AppError::new("Nanoleaf 4D layout must contain 1..40 segments"))?;
     let positions = object
         .get("positionData")
         .and_then(Value::as_array)
         .filter(|positions| positions.len() == count)
-        .ok_or_else(|| AppError::new("Nanoleaf 4D layout must contain 4..40 segments"))?;
-
+        .ok_or_else(|| AppError::new("Nanoleaf 4D layout must contain 1..40 segments"))?;
     let mut seen = HashSet::with_capacity(count);
     let mut panels = Vec::with_capacity(count);
     for entry in positions {
@@ -572,7 +571,12 @@ pub fn self_test() -> Result<()> {
     let four = br#"{"numPanels":4,"positionData":[{"panelId":1,"x":-2,"y":3},{"panelId":2,"x":4,"y":5},{"panelId":3,"x":6,"y":7},{"panelId":65535,"x":8,"y":9}]}"#;
     let panels = parse_panel_layout(four)?;
     expect(
-        panels.len() == MIN_PANELS && panels[0].x == -2 && panels[3].id == u16::MAX,
+        panels.len() == 4 && panels[0].x == -2 && panels[3].id == u16::MAX,
+        "device self-test: four-panel layout",
+    )?;
+    let one = parse_panel_layout(br#"{"numPanels":1,"positionData":[{"panelId":65535,"x":-2,"y":3}]}"#)?;
+    expect(
+        one.len() == MIN_PANELS && one[0].id == u16::MAX,
         "device self-test: minimum layout boundary",
     )?;
     let max_layout_body = serde_json::to_vec(&serde_json::json!({
@@ -625,6 +629,7 @@ pub fn self_test() -> Result<()> {
     let zones = [
         Zone {
             id: 0x1234,
+            edge: None,
             x0: 0.0,
             x1: 1.0,
             y0: 0.0,
@@ -632,6 +637,7 @@ pub fn self_test() -> Result<()> {
         },
         Zone {
             id: 0xffff,
+            edge: None,
             x0: 0.0,
             x1: 1.0,
             y0: 0.0,
@@ -639,6 +645,7 @@ pub fn self_test() -> Result<()> {
         },
         Zone {
             id: 3,
+            edge: None,
             x0: 0.0,
             x1: 1.0,
             y0: 0.0,
@@ -646,6 +653,7 @@ pub fn self_test() -> Result<()> {
         },
         Zone {
             id: 4,
+            edge: None,
             x0: 0.0,
             x1: 1.0,
             y0: 0.0,
@@ -695,6 +703,7 @@ pub fn self_test() -> Result<()> {
     let max_zones: Vec<_> = (0..MAX_PANELS)
         .map(|id| Zone {
             id: id as u16,
+            edge: None,
             x0: 0.0,
             x1: 1.0,
             y0: 0.0,
@@ -723,6 +732,7 @@ mod tests {
     fn packet_boundaries_and_invalid_colors() {
         let zone = Zone {
             id: 1,
+            edge: None,
             x0: 0.0,
             x1: 1.0,
             y0: 0.0,
@@ -758,6 +768,7 @@ mod tests {
         let sender = connect_udp("127.0.0.1", address.port()).unwrap();
         let zones: [Zone; 4] = std::array::from_fn(|index| Zone {
             id: 0x1234 + index as u16,
+            edge: None,
             x0: 0.0,
             x1: 1.0,
             y0: 0.0,

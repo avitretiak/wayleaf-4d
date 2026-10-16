@@ -21,9 +21,9 @@ TestCase {
         mode: "4D", static_color: "#ffffff", brightness: 1.5,
         saturation_boost: 1.0, smooth: 0.35, max_step: 12, edge_depth: 8,
         feather_depth: 5, center_bleed: 0, peak_mix: 15, black_threshold: 0.01,
-        fps: 10, letterbox: true, midtone_lift: false, strict_black: false
+        fps: 10, letterbox: true, midtone_lift: false, strict_black: false,
+        start_corner: "bottom_center", reverse_direction: false, perimeter_offset: 0
     })
-
     function normalized(values) {
         const result = Object.assign({}, values)
         for (const key of Object.keys(result)) {
@@ -43,6 +43,7 @@ TestCase {
         property bool deviceBusy: false
         property bool deviceConnected: true
         property bool deviceInfoStale: false
+        property int detectedPanelCount: 32
         property var deviceInfo: ({ name: "Fixture 4D" })
         property string deviceHost: "192.0.2.4"
         property string deviceMessage: ""
@@ -216,6 +217,42 @@ TestCase {
         for (const mode of ["2D", "3D", "4D"]) {
             backendState.setSetting("mode", mode)
             verify(findChild(popup, "fine-tune-controls").visible, mode)
+        }
+    }
+
+    function test_alignment_survives_look_changes_and_group_reset() {
+        const controls = findChild(popup, "alignment-controls")
+        const corner = findChild(popup, "alignment-start-corner")
+        const reverse = findChild(popup, "alignment-reverse-direction")
+        const offset = findChild(popup, "alignment-perimeter-offset")
+        corner.forceActiveFocus()
+        keyClick(Qt.Key_Down)
+        keyClick(Qt.Key_Down)
+        compare(backendState.settings.start_corner, "top_left")
+        reverse.forceActiveFocus()
+        keyClick(Qt.Key_Space)
+        offset.forceActiveFocus()
+        keyClick(Qt.Key_Up)
+        compare(backendState.settings.perimeter_offset, 1)
+        for (const look of ["Subtle", "Balanced", "Vivid", "Custom"]) {
+            popup.choosePreset(look)
+            verify(controls.visible)
+            compare(backendState.settings.start_corner, "top_left")
+            compare(backendState.settings.reverse_direction, true)
+            compare(backendState.settings.perimeter_offset, 1)
+        }
+        const saved = JSON.parse(savedState.customSettings)
+        for (const key of ["start_corner", "reverse_direction", "perimeter_offset"])
+            verify(!Object.prototype.hasOwnProperty.call(saved, key))
+        const brightness = backendState.settings.brightness
+        mouseClick(findChild(popup, "alignment-reset"))
+        compare(backendState.settings.start_corner, "bottom_center")
+        compare(backendState.settings.reverse_direction, false)
+        compare(backendState.settings.perimeter_offset, 0)
+        compare(backendState.settings.brightness, brightness)
+        for (const mode of ["1D", "2D", "3D"]) {
+            backendState.setSetting("mode", mode)
+            verify(!controls.visible)
         }
     }
 }

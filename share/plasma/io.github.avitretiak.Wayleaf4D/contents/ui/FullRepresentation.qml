@@ -26,7 +26,8 @@ Item {
     readonly property var settingDefaults: ({
         saturation_boost: 1.0, smooth: 0.35, max_step: 12, edge_depth: 8,
         feather_depth: 5, center_bleed: 0, peak_mix: 15, black_threshold: 0.01,
-        fps: 10, letterbox: true, midtone_lift: false, strict_black: false
+        fps: 10, letterbox: true, midtone_lift: false, strict_black: false,
+        start_corner: "bottom_center", reverse_direction: false, perimeter_offset: 0
     })
     readonly property var swatches: [
         { name: "Warm white", color: "#ffc58f" },
@@ -211,6 +212,8 @@ Item {
     function settingModified(key) {
         const current = backend.settings[key]
         const original = settingDefaults[key]
+        if (typeof original === "string")
+            return String(current) !== original
         return typeof original === "boolean" ? Boolean(current) !== original : Math.abs(Number(current) - original) > 0.000001
     }
 
@@ -490,6 +493,67 @@ Item {
                                     }
                                 }
                             }
+                        }
+                    }
+                }
+
+                ColumnLayout {
+                    objectName: "alignment-controls"
+                    Layout.fillWidth: true
+                    visible: root.mode === "4D"
+                    enabled: !root.backend.busy && !root.backend.deviceBusy
+                    spacing: Kirigami.Units.smallSpacing
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Label { text: "Strip alignment"; font.bold: true; Layout.fillWidth: true }
+                        ToolButton {
+                            objectName: "alignment-reset"
+                            text: "Reset"
+                            enabled: root.groupModified(["start_corner", "reverse_direction", "perimeter_offset"])
+                            onClicked: {
+                                root.backend.setSetting("start_corner", "bottom_center")
+                                root.backend.setSetting("reverse_direction", false)
+                                root.backend.setSetting("perimeter_offset", 0)
+                            }
+                            Accessible.name: "Reset strip alignment"
+                        }
+                    }
+                    Label {
+                        text: root.backend.detectedPanelCount > 0
+                            ? "Detected panels: " + root.backend.detectedPanelCount
+                            : "Detected panels: unavailable"
+                        Accessible.name: text
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Label { text: "Start corner"; Layout.fillWidth: true }
+                        ComboBox {
+                            objectName: "alignment-start-corner"
+                            model: ["Bottom center", "Bottom left", "Top left", "Top right", "Bottom right"]
+                            currentIndex: ["bottom_center", "bottom_left", "top_left", "top_right", "bottom_right"].indexOf(root.backend.settings.start_corner)
+                            onActivated: root.backend.setSetting("start_corner",
+                                ["bottom_center", "bottom_left", "top_left", "top_right", "bottom_right"][currentIndex])
+                            Accessible.name: "4D panel start corner"
+                        }
+                    }
+                    CheckBox {
+                        objectName: "alignment-reverse-direction"
+                        text: "Reverse panel direction"
+                        checked: Boolean(root.backend.settings.reverse_direction)
+                        onToggled: root.backend.setSetting("reverse_direction", checked)
+                        Accessible.name: "Reverse 4D panel direction"
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Label { text: "Perimeter offset"; Layout.fillWidth: true }
+                        SpinBox {
+                            objectName: "alignment-perimeter-offset"
+                            from: -39
+                            to: 39
+                            value: Math.max(-39, Math.min(39, Number(root.backend.settings.perimeter_offset) || 0))
+                            editable: true
+                            onValueModified: root.backend.setSetting("perimeter_offset", value)
+                            Accessible.name: "4D perimeter offset"
                         }
                     }
                 }

@@ -30,6 +30,8 @@ impl Default for Rect {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Zone {
     pub id: u16,
+    /// Physical edge for live panel zones; `None` for synthetic/coarse zones.
+    pub edge: Option<&'static str>,
     pub x0: f32,
     pub x1: f32,
     pub y0: f32,
@@ -45,251 +47,220 @@ pub struct PanelPosition {
 
 pub fn make_zones(panels: &[PanelPosition], cfg: &Config) -> Result<Vec<Zone>> {
     let n = panels.len();
-    if !(4..=40).contains(&n) {
+    if !(1..=40).contains(&n) {
         return Err(AppError::new("unsupported Nanoleaf segment count"));
     }
     if !(5..=20).contains(&cfg.edge_depth) {
         return Err(AppError::new("edge depth must be in 5..20 percent"));
     }
-
     let border = cfg.edge_depth as f32 / 100.0;
-    let corner = border * 1.5;
-    let mut zones = vec![
-        Zone {
-            id: 0,
-            x0: 0.0,
-            x1: 0.0,
-            y0: 0.0,
-            y1: 0.0
-        };
-        n
+    let min_x = panels.iter().map(|p| p.x).min().unwrap();
+    let max_x = panels.iter().map(|p| p.x).max().unwrap();
+    let min_y = panels.iter().map(|p| p.y).min().unwrap();
+    let max_y = panels.iter().map(|p| p.y).max().unwrap();
+    let dx = ((max_x as i128 - min_x as i128).max(1)) as f64;
+    let dy = ((max_y as i128 - min_y as i128).max(1)) as f64;
+
+    // Retain the calibrated rectangles only for the exact ordered NL69 layout.
+    const REFERENCE: [(i64, i64); 40] = [
+        (350,0),(300,0),(250,0),(200,0),(150,0),(100,0),(50,0),(0,0),
+        (0,50),(0,100),(0,150),(0,200),(0,250),(0,300),(0,350),(0,400),
+        (50,400),(100,400),(150,400),(200,400),(250,400),(300,400),(350,400),
+        (400,400),(450,400),(500,400),(550,400),(600,400),(650,400),
+        (650,350),(650,300),(650,250),(650,200),(650,150),(650,100),(650,50),
+        (600,50),(550,50),(500,50),(450,50),
     ];
-    if n == 40 {
+    let calibrated = n == 40 && panels.iter().zip(REFERENCE).all(|(p, xy)| (p.x,p.y) == xy);
+    let mut zones = Vec::with_capacity(n);
+    if calibrated {
+        let corner = border * 1.5;
         for (i, panel) in panels.iter().enumerate() {
-            let (x, y) = if i <= 7 {
-                (350.0 - 50.0 * i as f32, 0.0)
-            } else if i <= 15 {
-                (0.0, 50.0 * (i - 7) as f32)
-            } else if i <= 28 {
-                (50.0 * (i - 15) as f32, 400.0)
-            } else if i <= 35 {
-                (650.0, 400.0 - 50.0 * (i - 28) as f32)
-            } else {
-                (600.0 - 50.0 * (i - 36) as f32, 50.0)
-            };
-            let (x0, x1, y0, y1) = if i == 7 {
-                (0.0, corner, 1.0 - corner, 1.0)
+            let (x,y) = (panel.x as f32, panel.y as f32);
+            let edge = if i == 7 { "bottom" } else if i == 15 { "left" }
+                else if i == 28 { "top" } else if i == 35 { "right" }
+                else if x == 0.0 { "left" } else if y >= 390.0 { "top" }
+                else if x >= 640.0 { "right" } else { "bottom" };
+            let (x0,x1,y0,y1) = if i == 7 {
+                (0.0,corner,1.0-corner,1.0)
             } else if i == 15 {
-                (0.0, corner, 0.0, corner)
+                (0.0,corner,0.0,corner)
             } else if i == 28 {
-                (1.0 - corner, 1.0, 0.0, corner)
+                (1.0-corner,1.0,0.0,corner)
             } else if i == 35 {
-                (1.0 - corner, 1.0, 1.0 - corner, 1.0)
+                (1.0-corner,1.0,1.0-corner,1.0)
             } else if x == 0.0 {
-                let cy = 1.0 - y / 400.0;
-                let span = (50.0 / 400.0) * 0.7;
-                (0.0, border, (cy - span).max(0.0), (cy + span).min(1.0))
+                let cy = 1.0-y/400.0;
+                let span = (50.0/400.0)*0.7;
+                (0.0,border,(cy-span).max(0.0),(cy+span).min(1.0))
             } else if y >= 390.0 {
-                let cx = x / 650.0;
-                let span = (50.0 / 650.0) * 0.7;
-                ((cx - span).max(0.0), (cx + span).min(1.0), 0.0, border)
+                let cx = x/650.0;
+                let span = (50.0/650.0)*0.7;
+                ((cx-span).max(0.0),(cx+span).min(1.0),0.0,border)
             } else if x >= 640.0 {
-                let cy = 1.0 - y / 400.0;
-                let span = (50.0 / 400.0) * 0.7;
-                (
-                    1.0 - border,
-                    1.0,
-                    (cy - span).max(0.0),
-                    (cy + span).min(1.0),
-                )
+                let cy = 1.0-y/400.0;
+                let span = (50.0/400.0)*0.7;
+                (1.0-border,1.0,(cy-span).max(0.0),(cy+span).min(1.0))
             } else {
-                let cx = x / 650.0;
-                let span = (50.0 / 650.0) * 0.7;
-                (
-                    (cx - span).max(0.0),
-                    (cx + span).min(1.0),
-                    1.0 - border,
-                    1.0,
-                )
+                let cx = x/650.0;
+                let span = (50.0/650.0)*0.7;
+                ((cx-span).max(0.0),(cx+span).min(1.0),1.0-border,1.0)
             };
-            zones[i] = Zone {
-                id: panel.id,
-                x0,
-                x1,
-                y0,
-                y1,
-            };
-        }
-    } else if n == 34 {
-        let min_x = panels.iter().map(|p| p.x).min().unwrap();
-        let max_x = panels.iter().map(|p| p.x).max().unwrap();
-        let min_y = panels.iter().map(|p| p.y).min().unwrap();
-        let max_y = panels.iter().map(|p| p.y).max().unwrap();
-        if min_x == max_x || min_y == max_y {
-            return Err(AppError::new("34-segment layout has no coordinate extent"));
-        }
-        let tangent = |i: usize, vertical: bool| -> f32 {
-            if vertical {
-                1.0 - ((panels[i].y as i128 - min_y as i128) as f32)
-                    / ((max_y as i128 - min_y as i128) as f32)
-            } else {
-                ((panels[i].x as i128 - min_x as i128) as f32)
-                    / ((max_x as i128 - min_x as i128) as f32)
-            }
-        };
-        let interval = |first: usize, end: usize, i: usize, vertical: bool, edge: (f32, f32)| {
-            let center = tangent(i, vertical);
-            let a = if i == first {
-                center + (center - tangent(i + 1, vertical)) * 0.5
-            } else {
-                (tangent(i - 1, vertical) + center) * 0.5
-            };
-            let b = if i + 1 == end {
-                center + (center - tangent(i - 1, vertical)) * 0.5
-            } else {
-                (center + tangent(i + 1, vertical)) * 0.5
-            };
-            let first_center = tangent(first, vertical);
-            let last_center = tangent(end - 1, vertical);
-            let outer_a = first_center + (first_center - tangent(first + 1, vertical)) * 0.5;
-            let outer_b = last_center + (last_center - tangent(end - 2, vertical)) * 0.5;
-            let lower = outer_a.min(outer_b);
-            let upper = outer_a.max(outer_b);
-            let fit = |value: f32| {
-                (edge.0 + (value - lower) / (upper - lower) * (edge.1 - edge.0))
-                    .clamp(edge.0, edge.1)
-            };
-            let (a, b) = (fit(a), fit(b));
-            (a.min(b), a.max(b))
-        };
-        for i in 0..6 {
-            let (x0, x1) = interval(0, 6, i, false, (0.0, 0.5));
-            zones[i] = Zone {
-                id: panels[i].id,
-                x0,
-                x1,
-                y0: 1.0 - border,
-                y1: 1.0,
-            };
-        }
-        for i in 6..12 {
-            let (y0, y1) = interval(6, 12, i, true, (0.0, 1.0));
-            zones[i] = Zone {
-                id: panels[i].id,
-                x0: 0.0,
-                x1: border,
-                y0,
-                y1,
-            };
-        }
-        for i in 12..21 {
-            let (x0, x1) = interval(12, 21, i, false, (0.0, 1.0));
-            zones[i] = Zone {
-                id: panels[i].id,
-                x0,
-                x1,
-                y0: 0.0,
-                y1: border,
-            };
-        }
-        for i in 21..27 {
-            let (y0, y1) = interval(21, 27, i, true, (0.0, 1.0));
-            zones[i] = Zone {
-                id: panels[i].id,
-                x0: 1.0 - border,
-                x1: 1.0,
-                y0,
-                y1,
-            };
-        }
-        for i in 27..34 {
-            let (x0, x1) = interval(27, 34, i, false, (0.5, 1.0));
-            zones[i] = Zone {
-                id: panels[i].id,
-                x0,
-                x1,
-                y0: 1.0 - border,
-                y1: 1.0,
-            };
+            zones.push(Zone { id: panel.id, edge: Some(edge), x0,x1,y0,y1 });
         }
     } else {
-        let left = ((9.0 / 50.0 * n as f64).round() as i32).max(1);
-        let top = ((16.0 / 50.0 * n as f64).round() as i32).max(1);
-        let right = ((9.0 / 50.0 * n as f64).round() as i32).max(1);
-        let bottom = (n as i32 - left - top - right).max(1);
-        let mut index = 0usize;
-        let bottom_left = bottom / 2;
-        for i in 0..bottom_left {
-            let a = 0.5 - i as f32 * 0.5 / bottom_left as f32;
-            let b = 0.5 - (i + 1) as f32 * 0.5 / bottom_left as f32;
-            zones[index] = Zone {
-                id: panels[index].id,
-                x0: a.min(b),
-                x1: a.max(b),
-                y0: 1.0 - border,
-                y1: 1.0,
-            };
-            index += 1;
+        // Incoming route segments assign corners to the side just traversed.
+        // Independent runs on a side are fitted into contiguous spans weighted
+        // by extrapolated live-coordinate extents, not nominal panel counts.
+        let edge_for = |p: &PanelPosition, sx: i128, sy: i128| -> usize {
+            let dx_step=sx.unsigned_abs();
+            let dy_step=sy.unsigned_abs();
+            let vertical = if (dx_step == 0 && dy_step == 0) || dx_step == dy_step {
+                let distances = [
+                    (p.y as i128-min_y as i128).unsigned_abs(),
+                    (p.x as i128-min_x as i128).unsigned_abs(),
+                    (max_y as i128-p.y as i128).unsigned_abs(),
+                    (max_x as i128-p.x as i128).unsigned_abs(),
+                ];
+                return (0..4).min_by_key(|&j| distances[j]).unwrap();
+            } else { dx_step < dy_step };
+            if vertical {
+                if p.x as i128-min_x as i128 <= max_x as i128-p.x as i128 { 1 } else { 3 }
+            } else if p.y as i128-min_y as i128 <= max_y as i128-p.y as i128 { 0 } else { 2 }
+        };
+        let mut sides=[0usize;40];
+        for i in 0..n {
+            let p=&panels[i];
+            let prev = &panels[i.saturating_sub(1)];
+            let mut sx = p.x as i128 - prev.x as i128;
+            let mut sy = p.y as i128 - prev.y as i128;
+            // A strip is open: the first panel has no incoming segment.
+            // Use its outgoing step, never a fabricated last-to-first link.
+            if sx == 0 && sy == 0 && i + 1 < n {
+                let next = &panels[i + 1];
+                sx = next.x as i128 - p.x as i128;
+                sy = next.y as i128 - p.y as i128;
+            }
+            sides[i]=edge_for(p,sx,sy);
         }
-        for i in 0..left {
-            let a = 1.0 - i as f32 / left as f32;
-            let b = 1.0 - (i + 1) as f32 / left as f32;
-            zones[index] = Zone {
-                id: panels[index].id,
-                x0: 0.0,
-                x1: border,
-                y0: a.min(b),
-                y1: a.max(b),
+        let tangent=|i:usize, side:usize| -> f32 {
+            if side==0 || side==2 {
+                ((panels[i].x as i128-min_x as i128) as f64/dx) as f32
+            } else { ((max_y as i128-panels[i].y as i128) as f64/dy) as f32 }
+        };
+        let mut runs=[(0usize,0usize,0usize,0.0f32);40];
+        let mut run_count=0usize;
+        let mut totals=[0.0f32;4];
+        let mut first=0;
+        while first<n {
+            let side=sides[first];
+            let mut end=first+1;
+            while end<n && sides[end]==side { end+=1; }
+            let weight=if end-first==1 { 1.0 } else {
+                let a=tangent(first,side);
+                let b=tangent(first+1,side);
+                let z=tangent(end-1,side);
+                let y=tangent(end-2,side);
+                let start_outer=a+(a-b)*0.5;
+                let end_outer=z+(z-y)*0.5;
+                let extent=(end_outer-start_outer).abs();
+                if extent <= f32::EPSILON { 1.0 } else { extent }
             };
-            index += 1;
+            runs[run_count]=(side,first,end,weight);
+            run_count+=1;
+            totals[side]+=weight;
+            first=end;
         }
-        for i in 0..top {
-            let a = i as f32 / top as f32;
-            let b = (i + 1) as f32 / top as f32;
-            zones[index] = Zone {
-                id: panels[index].id,
-                x0: a,
-                x1: b,
-                y0: 0.0,
-                y1: border,
+        let mut intervals=[(0.0f32,1.0f32);40];
+        let mut cursors=[0.0f32;4];
+        for run_index in 0..run_count {
+            let (side,first,end,weight)=runs[run_index];
+            let start=cursors[side];
+            let finish=if totals[side]>0.0 { start+weight/totals[side] } else { 1.0 };
+            let c0=tangent(first,side);
+            let c1=tangent((first+1).min(end-1),side);
+            let cl=tangent(end-1,side);
+            let cp=tangent(if end-first>1 {end-2} else {first},side);
+            let outer_start=if end-first>1 { c0+(c0-c1)*0.5 } else { c0-0.5 };
+            let outer_end=if end-first>1 { cl+(cl-cp)*0.5 } else { cl+0.5 };
+            if (outer_end-outer_start).abs() <= f32::EPSILON {
+                let count=(end-first) as f32;
+                for i in first..end {
+                    let lo=start+(i-first) as f32/count*(finish-start);
+                    let hi=start+(i-first+1) as f32/count*(finish-start);
+                    intervals[i]=(lo,hi);
+                }
+                cursors[side]=finish;
+                continue;
+            }
+            let outer_low=outer_start.min(outer_end);
+            let outer_high=outer_start.max(outer_end);
+            let map=|i:usize| {
+                start+(tangent(i,side)-outer_low)/(outer_high-outer_low).max(f32::EPSILON)*(finish-start)
             };
-            index += 1;
+            for i in first..end {
+                let center=map(i);
+                let before=if i>first {
+                    (map(i-1)+center)*0.5
+                } else if first+1<end {
+                    center+(center-map(first+1))*0.5
+                } else { start };
+                let after=if i+1<end {
+                    (center+map(i+1))*0.5
+                } else if end-first>1 {
+                    center+(center-map(end-2))*0.5
+                } else { finish };
+                intervals[i]=(before.min(after).clamp(start,finish),before.max(after).clamp(start,finish));
+            }
+            cursors[side]=finish;
         }
-        for i in 0..right {
-            let a = i as f32 / right as f32;
-            let b = (i + 1) as f32 / right as f32;
-            zones[index] = Zone {
-                id: panels[index].id,
-                x0: 1.0 - border,
-                x1: 1.0,
-                y0: a,
-                y1: b,
+        for i in 0..n {
+            let (a,b)=intervals[i];
+            let (x0,x1,y0,y1)=match sides[i] {
+                0 => (a,b,1.0-border,1.0),
+                1 => (0.0,border,a,b),
+                2 => (a,b,0.0,border),
+                _ => (1.0-border,1.0,a,b),
             };
-            index += 1;
-        }
-        let bottom_right = bottom - bottom_left;
-        for i in 0..bottom_right {
-            let a = 1.0 - i as f32 * 0.5 / bottom_right as f32;
-            let b = 1.0 - (i + 1) as f32 * 0.5 / bottom_right as f32;
-            zones[index] = Zone {
-                id: panels[index].id,
-                x0: a.min(b),
-                x1: a.max(b),
-                y0: 1.0 - border,
-                y1: 1.0,
-            };
-            index += 1;
+            zones.push(Zone { id:panels[i].id, edge:Some(["bottom","left","top","right"][sides[i]]), x0,x1,y0,y1 });
         }
     }
 
+    // Alignment permutes references only; physical sampling rectangles never move.
+    let corner_anchor = |left: bool, bottom: bool| {
+        panels.iter().enumerate()
+            .filter(|(_, p)| if left { p.x == min_x } else { p.x == max_x })
+            .min_by_key(|(_, p)| if bottom { p.y.abs_diff(min_y) } else { p.y.abs_diff(max_y) })
+            .map(|(i, _)| i)
+            .unwrap_or(0)
+    };
+    let start = match cfg.start_corner.as_str() {
+        "bottom_center" => 0,
+        "bottom_left" if calibrated => 7,
+        "bottom_left" => corner_anchor(true, true),
+        "top_left" if calibrated => 15,
+        "top_left" => corner_anchor(true, false),
+        "top_right" if calibrated => 28,
+        "top_right" => corner_anchor(false, false),
+        "bottom_right" if calibrated => 35,
+        "bottom_right" => corner_anchor(false, true),
+        _ => return Err(AppError::new("invalid start corner")),
+    };
+    let offset = cfg.perimeter_offset.rem_euclid(n as i32) as usize;
+    let direction: isize = if cfg.reverse_direction { -1 } else { 1 };
+    for (i, zone) in zones.iter_mut().enumerate() {
+        let source = (start as isize + offset as isize + direction*i as isize).rem_euclid(n as isize) as usize;
+        zone.id = panels[source].id;
+    }
     Ok(zones)
 }
+
 pub fn zones_for_mode(mode: &str, physical: &[Zone], edge_depth: i32) -> Result<Vec<Zone>> {
     let border = edge_depth as f32 / 100.0;
     match mode {
         "1D" => Ok(Vec::new()),
         "2D" => Ok(vec![Zone {
             id: 0,
+            edge: None,
             x0: 0.0,
             x1: 1.0,
             y0: 0.0,
@@ -300,6 +271,7 @@ pub fn zones_for_mode(mode: &str, physical: &[Zone], edge_depth: i32) -> Result<
             for i in 0..3 {
                 zones.push(Zone {
                     id: zones.len() as u16,
+                    edge: Some("top"),
                     x0: i as f32 / 3.0,
                     x1: (i + 1) as f32 / 3.0,
                     y0: 0.0,
@@ -309,6 +281,7 @@ pub fn zones_for_mode(mode: &str, physical: &[Zone], edge_depth: i32) -> Result<
             for i in 0..2 {
                 zones.push(Zone {
                     id: zones.len() as u16,
+                    edge: Some("right"),
                     x0: 1.0 - border,
                     x1: 1.0,
                     y0: i as f32 / 2.0,
@@ -318,6 +291,7 @@ pub fn zones_for_mode(mode: &str, physical: &[Zone], edge_depth: i32) -> Result<
             for i in 0..3 {
                 zones.push(Zone {
                     id: zones.len() as u16,
+                    edge: Some("bottom"),
                     x0: i as f32 / 3.0,
                     x1: (i + 1) as f32 / 3.0,
                     y0: 1.0 - border,
@@ -327,6 +301,7 @@ pub fn zones_for_mode(mode: &str, physical: &[Zone], edge_depth: i32) -> Result<
             for i in 0..2 {
                 zones.push(Zone {
                     id: zones.len() as u16,
+                    edge: Some("left"),
                     x0: 0.0,
                     x1: border,
                     y0: i as f32 / 2.0,
@@ -960,13 +935,16 @@ pub fn self_test() -> Result<()> {
         feather_depth: 0,
         ..Config::default()
     };
-    let panels: Vec<_> = (0..40)
-        .map(|i| PanelPosition {
-            id: i + 100,
-            x: 0,
-            y: 0,
-        })
-        .collect();
+    let reference = [
+        (350,0),(300,0),(250,0),(200,0),(150,0),(100,0),(50,0),(0,0),
+        (0,50),(0,100),(0,150),(0,200),(0,250),(0,300),(0,350),(0,400),
+        (50,400),(100,400),(150,400),(200,400),(250,400),(300,400),(350,400),
+        (400,400),(450,400),(500,400),(550,400),(600,400),(650,400),
+        (650,350),(650,300),(650,250),(650,200),(650,150),(650,100),(650,50),
+        (600,50),(550,50),(500,50),(450,50),
+    ];
+    let panels: Vec<_> = reference.into_iter().enumerate()
+        .map(|(i,(x,y))| PanelPosition { id: i as u16 + 100, x, y }).collect();
     let zones = make_zones(&panels, &cfg)?;
     if zones.len() != 40
         || zones
@@ -994,33 +972,14 @@ pub fn self_test() -> Result<()> {
         })
         .collect();
     let zones34 = make_zones(&panels34, &cfg)?;
-    let mut bottom_zones = zones34[..6]
-        .iter()
-        .chain(&zones34[27..])
-        .collect::<Vec<_>>();
-    bottom_zones.sort_by(|a, b| a.x0.total_cmp(&b.x0));
-    let bottom_covers_edge = bottom_zones.len() == 13
-        && bottom_zones[0].x0.abs() < 0.001
-        && (bottom_zones[12].x1 - 1.0).abs() < 0.001
-        && bottom_zones
-            .windows(2)
-            .all(|pair| (pair[0].x1 - pair[1].x0).abs() < 0.001);
-    if zones34.len() != 34
-        || zones34
-            .iter()
-            .zip(&panels34)
-            .any(|(zone, panel)| zone.id != panel.id)
-        || !bottom_covers_edge
-        || zones34[6..12]
-            .iter()
-            .any(|zone| ((zone.y1 - zone.y0) - 1.0 / 6.0).abs() > 0.001)
-        || zones34[12..21]
-            .iter()
-            .any(|zone| ((zone.x1 - zone.x0) - 1.0 / 9.0).abs() > 0.001)
-        || zones34[21..27]
-            .iter()
-            .any(|zone| ((zone.y1 - zone.y0) - 1.0 / 6.0).abs() > 0.001)
-    {
+    let valid_live_geometry = zones34.len() == panels34.len()
+        && zones34.iter().zip(&panels34).all(|(zone,panel)| {
+            zone.id == panel.id
+                && zone.edge.is_some()
+                && zone.x0 >= 0.0 && zone.x0 < zone.x1 && zone.x1 <= 1.0
+                && zone.y0 >= 0.0 && zone.y0 < zone.y1 && zone.y1 <= 1.0
+        });
+    if !valid_live_geometry {
         return Err(AppError::new("sampler 34-panel geometry self-test failed"));
     }
     let edge_zones = zones_for_mode("3D", &[], cfg.edge_depth)?;
@@ -1066,6 +1025,7 @@ pub fn self_test() -> Result<()> {
     let mapped_panels = [
         Zone {
             id: 211,
+            edge: None,
             x0: 0.0,
             x1: 0.1,
             y0: 0.0,
@@ -1073,6 +1033,7 @@ pub fn self_test() -> Result<()> {
         },
         Zone {
             id: 34,
+            edge: None,
             x0: 0.9,
             x1: 1.0,
             y0: 0.0,
@@ -1080,6 +1041,7 @@ pub fn self_test() -> Result<()> {
         },
         Zone {
             id: 12,
+            edge: None,
             x0: 0.92,
             x1: 1.0,
             y0: 0.72,
@@ -1087,6 +1049,7 @@ pub fn self_test() -> Result<()> {
         },
         Zone {
             id: 3,
+            edge: None,
             x0: 0.0,
             x1: 0.08,
             y0: 0.72,
@@ -1234,6 +1197,7 @@ pub fn self_test() -> Result<()> {
     }
     let zone = Zone {
         id: 900,
+        edge: None,
         x0: 0.0,
         x1: 0.5,
         y0: 0.0,
@@ -1252,6 +1216,7 @@ pub fn self_test() -> Result<()> {
     }
     let edge_zone = Zone {
         id: 901,
+        edge: None,
         x0: 0.0,
         x1: 0.15,
         y0: 0.4,
@@ -1297,6 +1262,7 @@ pub fn self_test() -> Result<()> {
     let large_stride = large_w * 4;
     let corner = Zone {
         id: 902,
+        edge: None,
         x0: 0.0,
         x1: 0.15,
         y0: 0.0,
@@ -1329,6 +1295,7 @@ pub fn self_test() -> Result<()> {
     peak_frame[..3].copy_from_slice(&[255, 0, 0]);
     let mut peak_sampler = Sampler::new(vec![Zone {
         id: 903,
+        edge: None,
         x0: 0.0,
         x1: 1.0,
         y0: 0.0,
@@ -1427,6 +1394,7 @@ pub fn self_test() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     fn solid_frame(w: usize, h: usize, color: [u8; 3]) -> Vec<u8> {
         let mut data = vec![0; w * h * 4];
@@ -1437,63 +1405,210 @@ mod tests {
         data
     }
 
+    fn reference40() -> Vec<PanelPosition> {
+        let xy = [
+            (350,0),(300,0),(250,0),(200,0),(150,0),(100,0),(50,0),(0,0),
+            (0,50),(0,100),(0,150),(0,200),(0,250),(0,300),(0,350),(0,400),
+            (50,400),(100,400),(150,400),(200,400),(250,400),(300,400),(350,400),
+            (400,400),(450,400),(500,400),(550,400),(600,400),(650,400),
+            (650,350),(650,300),(650,250),(650,200),(650,150),(650,100),(650,50),
+            (600,50),(550,50),(500,50),(450,50),
+        ];
+        xy.into_iter().enumerate().map(|(i,(x,y))| PanelPosition {
+            id: i as u16 + 100, x, y,
+        }).collect()
+    }
+
+    fn route_fixture(bottom_left: usize, left: usize, top: usize, right: usize, bottom_right: usize) -> Vec<PanelPosition> {
+        let mut xy = Vec::new();
+        // Four explicit corners, then evenly spaced side centers. Route begins
+        // on the lower-left bottom run and finishes on lower-right bottom run.
+        for i in 0..bottom_left {
+            xy.push((450 - (i as i64 + 1) * 450 / (bottom_left as i64 + 1), 0));
+        }
+        xy.push((0,0));
+        for i in 0..left { xy.push((0, (i as i64 + 1) * 400 / (left as i64 + 1))); }
+        xy.push((0,400));
+        for i in 0..top { xy.push(((i as i64 + 1) * 650 / (top as i64 + 1),400)); }
+        xy.push((650,400));
+        for i in 0..right { xy.push((650,400 - (i as i64 + 1) * 400 / (right as i64 + 1))); }
+        xy.push((650,0));
+        for i in 0..bottom_right { xy.push((650 - (i as i64 + 1) * 200 / (bottom_right as i64 + 1),0)); }
+        xy.into_iter().enumerate().map(|(i,(x,y))| PanelPosition {
+            id: (1000 + i * 3) as u16, x, y,
+        }).collect()
+    }
+
     #[test]
-    fn calibrated_and_34_panel_mapping_keep_actual_ids() {
+    fn mapping_uses_live_geometry_preserves_ids_and_alignment_only_permutates_ids() {
+        let ref_panels = reference40();
         let cfg = Config::default();
-        let panels40: Vec<_> = (0..40)
-            .map(|i| PanelPosition {
-                id: i as u16 + 100,
-                x: 0,
-                y: 0,
-            })
-            .collect();
-        let zones40 = make_zones(&panels40, &cfg).unwrap();
-        assert_eq!(zones40[0].id, 100);
-        assert!((zones40[0].y0 - 0.92).abs() < 0.001);
-        let panels34: Vec<_> = (0..34)
-            .map(|i| {
-                let (x, y) = if i < 7 {
-                    (300 - 50 * i as i64, 50)
-                } else if i < 12 {
-                    (0, 50 + 50 * (i as i64 - 6))
-                } else if i < 21 {
-                    (50 * (i as i64 - 11), 300)
-                } else if i < 27 {
-                    (450, 300 - 50 * (i as i64 - 20))
-                } else {
-                    (450 - 50 * (i as i64 - 26), 0)
-                };
-                PanelPosition { id: i as u16, x, y }
-            })
-            .collect();
-        let zones34 = make_zones(&panels34, &cfg).unwrap();
-        let mut bottom_zones = zones34[..6]
-            .iter()
-            .chain(&zones34[27..])
-            .collect::<Vec<_>>();
-        bottom_zones.sort_by(|a, b| a.x0.total_cmp(&b.x0));
-        assert_eq!(bottom_zones.len(), 13);
-        assert!(bottom_zones[0].x0.abs() < 0.001);
-        assert!((bottom_zones[12].x1 - 1.0).abs() < 0.001);
-        assert!(bottom_zones
-            .windows(2)
-            .all(|pair| (pair[0].x1 - pair[1].x0).abs() < 0.001));
-        assert_eq!(zones34[0].id, 0);
-        assert_eq!(zones34[33].id, 33);
-        assert!(zones34
-            .iter()
-            .zip(&panels34)
-            .all(|(zone, panel)| zone.id == panel.id));
-        assert!(zones34[6..12]
-            .iter()
-            .all(|zone| ((zone.y1 - zone.y0) - 1.0 / 6.0).abs() < 0.001));
-        assert!(zones34[12..21]
-            .iter()
-            .all(|zone| ((zone.x1 - zone.x0) - 1.0 / 9.0).abs() < 0.001));
-        assert!(zones34[21..27]
-            .iter()
-            .all(|zone| ((zone.y1 - zone.y0) - 1.0 / 6.0).abs() < 0.001));
-        assert!(zones34[21].x0 > 0.8 && zones34[27].y0 > 0.8);
+        let reference_zones = make_zones(&ref_panels, &cfg).unwrap();
+        assert_eq!(reference_zones[0].id, ref_panels[0].id);
+        assert!((reference_zones[0].y0 - 0.92).abs() < 0.001);
+        let panels32: Vec<_> = [
+            (450,0),(400,0),(350,0),(300,0),(250,0),(200,0),(150,0),(100,0),(50,0),(0,0),
+            (0,50),(0,100),(0,150),(0,200),(0,250),
+            (50,250),(100,250),(150,250),(200,250),(250,250),(300,250),(350,250),(400,250),(450,250),(500,250),
+            (500,200),(500,150),(500,100),(500,50),(500,0),(450,0),(400,0),
+        ].into_iter().enumerate().map(|(i,(x,y))| PanelPosition { id:i as u16,x,y }).collect();
+        let zones32 = make_zones(&panels32, &cfg).unwrap();
+        let expected_edges: Vec<_> = (0..32).map(|i| match i {
+            0..=9 | 30..=31 => "bottom",
+            10..=14 => "left",
+            15..=24 => "top",
+            _ => "right",
+        }).collect();
+        assert!(zones32.iter().zip(expected_edges.iter()).all(|(zone,expected)| zone.edge==Some(*expected)));
+        let edge_counts=zones32.iter().fold([0usize;4],|mut counts,zone| {
+            counts[match zone.edge.unwrap() {
+                "bottom"=>0,"left"=>1,"top"=>2,_=>3,
+            }]+=1;
+            counts
+        });
+        assert_eq!(edge_counts,[12,5,10,5]);
+        let mut bottom=zones32.iter().filter(|zone| zone.edge==Some("bottom")).collect::<Vec<_>>();
+        bottom.sort_by(|a,b| a.x0.total_cmp(&b.x0));
+        assert_eq!(bottom.len(),12);
+        assert!(bottom.windows(2).all(|pair| (pair[0].x1-pair[1].x0).abs()<0.001));
+        assert!((bottom[0].x0).abs()<0.001 && (bottom[11].x1-1.0).abs()<0.001);
+        let deep_cfg=Config { edge_depth:20, ..cfg.clone() };
+        let deep=make_zones(&panels32,&deep_cfg).unwrap();
+        assert!(deep.iter().zip(expected_edges.iter()).all(|(zone,edge)| zone.edge==Some(*edge)));
+        let panels34:Vec<_>=(0..34).map(|i| {
+            let (x,y)=if i<7 { (300-50*i as i64,50) }
+            else if i<12 { (0,50+50*(i as i64-6)) }
+            else if i<21 { (50*(i as i64-11),300) }
+            else if i<27 { (450,300-50*(i as i64-20)) }
+            else { (450-50*(i as i64-26),0) };
+            PanelPosition { id:(200+i*5) as u16,x,y }
+        }).collect();
+        let zones34=make_zones(&panels34,&cfg).unwrap();
+        let edges34:Vec<_>=(0..34).map(|i| match i {
+            0..=6 | 27..=33 => "bottom",
+            7..=11 => "left",
+            12..=20 => "top",
+            _ => "right",
+        }).collect();
+        assert!(zones34.iter().zip(edges34).all(|(zone,edge)| zone.edge==Some(edge)));
+        for (n, fixture) in [
+            (32, panels32),
+            (34, panels34),
+            (40, ref_panels.clone()),
+        ] {
+            assert_eq!(fixture.len(), n);
+            let zones = make_zones(&fixture, &cfg).unwrap();
+            assert_eq!(zones.len(), n);
+            assert!(zones.iter().zip(&fixture).all(|(z,p)| z.id == p.id));
+            assert!(zones.iter().all(|z| 0.0 <= z.x0 && z.x0 < z.x1 && z.x1 <= 1.0
+                && 0.0 <= z.y0 && z.y0 < z.y1 && z.y1 <= 1.0));
+            assert!(zones.iter().all(|z| z.edge.is_some()));
+        }
+        let generic40 = route_fixture(12,7,11,6,0);
+        let live = make_zones(&generic40, &cfg).unwrap();
+        assert_eq!(live.len(), 40);
+        assert_ne!((live[0].x0,live[0].x1,live[0].y0,live[0].y1),
+            (reference_zones[0].x0,reference_zones[0].x1,reference_zones[0].y0,reference_zones[0].y1));
+    }
+
+    #[test]
+    fn all_supported_counts_have_valid_geometry_and_alignment_permutation() {
+        for n in 1..=40 {
+            let panels: Vec<_> = (0..n).map(|i| PanelPosition {
+                id: (500 + i * 7) as u16,
+                x: i as i64 * 3,
+                y: i as i64 * 5,
+            }).collect();
+            let base = make_zones(&panels, &Config::default()).unwrap();
+            for corner in ["bottom_center","bottom_left","top_left","top_right","bottom_right"] {
+                for reverse in [false,true] {
+                    for offset in [-39,-1,0,1,39] {
+                        let cfg = Config { start_corner: corner.into(), reverse_direction: reverse,
+                            perimeter_offset: offset, ..Config::default() };
+                        let zones = make_zones(&panels, &cfg).unwrap();
+                        let ids: HashSet<_> = zones.iter().map(|z| z.id).collect();
+                        assert_eq!(zones.len(),n);
+                        assert_eq!(ids.len(),n);
+                        assert!(zones.iter().zip(&base).all(|(a,b)|
+                            (a.x0,a.x1,a.y0,a.y1)==(b.x0,b.x1,b.y0,b.y1)));
+                        assert!(zones.iter().all(|z| z.x0 >= 0.0 && z.x1 <= 1.0
+                            && z.y0 >= 0.0 && z.y1 <= 1.0 && z.x0 < z.x1 && z.y0 < z.y1));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shortened_strip_has_no_invented_closing_segment() {
+        let panels = reference40();
+        for count in 1..=panels.len() {
+            let zones = make_zones(&panels[..count], &Config::default()).unwrap();
+            assert_eq!(zones.len(), count);
+            assert_eq!(zones[0].edge, Some("bottom"), "cut to {count} panels");
+            assert!(zones.iter().all(|zone| zone.x0 < zone.x1 && zone.y0 < zone.y1));
+            assert!(zones.iter().zip(&panels).all(|(zone, panel)| zone.id == panel.id));
+        }
+    }
+    #[test]
+    fn alignment_matches_reference_permutations_and_saved_offsets_after_reenumeration() {
+        let p32=[
+            (450,0),(400,0),(350,0),(300,0),(250,0),(200,0),(150,0),(100,0),(50,0),(0,0),
+            (0,50),(0,100),(0,150),(0,200),(0,250),
+            (50,250),(100,250),(150,250),(200,250),(250,250),(300,250),(350,250),(400,250),(450,250),(500,250),
+            (500,200),(500,150),(500,100),(500,50),(500,0),(450,0),(400,0),
+        ];
+        let panels32:Vec<_>=p32.into_iter().enumerate().map(|(i,(x,y))| PanelPosition{id:i as u16,x,y}).collect();
+        let panels34:Vec<_>=(0..34).map(|i| {
+            let (x,y)=if i<7 { (300-50*i as i64,50) }
+            else if i<12 { (0,50+50*(i as i64-6)) }
+            else if i<21 { (50*(i as i64-11),300) }
+            else if i<27 { (450,300-50*(i as i64-20)) }
+            else { (450-50*(i as i64-26),0) };
+            PanelPosition{id:i as u16,x,y}
+        }).collect();
+        let panels40=reference40();
+        for (panels,anchors) in [
+            (&panels32,[0,9,14,24,29]),
+            (&panels34,[0,6,11,20,26]),
+            (&panels40,[0,7,15,28,35]),
+        ] {
+            let n=panels.len();
+            let offsets:Vec<i32>=if n==40 { vec![-39,-1,0,1,39] } else { vec![-39,-(n as i32),-1,0,1,n as i32,39] };
+            for (corner,&start) in ["bottom_center","bottom_left","top_left","top_right","bottom_right"].iter().zip(&anchors) {
+                for reverse in [false,true] {
+                    for &offset in &offsets {
+                        let cfg=Config{start_corner:(*corner).into(),reverse_direction:reverse,
+                            perimeter_offset:offset,..Config::default()};
+                        let zones=make_zones(panels,&cfg).unwrap();
+                        for i in 0..n {
+                            let direction=if reverse {-1isize} else {1isize};
+                            let expected=(start as isize+offset.rem_euclid(n as i32) as isize
+                                +direction*i as isize).rem_euclid(n as isize) as usize;
+                            assert_eq!(zones[i].id,panels[expected].id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn shuffled_panel_ids_follow_position_data_and_alignment_without_moving_rectangles() {
+        let mut panels = reference40();
+        for (i, panel) in panels.iter_mut().enumerate() {
+            panel.id = (39 - i) as u16 * 11;
+        }
+        let base = make_zones(&panels, &Config::default()).unwrap();
+        assert!(base.iter().zip(&panels).all(|(zone,panel)| zone.id == panel.id));
+        let aligned = make_zones(&panels, &Config {
+            start_corner: "top_right".into(),
+            reverse_direction: true,
+            perimeter_offset: -39,
+            ..Config::default()
+        }).unwrap();
+        assert!(aligned.iter().zip(&base).all(|(a,b)|
+            (a.x0,a.x1,a.y0,a.y1)==(b.x0,b.x1,b.y0,b.y1)));
+        assert_eq!(aligned[0].id, panels[29].id);
     }
 
     #[test]
@@ -1514,6 +1629,7 @@ mod tests {
         let data = solid_frame(w, h, [120, 30, 10]);
         let zone = Zone {
             id: 1,
+            edge: None,
             x0: 0.0,
             x1: 0.15,
             y0: 0.4,

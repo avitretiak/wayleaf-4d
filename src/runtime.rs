@@ -13,7 +13,7 @@ use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::flag;
 use std::collections::HashMap;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -94,6 +94,7 @@ struct Shared {
     stop: Arc<AtomicBool>,
     sent: AtomicBool,
     preview_enabled: AtomicBool,
+    panel_count: AtomicUsize,
     preview: Mutex<Vec<PreviewSegment>>,
 }
 
@@ -109,6 +110,7 @@ impl Shared {
             stop: Arc::new(AtomicBool::new(false)),
             sent: AtomicBool::new(false),
             preview_enabled: AtomicBool::new(false),
+            panel_count: AtomicUsize::new(0),
             preview: Mutex::new(Vec::new()),
         }
     }
@@ -153,14 +155,8 @@ impl Shared {
                             8..=9 => "left",
                             _ => unreachable!(),
                         })
-                    } else if mode == "4D" && zones.len() == 34 {
-                        Some(match index {
-                            0..=5 | 27..=33 => "bottom",
-                            6..=11 => "left",
-                            12..=20 => "top",
-                            21..=26 => "right",
-                            _ => unreachable!(),
-                        })
+                    } else if mode == "4D" {
+                        zone.edge
                     } else {
                         None
                     };
@@ -294,6 +290,11 @@ impl WorkerInterface {
         }
     }
 
+    #[zbus(name = "GetPanelCount")]
+    fn get_panel_count(&self) -> u32 {
+        self.shared.panel_count.load(Ordering::Acquire) as u32
+    }
+
     #[zbus(name = "GetPreview")]
     fn get_preview(&self) -> String {
         self.shared.preview_json()
@@ -326,7 +327,8 @@ fn settings_to_dbus(settings: &Value) -> WorkerResult<HashMap<String, OwnedValue
                     })?;
                 OwnedValue::from(number)
             }
-            "fps" | "max_step" | "edge_depth" | "center_bleed" | "peak_mix" | "feather_depth" => {
+            "fps" | "max_step" | "edge_depth" | "center_bleed" | "peak_mix" | "feather_depth"
+            | "perimeter_offset" => {
                 let number = value
                     .as_i64()
                     .and_then(|number| i32::try_from(number).ok())
@@ -335,12 +337,12 @@ fn settings_to_dbus(settings: &Value) -> WorkerResult<HashMap<String, OwnedValue
                     })?;
                 OwnedValue::from(number)
             }
-            "letterbox" | "midtone_lift" | "strict_black" => {
+            "letterbox" | "midtone_lift" | "strict_black" | "reverse_direction" => {
                 OwnedValue::from(value.as_bool().ok_or_else(|| {
                     WorkerError::Failed("worker setting has an invalid boolean".to_owned())
                 })?)
             }
-            "monitor" | "mode" | "static_color" => OwnedValue::try_from(DbusValue::from(
+            "monitor" | "mode" | "static_color" | "start_corner" => OwnedValue::try_from(DbusValue::from(
                 value
                     .as_str()
                     .ok_or_else(|| {
@@ -365,13 +367,14 @@ fn settings_from_dbus(settings: HashMap<String, OwnedValue>) -> WorkerResult<Map
                 let value = f64::try_from(value).map_err(|_| invalid())?;
                 Value::Number(Number::from_f64(value).ok_or_else(invalid)?)
             }
-            "fps" | "max_step" | "edge_depth" | "center_bleed" | "peak_mix" | "feather_depth" => {
+            "fps" | "max_step" | "edge_depth" | "center_bleed" | "peak_mix" | "feather_depth"
+            | "perimeter_offset" => {
                 Value::from(i32::try_from(value).map_err(|_| invalid())?)
             }
-            "letterbox" | "midtone_lift" | "strict_black" => {
+            "letterbox" | "midtone_lift" | "strict_black" | "reverse_direction" => {
                 Value::from(bool::try_from(value).map_err(|_| invalid())?)
             }
-            "monitor" | "mode" | "static_color" => {
+            "monitor" | "mode" | "static_color" | "start_corner" => {
                 Value::String(String::try_from(value).map_err(|_| invalid())?)
             }
             _ => return Err(invalid()),
@@ -474,6 +477,7 @@ pub fn run(mut config: Config) -> Result<()> {
     }
 
     let panels = panel_layout(&config)?;
+    shared.panel_count.store(panels.len(), Ordering::Release);
     if shared.is_stopping() {
         return Ok(());
     }
@@ -1036,6 +1040,7 @@ fn preview_self_test() -> Result<()> {
     let zones = [
         Zone {
             id: 34,
+            edge: Some("bottom"),
             x0: 0.1,
             x1: 0.2,
             y0: 0.9,
@@ -1043,6 +1048,7 @@ fn preview_self_test() -> Result<()> {
         },
         Zone {
             id: 3,
+            edge: Some("left"),
             x0: 0.0,
             x1: 0.08,
             y0: 0.2,
@@ -1102,51 +1108,11 @@ fn preview_self_test() -> Result<()> {
             "runtime self-test: disabled preview retained a published snapshot",
         ));
     }
-    let panels34: Vec<_> = (0..34)
-        .map(|i| {
-            let (x, y) = if i < 7 {
-                (300 - 50 * i as i64, 50)
-            } else if i < 12 {
-                (0, 50 + 50 * (i as i64 - 6))
-            } else if i < 21 {
-                (50 * (i as i64 - 11), 300)
-            } else if i < 27 {
-                (450, 300 - 50 * (i as i64 - 20))
-            } else {
-                (450 - 50 * (i as i64 - 26), 0)
-            };
-            crate::sampling::PanelPosition { id: i as u16, x, y }
-        })
-        .collect();
-    let zones34 = crate::sampling::make_zones(&panels34, &Config::default())?;
     let preview_shared = Shared::new(Config::default());
     preview_shared.set_preview_enabled(true);
-    let colors34 = vec![Color::default(); zones34.len()];
-    preview_shared.update_preview("4D", &zones34, &colors34);
-    let preview = preview_shared
-        .preview
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    let mut edge_counts = [0; 4];
-    for segment in preview.iter() {
-        let edge = match segment.edge {
-            "top" => 0,
-            "right" => 1,
-            "bottom" => 2,
-            "left" => 3,
-            _ => unreachable!(),
-        };
-        edge_counts[edge] += 1;
-    }
-    if edge_counts != [9, 6, 13, 6] {
-        return Err(AppError::new(format!(
-            "runtime self-test: 34-panel preview edge counts are {edge_counts:?}, expected [9, 6, 13, 6]"
-        )));
-    }
-    drop(preview);
 
     for depth in [5, 8, 20] {
-        let coarse = zones_for_mode("3D", &zones34, depth)?;
+        let coarse = zones_for_mode("3D", &zones, depth)?;
         preview_shared.update_preview("3D", &coarse, &[Color::default(); 10]);
         let published: Value = serde_json::from_str(&preview_shared.preview_json())
             .map_err(|_| AppError::new("runtime self-test: 3D preview serialization failed"))?;
@@ -1223,6 +1189,9 @@ fn settings_transaction_self_test() -> Result<()> {
         ("smooth".to_owned(), OwnedValue::from(0.62_f64)),
         ("mode".to_owned(), mode),
         ("static_color".to_owned(), static_color),
+        ("start_corner".to_owned(), OwnedValue::from(zbus::zvariant::Str::from("top_right"))),
+        ("reverse_direction".to_owned(), OwnedValue::from(true)),
+        ("perimeter_offset".to_owned(), OwnedValue::from(-39_i32)),
     ]);
     interface
         .set_settings(valid)
@@ -1234,10 +1203,26 @@ fn settings_transaction_self_test() -> Result<()> {
         .map_err(|error| AppError::new(format!("runtime self-test: {error:?}")))?;
     if returned.get("mode") != Some(&Value::String("2D".into()))
         || returned.get("static_color") != Some(&Value::String("#40a0ff".into()))
+        || returned.get("start_corner") != Some(&Value::String("top_right".into()))
+        || returned.get("reverse_direction") != Some(&Value::Bool(true))
+        || returned.get("perimeter_offset") != Some(&Value::from(-39))
     {
         return Err(AppError::new(
             "runtime self-test: mode settings D-Bus round trip failed",
         ));
+    }
+    let saved = Config::load(&path)?;
+    if saved.start_corner != "top_right" || !saved.reverse_direction || saved.perimeter_offset != -39 {
+        return Err(AppError::new("runtime self-test: alignment was not persisted"));
+    }
+    for patch in [
+        HashMap::from([("start_corner".to_owned(), OwnedValue::from(zbus::zvariant::Str::from("invalid")))]),
+        HashMap::from([("perimeter_offset".to_owned(), OwnedValue::from(40_i32))]),
+        HashMap::from([("reverse_direction".to_owned(), OwnedValue::from(1_i32))]),
+    ] {
+        if !matches!(interface.set_settings(patch), Err(WorkerError::InvalidSettings(_))) {
+            return Err(AppError::new("runtime self-test: invalid alignment was accepted"));
+        }
     }
     let invalid = HashMap::from([
         ("brightness".to_owned(), OwnedValue::from(0.1_f64)),

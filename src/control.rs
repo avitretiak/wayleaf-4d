@@ -181,6 +181,19 @@ impl ControlApi {
         serde_json::to_string(&state_lock(&self.shared).json()).unwrap_or_else(|_| "{}".into())
     }
 
+    #[zbus(name = "GetPanelCount")]
+    fn get_panel_count(&self) -> u32 {
+        let Ok(connection) = session_connection() else {
+            return 0;
+        };
+        if !worker_present_on(&connection).unwrap_or(false) {
+            return 0;
+        }
+        worker_proxy(&connection)
+            .and_then(|proxy| proxy.call("GetPanelCount", &()).map_err(|error| error.to_string()))
+            .unwrap_or(0)
+    }
+
     #[zbus(name = "GetPreview")]
     fn get_preview(&self) -> String {
         if !state_lock(&self.shared).preview_enabled {
@@ -1128,17 +1141,18 @@ fn value_to_owned(key: &str, value: &Value) -> std::result::Result<OwnedValue, S
                 .ok_or_else(invalid)?;
             Ok(OwnedValue::from(number))
         }
-        "fps" | "max_step" | "edge_depth" | "center_bleed" | "peak_mix" | "feather_depth" => {
+        "fps" | "max_step" | "edge_depth" | "center_bleed" | "peak_mix" | "feather_depth"
+        | "perimeter_offset" => {
             let number = value
                 .as_i64()
                 .and_then(|number| i32::try_from(number).ok())
                 .ok_or_else(invalid)?;
             Ok(OwnedValue::from(number))
         }
-        "letterbox" | "midtone_lift" | "strict_black" => {
+        "letterbox" | "midtone_lift" | "strict_black" | "reverse_direction" => {
             value.as_bool().map(OwnedValue::from).ok_or_else(invalid)
         }
-        "monitor" | "mode" | "static_color" => value
+        "monitor" | "mode" | "static_color" | "start_corner" => value
             .as_str()
             .map(|value| OwnedValue::from(Str::from(value)))
             .ok_or_else(invalid),
@@ -1339,7 +1353,10 @@ pub fn self_test() -> Result<()> {
             "control discovery deduplication self-test failed",
         ));
     }
-    let mode_settings = json!({"mode":"3D","static_color":"#01A2fF"});
+    let mode_settings = json!({
+        "mode":"3D", "static_color":"#01A2fF", "start_corner":"bottom_right",
+        "reverse_direction":true, "perimeter_offset":-39
+    });
     let forwarded = settings_to_dbus(&mode_settings)
         .map_err(|error| AppError::new(format!("control settings self-test: {error}")))?;
     if owned_settings_json(forwarded)

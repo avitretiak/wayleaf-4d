@@ -24,7 +24,10 @@ Item {
         feather_depth: 5,
         letterbox: true,
         midtone_lift: false,
-        strict_black: false
+        strict_black: false,
+        start_corner: "bottom_center",
+        reverse_direction: false,
+        perimeter_offset: 0
     })
     property string status: "stopped"
     property bool running: false
@@ -32,6 +35,7 @@ Item {
     property bool startAtLogin: false
     property bool busy: false
     property bool deviceConnected: false
+    property int detectedPanelCount: 0
     property bool deviceBusy: false
     property string deviceHost: ""
     property var deviceInfo: ({})
@@ -137,6 +141,11 @@ Item {
                 continue
             result[key] = values && Object.prototype.hasOwnProperty.call(values, key) ? values[key] : settings[key]
         }
+        const corners = ["bottom_center", "bottom_left", "top_left", "top_right", "bottom_right"]
+        result.start_corner = corners.indexOf(result.start_corner) >= 0 ? result.start_corner : "bottom_center"
+        result.reverse_direction = result.reverse_direction === true
+        const offset = Number(result.perimeter_offset)
+        result.perimeter_offset = Number.isFinite(offset) ? Math.max(-39, Math.min(39, Math.trunc(offset))) : 0
         return result
     }
     function isSettingPending(key) {
@@ -243,7 +252,16 @@ Item {
                     busy = state.busy
             }
             if (settingsGeneration === _settingsGeneration && Object.keys(_pendingSettings).length === 0 && !_settingsInFlight && state.settings && typeof state.settings === "object" && !Array.isArray(state.settings))
+                // The worker reports its cached startup layout, not the mode's preview zone count.
                 settings = settingsFrom(state.settings)
+            if (!running) {
+                detectedPanelCount = 0
+            } else {
+                callControl("GetPanelCount", [], function(value) {
+                    if (stateGeneration === _stateGeneration && running)
+                        detectedPanelCount = Math.max(0, Math.min(40, Number(value) || 0))
+                }, function() { detectedPanelCount = 0 })
+            }
             if (stateGeneration === _stateGeneration && !_localDevicePending) {
                 applyDeviceState(state)
                 if (!_localBusy && typeof state.selectedMonitor === "string")

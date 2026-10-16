@@ -33,6 +33,9 @@ pub struct Config {
     pub letterbox: bool,
     pub midtone_lift: bool,
     pub strict_black: bool,
+    pub start_corner: String,
+    pub reverse_direction: bool,
+    pub perimeter_offset: i32,
 }
 
 impl Default for Config {
@@ -63,6 +66,9 @@ impl Default for Config {
             letterbox: true,
             midtone_lift: false,
             strict_black: false,
+            start_corner: "bottom_center".into(),
+            reverse_direction: false,
+            perimeter_offset: 0,
         }
     }
 }
@@ -96,6 +102,11 @@ impl Config {
             || !in_range(self.smooth, 0.05, 1.0)
             || !in_range(self.black_threshold, 0.0, 0.1)
             || !in_range(self.saturation_boost, 0.0, 3.0)
+            || !matches!(
+                self.start_corner.as_str(),
+                "bottom_center" | "bottom_left" | "top_left" | "top_right" | "bottom_right"
+            )
+            || !(-39..=39).contains(&self.perimeter_offset)
         {
             return Err(AppError::new(
                 "configuration value outside its supported range",
@@ -123,11 +134,11 @@ impl Config {
 
     pub fn save_settings(&self, settings: &Value) -> Result<()> {
         update_root(&self.config_path, true, |object, current| {
+            let mut next = current.clone();
+            next.apply_settings(settings)?;
             for key in ["corner", "offset", "reverse"] {
                 object.remove(key);
             }
-            let mut next = current.clone();
-            next.apply_settings(settings)?;
             let values = next.settings_json();
             for key in settings
                 .as_object()
@@ -135,6 +146,9 @@ impl Config {
                 .keys()
             {
                 object.insert(key.clone(), values[key].clone());
+            }
+            for key in ["start_corner", "reverse_direction", "perimeter_offset"] {
+                object.insert(key.into(), values[key].clone());
             }
             Ok(())
         })
@@ -167,6 +181,9 @@ impl Config {
             "smooth": self.smooth,
             "black_threshold": self.black_threshold,
             "saturation_boost": self.saturation_boost,
+            "start_corner": self.start_corner,
+            "reverse_direction": self.reverse_direction,
+            "perimeter_offset": self.perimeter_offset,
             "letterbox": self.letterbox,
             "midtone_lift": self.midtone_lift,
             "strict_black": self.strict_black,
@@ -196,6 +213,9 @@ impl Config {
                 "letterbox" => next.letterbox = json_bool(value, key)?,
                 "midtone_lift" => next.midtone_lift = json_bool(value, key)?,
                 "strict_black" => next.strict_black = json_bool(value, key)?,
+                "start_corner" => next.start_corner = json_string(value, key)?,
+                "reverse_direction" => next.reverse_direction = json_bool(value, key)?,
+                "perimeter_offset" => next.perimeter_offset = json_i32(value, key)?,
                 _ => return Err(AppError::new("unknown setting key")),
             }
         }
@@ -381,6 +401,40 @@ fn load_values(config: &mut Config, root: &Value) -> Result<()> {
     }
     if let Some(value) = object.get("strict_black") {
         config.strict_black = json_bool(value, "strict_black")?;
+    }
+    if !object.contains_key("start_corner") {
+        if let Some(corner) = object.get("corner").and_then(Value::as_str) {
+            config.start_corner = match corner {
+                "bottom-center" => "bottom_center",
+                "bottom-left" => "bottom_left",
+                "top-left" => "top_left",
+                "top-right" => "top_right",
+                "bottom-right" => "bottom_right",
+                _ => config.start_corner.as_str(),
+            }
+            .to_owned();
+        }
+    }
+    if !object.contains_key("reverse_direction") {
+        if let Some(reverse) = object.get("reverse").and_then(Value::as_bool) {
+            config.reverse_direction = reverse;
+        }
+    }
+    if !object.contains_key("perimeter_offset") {
+        if let Some(offset) = object.get("offset").and_then(|value| json_i32(value, "offset").ok()) {
+            if (-39..=39).contains(&offset) {
+                config.perimeter_offset = offset;
+            }
+        }
+    }
+    if let Some(value) = object.get("start_corner") {
+        config.start_corner = json_string(value, "start_corner")?;
+    }
+    if let Some(value) = object.get("reverse_direction") {
+        config.reverse_direction = json_bool(value, "reverse_direction")?;
+    }
+    if let Some(value) = object.get("perimeter_offset") {
+        config.perimeter_offset = json_i32(value, "perimeter_offset")?;
     }
     Ok(())
 }
@@ -712,6 +766,79 @@ mod tests {
     }
 
     #[test]
+    fn alignment_settings_validate_and_round_trip() {
+        let mut config = Config::default();
+        assert_eq!(config.start_corner, "bottom_center");
+        assert!(!config.reverse_direction);
+        assert_eq!(config.perimeter_offset, 0);
+        config
+            .apply_settings(&json!({
+                "start_corner": "top_left",
+                "reverse_direction": true,
+                "perimeter_offset": -39
+            }))
+            .expect("apply alignment settings");
+        let before = config.settings_json();
+        for invalid in [
+            json!({"start_corner":"center"}),
+            json!({"perimeter_offset":40}),
+            json!({"perimeter_offset":-40}),
+        ] {
+            assert!(config.apply_settings(&invalid).is_err());
+            assert_eq!(config.settings_json(), before);
+        }
+        let path = test_path();
+        config.config_path = path.clone();
+        config.save().expect("save alignment settings");
+        let loaded = Config::load(&path).expect("reload alignment settings");
+        assert_eq!(loaded.settings_json(), config.settings_json());
+        let _ = fs::remove_file(&path);
+        if let Ok(lock) = lock_path(&path) {
+            let _ = fs::remove_file(lock);
+        }
+    }
+
+    #[test]
+    fn legacy_alignment_migrates_and_canonical_values_take_precedence() {
+        let path = test_path();
+        write_atomic(
+            &path,
+            br#"{"corner":"bottom-right","offset":26,"reverse":true}"#,
+        )
+        .expect("seed legacy alignment");
+        let legacy = Config::load(&path).expect("load legacy alignment");
+        assert_eq!(legacy.start_corner, "bottom_right");
+        assert_eq!(legacy.perimeter_offset, 26);
+        assert!(legacy.reverse_direction);
+        legacy
+            .save_settings(&json!({"monitor":"DP-3"}))
+            .expect("save unrelated setting");
+        let migrated = read_root(&path)
+            .expect("read migrated alignment")
+            .expect("migrated config");
+        assert_eq!(migrated["start_corner"], "bottom_right");
+        assert_eq!(migrated["perimeter_offset"], 26);
+        assert_eq!(migrated["reverse_direction"], true);
+        assert!(["corner", "offset", "reverse"]
+            .iter()
+            .all(|key| migrated.get(key).is_none()));
+
+        write_atomic(
+            &path,
+            br#"{"corner":"bottom-left","offset":12,"reverse":true,"start_corner":"top_right","perimeter_offset":-4,"reverse_direction":false}"#,
+        )
+        .expect("seed mixed alignment");
+        let canonical = Config::load(&path).expect("load canonical alignment");
+        assert_eq!(canonical.start_corner, "top_right");
+        assert_eq!(canonical.perimeter_offset, -4);
+        assert!(!canonical.reverse_direction);
+        let _ = fs::remove_file(&path);
+        if let Ok(lock) = lock_path(&path) {
+            let _ = fs::remove_file(lock);
+        }
+    }
+
+    #[test]
     fn save_refuses_invalid_files_without_overwriting_or_leaking_credentials() {
         let path = test_path();
         let invalid = b"not-json";
@@ -732,4 +859,32 @@ mod tests {
             let _ = fs::remove_file(lock);
         }
     }
+    
+    #[test]
+    fn legacy_alignment_save_migrates_known_keys() {
+        let path = test_path();
+        write_atomic(
+            &path,
+            br#"{"corner":"bottom-right","offset":26,"reverse":true}"#,
+        )
+        .expect("seed legacy alignment");
+        let mut config = Config::load(&path).expect("load legacy alignment");
+        config.brightness = 0.7;
+        config.save().expect("save migrated config");
+        let root = read_root(&path)
+            .expect("read saved config")
+            .expect("saved config");
+        assert_eq!(root["start_corner"], "bottom_right");
+        assert_eq!(root["perimeter_offset"], 26);
+        assert_eq!(root["reverse_direction"], true);
+        assert!(["corner", "offset", "reverse"]
+            .iter()
+            .all(|key| root.get(key).is_none()));
+        let _ = fs::remove_file(&path);
+        if let Ok(lock) = lock_path(&path) {
+            let _ = fs::remove_file(lock);
+        }
+    }
+
 }
+    

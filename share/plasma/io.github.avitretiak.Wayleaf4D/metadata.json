@@ -13,7 +13,7 @@
         "Id": "io.github.avitretiak.Wayleaf4D",
         "License": "GPL-3.0-or-later",
         "Name": "Wayleaf 4D",
-        "Version": "0.3.3"
+        "Version": "0.3.4"
     },
     "KPackageStructure": "Plasma/Applet",
     "X-Plasma-API-Minimum-Version": "6.0",
