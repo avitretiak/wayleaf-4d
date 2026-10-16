@@ -178,7 +178,9 @@ impl Shared {
                 .clear();
         }
     }
+}
 
+impl Shared {
     fn lock(&self) -> MutexGuard<'_, WorkerState> {
         self.state.lock().unwrap_or_else(|error| error.into_inner())
     }
