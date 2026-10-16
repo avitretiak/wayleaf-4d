@@ -107,9 +107,7 @@ impl Config {
     pub fn save(&self) -> Result<()> {
         self.validate()?;
         update_root(&self.config_path, true, |object, _| {
-            for key in ["corner", "offset", "reverse"] {
-                object.remove(key);
-            }
+            remove_legacy_settings(object);
             if !self.host.is_empty() {
                 object.insert("ip".into(), Value::String(self.host.clone()));
             }
@@ -123,9 +121,7 @@ impl Config {
 
     pub fn save_settings(&self, settings: &Value) -> Result<()> {
         update_root(&self.config_path, true, |object, current| {
-            for key in ["corner", "offset", "reverse"] {
-                object.remove(key);
-            }
+            remove_legacy_settings(object);
             let mut next = current.clone();
             next.apply_settings(settings)?;
             let values = next.settings_json();
@@ -434,6 +430,12 @@ fn json_f32(value: &Value, key: &str) -> Result<f32> {
         .filter(|number| number.is_finite())
         .ok_or_else(|| AppError::new(format!("config field {key} must be finite")))?;
     Ok(number)
+}
+
+fn remove_legacy_settings(object: &mut Map<String, Value>) {
+    for key in ["corner", "offset", "reverse"] {
+        object.remove(key);
+    }
 }
 
 fn write_known_settings(object: &mut Map<String, Value>, config: &Config) {

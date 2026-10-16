@@ -45,7 +45,7 @@ Modes 2D–4D use direct KMS capture through the GSR helper instead of KDE's Scr
 
 - [User Guide](docs/USAGE.md): detailed controls, service behavior, configuration, CLI, diagnostics, and removal.
 - [Implementation reference](docs/DEVELOPMENT.md): architecture and implementation details.
-- [Release notes](docs/RELEASE_NOTES-0.3.0.md).
+- [Release notes](docs/RELEASE_NOTES-0.3.1.md).
 
 ## License
 

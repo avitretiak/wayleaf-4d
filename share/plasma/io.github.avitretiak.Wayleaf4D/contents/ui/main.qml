@@ -37,8 +37,7 @@ PlasmoidItem {
             anchors.verticalCenter: parent.verticalCenter
             Kirigami.Icon {
                 anchors.fill: parent
-                source: Qt.resolvedUrl("../ambient-light.svg")
-                isMask: false
+                source: "video-display"
             }
             Rectangle {
                 visible: root.syncBackend.running && root.syncBackend.settings.mode === "1D"
