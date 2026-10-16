@@ -39,13 +39,17 @@ This builds and installs Wayleaf 4D for the current user. It does not install th
 
 ## Capture, performance, and privacy
 
-Modes 2D–4D use direct KMS capture through the GSR helper instead of KDE's ScreenCast/portal path. The helper composites supported planes on the GPU and reduces them to a small frame before CPU sampling. No project-specific performance benchmark is published; actual capture and game-frame impact depend on the GPU and driver. The package-managed helper carries `CAP_SYS_ADMIN`; the Wayleaf worker stays unprivileged. Direct KMS shows neither a portal-consent prompt nor KDE's Screen Casting indicator. Start sync only when you intend to send sampled display colors. Captured frames are reduced and sampled in memory; screen images are not saved. Mode 1D does not capture.
+Modes 2D–4D use direct KMS capture through the GSR helper. The helper composites supported planes on the GPU and reduces them to a small frame before CPU sampling. Capture and game-frame impact depend on the GPU and driver. The package-managed helper carries `CAP_SYS_ADMIN`; the Wayleaf worker stays unprivileged. Direct KMS shows neither a portal-consent prompt nor KDE's Screen Casting indicator. Start sync only when you intend to send sampled display colors. Captured frames are reduced and sampled in memory; screen images are not saved. Mode 1D does not capture.
 
 ## More
 
 - [User Guide](docs/USAGE.md): detailed controls, service behavior, configuration, CLI, diagnostics, and removal.
 - [Implementation reference](docs/DEVELOPMENT.md): architecture and implementation details.
 - [Release notes](docs/RELEASE_NOTES-0.3.4.md).
+
+## Credits
+
+Thanks to [adeze/lg-hue-sync](https://github.com/adeze/lg-hue-sync) for code references used during Wayleaf 4D development.
 
 ## License
 

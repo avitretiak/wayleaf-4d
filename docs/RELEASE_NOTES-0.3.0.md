@@ -1,16 +1,15 @@
 # Wayleaf 4D 0.3.0
 
-This release refreshes the Plasma popup's four-way controls and edge preview, and corrects 34-panel edge mapping.
+Four-way Plasma controls, a mode-specific edge preview, and 34-panel edge mapping.
 
 ## Changes
 
-- Reworked the hero card with a native four-position mode slider: select a mode by clicking, dragging, or using the keyboard. Brightness remains available across modes.
-- Replaced the Look buttons with a four-step Subtle / Balanced / Vivid / Custom slider. Presets hide fine tuning; Custom restores its saved values and opens the controls.
-- Fixed custom settings being replaced by preset values. Custom-to-preset-to-Custom round-trips now preserve the snapshot across popup reopen, including when Custom happens to match a preset. Resetting fine tuning keeps Custom selected.
-- Updated the edge preview with equal-length 6 px segment pills, 4 px gaps, and a 4 px inset. A shared set of zone colors drives the preview glow: an antialiased 6 px rim and a soft Gaussian halo fading out by 16 logical pixels. Preview updates at up to 10 Hz while the popup is open.
-- Made the 3D preview show the 3 top, 2 right, 3 bottom, and 2 left coarse screen zones.
-- Corrected the 34-panel bottom-edge split so its two controller-order runs fit their respective halves without gaps or overlap. Panel IDs are preserved; the preview uses the layout's 9 top, 6 right, 13 bottom, and 6 left counts.
-- Refreshed the README screenshot with both sliders, rounded framing, and a soft window shadow on a transparent canvas. It is an illustrative rainbow preview, not a report of sampled hardware colors.
+- A native four-position mode slider supports clicking, dragging, and keyboard input. Brightness is available across modes.
+- The Look slider provides Subtle, Balanced, Vivid, and Custom. Presets hide fine tuning; Custom restores its saved values and opens the controls.
+- Custom settings persist across preset changes and popup reopen, including when Custom matches a preset. Resetting fine tuning keeps Custom selected.
+- The edge preview uses equal-length 6 px segment pills, 4 px gaps, and a 4 px inset. Shared zone colors drive an antialiased 6 px rim and a soft Gaussian halo extending to 16 logical pixels. Preview updates at up to 10 Hz while the popup is open.
+- The 3D preview shows 3 top, 2 right, 3 bottom, and 2 left coarse screen zones.
+- The 34-panel layout fits its two bottom-edge runs to adjacent halves. Panel IDs are retained; the preview has 9 top, 6 right, 13 bottom, and 6 left segments.
 
 ## Requirements and privacy
 

@@ -1,14 +1,14 @@
 # Wayleaf 4D 0.2.0
 
-Wayleaf 4D now uses a Rust worker and Plasma 6 widget to mirror display colors to Nanoleaf 4D panels.
+A Rust worker and Plasma 6 widget mirror display colors to Nanoleaf 4D panels.
 
 ## Changes
 
-- Added four output modes: 1D static color, 2D full-screen dominant color, 3D ten-zone edge sampling, and 4D per-panel edge sampling.
-- Replaced portal/PipeWire capture with direct KMS capture through the GPU Screen Recorder helper. Frames are reduced and sampled in memory; screen images are not saved.
-- Added the Plasma controls for mode selection, static colors, sampling presets and fine tuning, monitor selection, and a live mode-specific edge preview. Run/Stop is independent of Start at login.
-- Kept controller panel IDs in the output mapping. The 34-panel layout uses controller `positionData`; the 40-panel NL69 layout uses calibrated perimeter geometry.
-- Kept the shared XDG config and CLI for pairing, diagnostics, and standalone streaming.
+- Four output modes: 1D static color, 2D full-screen dominant color, 3D ten-zone edge sampling, and 4D per-panel edge sampling.
+- Direct KMS capture uses the GPU Screen Recorder helper. Frames are reduced and sampled in memory; screen images are not saved.
+- Plasma controls include mode selection, static colors, sampling presets and fine tuning, monitor selection, and a live mode-specific edge preview. Run/Stop is independent of Start at login.
+- Output mapping retains controller panel IDs. The 34-panel layout uses controller `positionData`; the 40-panel NL69 layout uses calibrated perimeter geometry.
+- Shared XDG configuration and CLI commands support pairing, diagnostics, and standalone streaming.
 
 ## Requirements and privacy
 

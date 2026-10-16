@@ -1,9 +1,9 @@
 # Wayleaf 4D 0.3.2
 
-Rollback release restoring the application and synchronization behavior from 0.3.0. The higher version lets pacman upgrade installations of 0.3.1.
+Plasma applet UI with branded artwork and per-panel synchronization.
 
 ## Changes
 
-- Restored the 0.3.0 Plasma applet UI and bundled `ambient-light.svg` icon.
-- Restored the 0.3.0 Rust dependency feature set and configuration/runtime implementation.
-- Kept the hicolor app icon installed for Plasma's applet metadata lookup.
+- The Plasma applet uses the bundled `ambient-light.svg` icon.
+- The worker provides 1D static color, 2D full-screen color, 3D coarse zones, and 4D per-panel sampling.
+- Plasma applet metadata resolves the application icon through the installed hicolor artwork.
