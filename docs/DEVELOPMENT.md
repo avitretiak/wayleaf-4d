@@ -60,6 +60,10 @@ When editing `glow_ring.vert` or `glow_ring.frag`, regenerate both packages with
 
 `make install-user` installs the worker, applet, user service, desktop identity, and D-Bus activation entry under user directories, then reloads systemd and D-Bus. It does not start or enable Wayleaf. It refuses to proceed while the legacy `nanoleaf-sync` worker or service is active; otherwise it disables and removes that legacy service and binaries while preserving the shared configuration. The Wayleaf binary is replaced atomically, so an already-running worker continues with its loaded code. Absolute `XDG_DATA_HOME` and `XDG_CONFIG_HOME` overrides are honored; unset or relative values use the standard home-directory defaults.
 
+The tray renders the bundled `contents/ambient-light.svg` directly. Plasma metadata retains the application-ID icon name; installers register the same artwork under `$USER_SHARE/pixmaps` or `/usr/share/pixmaps`, which KDE searches as an unthemed fallback after the selected icon theme. This needs no direct `hicolor-icon-theme` dependency. User installation removes the previous user-local hicolor copy; package upgrades remove the old package-owned copy.
+
+Cargo disables curl's default TLS feature because device URLs are constructed as HTTP, and disables signal-hook's unused channel/iterator features. This removes `openssl-probe` and `openssl-sys` from the Rust graph, not OpenSSL from the system libcurl dependency. Zbus retains its default runtime and blocking API features.
+
 ## Verification
 
 Build the worker and exercise its module self-tests:

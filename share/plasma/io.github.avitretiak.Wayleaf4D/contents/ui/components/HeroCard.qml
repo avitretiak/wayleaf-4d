@@ -149,7 +149,8 @@ Rectangle {
         y: 70 * root.u
         width: 16 * root.u
         height: width
-        source: "brightness-high"
+        source: "brightness-high-symbolic"
+        isMask: true
         Accessible.ignored: true
     }
     Slider {

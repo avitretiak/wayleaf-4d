@@ -2,7 +2,7 @@ APP_ID = io.github.avitretiak.Wayleaf4D
 PLASMA_PACKAGE = share/plasma/$(APP_ID)
 USER_SHARE = $(if $(filter /%,$(XDG_DATA_HOME)),$(XDG_DATA_HOME),$(HOME)/.local/share)
 PLASMA_DIR = $(USER_SHARE)/plasma/plasmoids/$(APP_ID)
-USER_ICON_DIR = $(USER_SHARE)/icons/hicolor/scalable/apps
+USER_ICON_DIR = $(USER_SHARE)/pixmaps
 USER_CONFIG = $(if $(filter /%,$(XDG_CONFIG_HOME)),$(XDG_CONFIG_HOME),$(HOME)/.config)
 USER_BIN = $(HOME)/.local/bin
 BUILD_DIR = build
@@ -57,6 +57,7 @@ install-user: all
 	mv -f -- "$(USER_BIN)/wayleaf-4d.new" "$(USER_BIN)/wayleaf-4d"
 	install -d "$(PLASMA_DIR)"
 	cp -R "$(PLASMA_PACKAGE)/." "$(PLASMA_DIR)/"
+	rm -f "$(USER_SHARE)/icons/hicolor/scalable/apps/$(APP_ID).svg"
 	install -Dm644 "$(PLASMA_PACKAGE)/contents/ambient-light.svg" "$(USER_ICON_DIR)/$(APP_ID).svg"
 	install -Dm644 share/systemd/user/wayleaf-4d.service "$(USER_CONFIG)/systemd/user/wayleaf-4d.service"
 	install -Dm644 share/applications/$(APP_ID).desktop "$(USER_SHARE)/applications/$(APP_ID).desktop"

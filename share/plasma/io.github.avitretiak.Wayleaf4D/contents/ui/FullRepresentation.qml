@@ -24,7 +24,7 @@ Item {
     readonly property var presetKeys: ["saturation_boost", "smooth", "max_step", "edge_depth", "feather_depth", "center_bleed", "peak_mix", "black_threshold", "fps"]
     readonly property var legacyPresetKeys: ["saturation_boost", "smooth", "max_step", "edge_depth", "center_bleed", "peak_mix", "fps"]
     readonly property var settingDefaults: ({
-        saturation_boost: 1.5, smooth: 0.35, max_step: 12, edge_depth: 8,
+        saturation_boost: 1.0, smooth: 0.35, max_step: 12, edge_depth: 8,
         feather_depth: 5, center_bleed: 0, peak_mix: 15, black_threshold: 0.01,
         fps: 10, letterbox: true, midtone_lift: false, strict_black: false
     })
@@ -59,10 +59,10 @@ Item {
 
     function presetValues(name) {
         if (name === "Subtle")
-            return ({ saturation_boost: 1.15, smooth: 0.25, max_step: 8, edge_depth: 8,
+            return ({ saturation_boost: 0.8, smooth: 0.25, max_step: 8, edge_depth: 8,
                 feather_depth: 5, center_bleed: 0, peak_mix: 5, black_threshold: 0.01, fps: 10 })
         if (name === "Balanced")
-            return ({ saturation_boost: 1.5, smooth: 0.35, max_step: 12, edge_depth: 8,
+            return ({ saturation_boost: 1.0, smooth: 0.35, max_step: 12, edge_depth: 8,
                 feather_depth: 5, center_bleed: 0, peak_mix: 15, black_threshold: 0.01, fps: 10 })
         if (name === "Vivid")
             return ({ saturation_boost: 1.9, smooth: 0.5, max_step: 18, edge_depth: 8,
@@ -905,7 +905,7 @@ Item {
                 ToolTip.visible: hovered
             }
             Button {
-                icon.name: "plug"
+                icon.name: "network-wired-symbolic"
                 text: root.backend.deviceConnected ? String(root.backend.deviceInfo.name || "Nanoleaf 4D") : "Not paired"
                 enabled: root.backend.deviceConnected || root.backend.deviceInfoStale
                 onClicked: deviceDialog.open()

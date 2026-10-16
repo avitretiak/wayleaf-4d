@@ -59,7 +59,7 @@ impl Default for Config {
             brightness: 1.5,
             smooth: 0.35,
             black_threshold: 0.01,
-            saturation_boost: 1.5,
+            saturation_boost: 1.0,
             letterbox: true,
             midtone_lift: false,
             strict_black: false,

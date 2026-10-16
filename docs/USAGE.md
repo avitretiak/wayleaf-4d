@@ -42,12 +42,14 @@ The preview shows one color across the output in 1D and 2D, 10 coarse zones in 3
 
 **Subtle**, **Balanced**, and **Vivid** adjust shared color-response and sampling settings; Balanced matches the default values. The presets do not change mode, brightness, monitor, or toggles. Leaving **Custom** saves its active values before applying a preset; returning to Custom restores them, including after the popup is reopened. Resetting fine-tune settings keeps Custom selected so the controls remain available. Fine-tune settings are shared across modes and persist even when hidden in the current mode.
 
+Saturation is **0.8** for Subtle, **1.0** for Balanced (also the new-install/reset default), and **1.9** for Vivid. Existing saved settings and Custom values are preserved.
+
 | Control | Config key | Range | Default | Applies to | Effect |
 |---|---|---:|---:|---|---|
 | Mode | `mode` | `1D`, `2D`, `3D`, `4D` | `4D` | All | Selects static color, full-screen dominant color, 10 coarse edge zones, or per-panel edge mirroring. |
 | Static color | `static_color` | `#RRGGBB` | `#ffffff` | 1D | Color sent to every discovered panel ID without screen capture. |
 | Brightness | `brightness` | 0–2 (displayed 0–100%) | 1.5 (displayed 75%) | All | Scales final LED brightness; 1.0 is neutral. |
-| Saturation boost | `saturation_boost` | 0–3 | 1.5 | 2D–4D | Emphasizes saturated sampled pixels. |
+| Saturation boost | `saturation_boost` | 0–3 | 1.0 | 2D–4D | Emphasizes saturated sampled pixels. |
 | Response | `smooth` | 0.05–1 | 0.35 | 2D–4D | Higher values follow changes faster; lower values smooth more but add lag. |
 | Capture/send rate | `fps` | 1–10 Hz | 10 Hz | 2D–4D | Requested frame rate; the implementation caps it at 10 Hz. |
 | Maximum step | `max_step` | 1–255 | 12 | 3D–4D | Caps each frame's color change; smaller steps respond more slowly. |
@@ -122,7 +124,7 @@ case $config_home in /*) ;; *) config_home="$HOME/.config";; esac
 systemctl --user disable wayleaf-4d.service
 rm -rf "$data_home/plasma/plasmoids/io.github.avitretiak.Wayleaf4D"
 rm -f "$HOME/.local/bin/wayleaf-4d" \
-  "$data_home/icons/hicolor/scalable/apps/io.github.avitretiak.Wayleaf4D.svg" \
+  "$data_home/pixmaps/io.github.avitretiak.Wayleaf4D.svg" \
   "$data_home/applications/io.github.avitretiak.Wayleaf4D.desktop" \
   "$data_home/dbus-1/services/io.github.avitretiak.Wayleaf4D.Control.service" \
   "$config_home/systemd/user/wayleaf-4d.service"

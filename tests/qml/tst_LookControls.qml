@@ -19,7 +19,7 @@ TestCase {
     })
     readonly property var defaults: ({
         mode: "4D", static_color: "#ffffff", brightness: 1.5,
-        saturation_boost: 1.5, smooth: 0.35, max_step: 12, edge_depth: 8,
+        saturation_boost: 1.0, smooth: 0.35, max_step: 12, edge_depth: 8,
         feather_depth: 5, center_bleed: 0, peak_mix: 15, black_threshold: 0.01,
         fps: 10, letterbox: true, midtone_lift: false, strict_black: false
     })
@@ -141,7 +141,7 @@ TestCase {
 
     function test_each_preset_hides_fine_tuning_and_preserves_custom() {
         const names = ["Subtle", "Balanced", "Vivid"]
-        const expectedSaturation = [1.15, 1.5, 1.9]
+        const expectedSaturation = [0.8, 1.0, 1.9]
         for (let i = 0; i < names.length; ++i) {
             selectLook(i)
             verify(!findChild(popup, "fine-tune-controls").visible, names[i])
