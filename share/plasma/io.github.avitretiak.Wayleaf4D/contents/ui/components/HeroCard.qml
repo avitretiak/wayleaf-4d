@@ -16,6 +16,7 @@ Rectangle {
     readonly property real u: Kirigami.Units.gridUnit / 16
     readonly property real brightness: Math.max(0, Math.min(2, Number(backend.settings.brightness)))
     readonly property real previewBrightness: Math.max(0, Math.min(1.35, brightness / 1.5))
+    readonly property var modes: ["1D", "2D", "3D", "4D"]
     // Kirigami's PlatformTheme has no separatorColor role.
     readonly property color separatorColor: Qt.rgba(
         Kirigami.Theme.textColor.r, Kirigami.Theme.textColor.g, Kirigami.Theme.textColor.b, 0.2)
@@ -63,8 +64,8 @@ Rectangle {
             mode: root.mode
             running: root.backend.running
             brightness: root.previewBrightness
-            x: index === 0 || index === 2 ? 22 * root.u : index === 1 ? root.width - 12 * root.u : 6 * root.u
-            y: index === 0 ? 6 * root.u : index === 2 ? root.height - 12 * root.u : 22 * root.u
+            x: index === 0 || index === 2 ? 22 * root.u : index === 1 ? root.width - 10 * root.u : 4 * root.u
+            y: index === 0 ? 4 * root.u : index === 2 ? root.height - 10 * root.u : 22 * root.u
             width: horizontal ? root.width - 44 * root.u : 6 * root.u
             height: horizontal ? 6 * root.u : root.height - 44 * root.u
             z: 2
@@ -180,56 +181,20 @@ Rectangle {
         font.pixelSize: 11 * root.u
     }
 
-    ButtonGroup { id: modeGroup; exclusive: true }
-    Repeater {
-        id: modeRepeater
-        model: ["1D", "2D", "3D", "4D"]
-        delegate: Button {
-            id: modeButton
-            required property string modelData
-            readonly property int modeIndex: ["1D", "2D", "3D", "4D"].indexOf(modelData)
-            ButtonGroup.group: modeGroup
-            x: 22 * root.u + modeIndex * ((root.width - 44 * root.u) / 4)
-            y: 94 * root.u
-            width: (root.width - 44 * root.u) / 4
-            height: 26 * root.u
-            text: modelData
-            font.pixelSize: 12 * root.u
-            padding: 0
-            contentItem: Label {
-                text: modeButton.text
-                font: modeButton.font
-                horizontalAlignment: Text.AlignHCenter
-                verticalAlignment: Text.AlignVCenter
-                color: modeButton.enabled ? Kirigami.Theme.textColor : Kirigami.Theme.disabledTextColor
-            }
-            checkable: true
-            checked: root.mode === modelData
-            enabled: !root.backend.busy && !root.backend.deviceBusy
-            onClicked: root.backend.setSetting("mode", modelData)
-            background: Rectangle {
-                radius: 6 * root.u
-                color: modeButton.checked ? root.color : "transparent"
-                border.width: modeButton.checked || modeButton.activeFocus ? 0.5 * root.u : 0
-                border.color: modeButton.activeFocus ? Kirigami.Theme.highlightColor : root.separatorColor
-            }
-            Accessible.name: modelData + " mode"
-            Accessible.description: root.descriptionForMode(modelData)
-            ToolTip.text: Accessible.description
-            ToolTip.visible: hovered || activeFocus
-            Keys.onLeftPressed: {
-                if (modeIndex > 0) {
-                    root.backend.setSetting("mode", ["1D", "2D", "3D", "4D"][modeIndex - 1])
-                    modeRepeater.itemAt(modeIndex - 1).forceActiveFocus()
-                }
-            }
-            Keys.onRightPressed: {
-                if (modeIndex < 3) {
-                    root.backend.setSetting("mode", ["1D", "2D", "3D", "4D"][modeIndex + 1])
-                    modeRepeater.itemAt(modeIndex + 1).forceActiveFocus()
-                }
-            }
-        }
+    SteppedSlider {
+        id: modeSlider
+        objectName: "mode-slider"
+        x: 22 * root.u
+        y: 94 * root.u
+        width: root.width - 44 * root.u
+        height: 26 * root.u
+        labels: root.modes
+        value: root.modes.indexOf(root.mode)
+        enabled: !root.backend.busy && !root.backend.deviceBusy
+        onMoved: root.backend.setSetting("mode", root.modes[Math.round(value)])
+        Accessible.name: "Output mode"
+        Accessible.description: root.mode + " · " + root.descriptionForMode(root.mode)
+            + ". Drag or use Left and Right to choose 1D, 2D, 3D, or 4D."
     }
     Label {
         x: 22 * root.u

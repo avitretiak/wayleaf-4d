@@ -72,6 +72,7 @@ PlasmoidItem {
     }
     fullRepresentation: FullRepresentation {
         backend: root.syncBackend
+        configuration: Plasmoid.configuration
         expanded: root.expanded
     }
 

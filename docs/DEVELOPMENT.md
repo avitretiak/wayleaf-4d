@@ -48,7 +48,9 @@ The popup uses a 280×160 logical-pixel hero card, scaled by `Kirigami.Units.gri
 
 Corner colors interpolate by angle around the rounded turn, rather than inverse distances to the straight edge lines; the latter reverse outside the card and produce pinched color wedges. Kirigami's `PlatformTheme` has no `separatorColor` role, so the card derives its separator from the theme text color at 20% opacity.
 
-Pills are inset 6 logical pixels from the card border, leaving a small gap to the exterior rim without moving the controls.
+Pills are inset 4 logical pixels from the card border, leaving a small gap to the exterior rim without moving the controls.
+
+`SteppedSlider.qml` is the shared native Qt Quick Controls `Slider` used for mode and Look selection: values 0–3, unit steps, and `SnapAlways`, with a quarter-width selection pill and four labels. Clicks, dragging, keyboard arrows, and external value changes share the same binding. `FullRepresentation.qml` receives the backend and applet configuration explicitly from `main.qml`; it saves the current custom settings before applying a preset and persists Custom's selection identity separately. Preset matching uses displayed slider steps rather than exact `f32` equality. Only Custom exposes fine tuning, and resetting it does not switch the Look back to Balanced.
 
 ## Build and capture internals
 
@@ -57,6 +59,26 @@ User-facing prerequisites and source-install steps are in the [README](../README
 When editing `glow_ring.vert` or `glow_ring.frag`, regenerate both packages with `make shaders` using `/usr/lib/qt6/bin/qsb --qt6` from Qt 6 Shader Tools. `make` and `make install-user` fail with regeneration guidance if either package is missing or older than its source.
 
 `make install-user` installs the worker, applet, user service, desktop identity, and D-Bus activation entry under user directories, then reloads systemd and D-Bus. It does not start or enable Wayleaf. It refuses to proceed while the legacy `nanoleaf-sync` worker or service is active; otherwise it disables and removes that legacy service and binaries while preserving the shared configuration. The Wayleaf binary is replaced atomically, so an already-running worker continues with its loaded code. Absolute `XDG_DATA_HOME` and `XDG_CONFIG_HOME` overrides are honored; unset or relative values use the standard home-directory defaults.
+
+## Verification
+
+Build the worker and exercise its module self-tests:
+
+```sh
+make
+build/wayleaf-4d --self-test
+```
+
+The QML regressions use isolated in-memory backend/configuration objects; they do not connect to the worker or change the lights. With Qt 6 Declarative's `qmltestrunner`, Kirigami, and the KDE desktop control style installed:
+
+```sh
+QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software \
+QT_QUICK_CONTROLS_STYLE=org.kde.desktop QT_STYLE_OVERRIDE=Breeze \
+/usr/lib/qt6/bin/qmltestrunner -input tests/qml
+```
+
+These checks cover Look clicks/dragging/keyboard input, Custom-to-preset round-trips, popup recreation, `f32` preset matching, and Custom-only fine-tune visibility. Software rendering is sufficient for state/input tests; verify shader appearance separately in a native Plasma/Qt Quick window.
+
 
 ## Sampling and panel layouts
 

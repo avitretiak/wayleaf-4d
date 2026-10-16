@@ -6,12 +6,12 @@ import QtQuick.Controls
 import QtQuick.Layouts
 import QtQuick.Dialogs
 import org.kde.kirigami as Kirigami
-import org.kde.plasma.plasmoid
 import "components" as Components
 
 Item {
     id: root
     required property var backend
+    required property var configuration
     required property bool expanded
     readonly property real u: Kirigami.Units.gridUnit / 16
 
@@ -19,7 +19,8 @@ Item {
     property bool customSettingsPersisted: false
     property bool userTouchedSettings: false
     property string selectedPreset: "Custom"
-    property bool fineTuneExpanded: Boolean(Plasmoid.configuration.fineTuneExpanded)
+    property bool fineTuneExpanded: Boolean(configuration.fineTuneExpanded)
+    readonly property var looks: ["Subtle", "Balanced", "Vivid", "Custom"]
     readonly property var presetKeys: ["saturation_boost", "smooth", "max_step", "edge_depth", "feather_depth", "center_bleed", "peak_mix", "black_threshold", "fps"]
     readonly property var legacyPresetKeys: ["saturation_boost", "smooth", "max_step", "edge_depth", "center_bleed", "peak_mix", "fps"]
     readonly property var settingDefaults: ({
@@ -76,15 +77,19 @@ Item {
         return values
     }
 
-    function samePreset(values, preset) {
-        const expected = presetValues(preset)
-        if (!expected)
-            return false
+    function sameValues(values, expected) {
         for (const key of presetKeys) {
-            if (Number(values[key]) !== Number(expected[key]))
+            const scale = key === "black_threshold" ? 1000
+                : key === "saturation_boost" || key === "smooth" ? 100 : 1
+            if (Math.round(Number(values[key]) * scale) !== Math.round(Number(expected[key]) * scale))
                 return false
         }
         return true
+    }
+
+    function samePreset(values, preset) {
+        const expected = presetValues(preset)
+        return expected !== null && sameValues(values, expected)
     }
 
     function validCustomSettings(values) {
@@ -112,7 +117,7 @@ Item {
 
     function loadCustomSettings() {
         try {
-            const saved = JSON.parse(String(Plasmoid.configuration.customSettings || ""))
+            const saved = JSON.parse(String(configuration.customSettings || ""))
             if (!validCustomSettings(saved))
                 return false
             customSettings = Object.assign(valuesFromSettings(backend.settings), saved)
@@ -124,7 +129,7 @@ Item {
 
     function saveCustomSettings(values) {
         customSettings = values
-        Plasmoid.configuration.customSettings = JSON.stringify(values)
+        configuration.customSettings = JSON.stringify(values)
         customSettingsPersisted = true
     }
 
@@ -166,9 +171,11 @@ Item {
         const current = valuesFromSettings(backend.settings)
         if (!customSettingsPersisted)
             customSettings = current
-        selectedPreset = samePreset(current, "Balanced") ? "Balanced"
-            : samePreset(current, "Subtle") ? "Subtle"
-                : samePreset(current, "Vivid") ? "Vivid" : "Custom"
+        selectedPreset = configuration.selectedPreset === "Custom"
+            && customSettingsPersisted && sameValues(current, customSettings) ? "Custom"
+                : samePreset(current, "Balanced") ? "Balanced"
+                    : samePreset(current, "Subtle") ? "Subtle"
+                        : samePreset(current, "Vivid") ? "Vivid" : "Custom"
     }
 
     function noteFineTuneEdit(key, value) {
@@ -179,17 +186,24 @@ Item {
         saveCustomSettings(next)
         userTouchedSettings = true
         selectedPreset = "Custom"
+        configuration.selectedPreset = "Custom"
     }
 
     function choosePreset(name) {
+        if (name === selectedPreset)
+            return
+        // Snapshot the active custom values before any preset writes can
+        // replace them, including when no fine-tune edit was made this session.
+        if (selectedPreset === "Custom")
+            saveCustomSettings(valuesFromSettings(backend.settings))
         userTouchedSettings = true
         selectedPreset = name
+        configuration.selectedPreset = name
+        const values = name === "Custom" ? customSettings : presetValues(name)
         if (name === "Custom") {
-            for (const key of presetKeys)
-                backend.setSetting(key, customSettings[key])
-            return
+            saveCustomSettings(values)
+            fineTuneExpanded = true
         }
-        const values = presetValues(name)
         for (const key of presetKeys)
             backend.setSetting(key, values[key])
     }
@@ -213,6 +227,7 @@ Item {
         saveCustomSettings(next)
         userTouchedSettings = true
         selectedPreset = "Custom"
+        configuration.selectedPreset = "Custom"
         for (const key of keys)
             backend.setSetting(key, settingDefaults[key])
     }
@@ -225,7 +240,8 @@ Item {
         }
         saveCustomSettings(values)
         userTouchedSettings = true
-        selectedPreset = samePreset(values, "Balanced") ? "Balanced" : "Custom"
+        selectedPreset = "Custom"
+        configuration.selectedPreset = "Custom"
         for (const key of fineTuneKeys)
             backend.setSetting(key, settingDefaults[key])
     }
@@ -316,7 +332,7 @@ Item {
     }
 
     onExpandedChanged: syncPreview()
-    onFineTuneExpandedChanged: Plasmoid.configuration.fineTuneExpanded = fineTuneExpanded
+    onFineTuneExpandedChanged: configuration.fineTuneExpanded = fineTuneExpanded
     Connections {
         target: root.backend
         function onRunningChanged() { root.syncPreview() }
@@ -483,31 +499,25 @@ Item {
                     visible: root.mode !== "1D"
                     spacing: Kirigami.Units.smallSpacing
                     Label { text: "Look"; font.bold: true }
-                    RowLayout {
+                    Components.SteppedSlider {
+                        id: lookSlider
+                        objectName: "look-slider"
                         Layout.fillWidth: true
-                        spacing: Kirigami.Units.smallSpacing / 2
-                        ButtonGroup { id: lookGroup; exclusive: true }
-                        Repeater {
-                            model: ["Subtle", "Balanced", "Vivid", "Custom"]
-                            delegate: Button {
-                                required property string modelData
-                                ButtonGroup.group: lookGroup
-                                Layout.fillWidth: true
-                                text: modelData
-                                checkable: true
-                                checked: root.selectedPreset === modelData
-                                highlighted: checked
-                                enabled: !root.backend.busy && !root.backend.deviceBusy
-                                onClicked: root.choosePreset(modelData)
-                                Accessible.name: modelData + " look"
-                            }
-                        }
+                        labels: root.looks
+                        value: root.looks.indexOf(root.selectedPreset)
+                        enabled: !root.backend.busy && !root.backend.deviceBusy
+                        onMoved: root.choosePreset(root.looks[Math.round(value)])
+                        Accessible.name: "Look"
+                        Accessible.description: root.selectedPreset === "Custom"
+                            ? "Custom look. Fine-tune settings are available."
+                            : root.selectedPreset + " preset. Fine-tune settings are hidden."
                     }
                 }
 
                 ColumnLayout {
+                    objectName: "fine-tune-controls"
                     Layout.fillWidth: true
-                    visible: root.mode !== "1D"
+                    visible: root.mode !== "1D" && root.selectedPreset === "Custom"
                     spacing: Kirigami.Units.smallSpacing
                     RowLayout {
                         Layout.fillWidth: true
