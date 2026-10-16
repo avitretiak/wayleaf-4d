@@ -46,24 +46,36 @@ struct PreviewSegment {
     b: u8,
 }
 
-fn preview_segment(zone: &Zone, color: crate::sampling::Color) -> PreviewSegment {
+fn preview_segment(
+    zone: &Zone,
+    color: crate::sampling::Color,
+    edge_hint: Option<&'static str>,
+) -> PreviewSegment {
     let width = zone.x1 - zone.x0;
     let height = zone.y1 - zone.y0;
     let center_x = (zone.x0 + zone.x1) * 0.5;
     let center_y = (zone.y0 + zone.y1) * 0.5;
-    let mut edge = ("top", center_x, width);
-    let mut edge_distance = zone.y0;
-    for (distance, candidate) in [
-        (1.0 - zone.x1, ("right", center_y, height)),
-        (1.0 - zone.y1, ("bottom", center_x, width)),
-        (zone.x0, ("left", center_y, height)),
-    ] {
-        if distance < edge_distance {
-            edge = candidate;
-            edge_distance = distance;
+    let (edge, position, span) = if let Some(edge) = edge_hint {
+        match edge {
+            "top" | "bottom" => (edge, center_x, width),
+            "left" | "right" => (edge, center_y, height),
+            _ => unreachable!(),
         }
-    }
-    let (edge, position, span) = edge;
+    } else {
+        let mut edge = ("top", center_x, width);
+        let mut edge_distance = zone.y0;
+        for (distance, candidate) in [
+            (1.0 - zone.x1, ("right", center_y, height)),
+            (1.0 - zone.y1, ("bottom", center_x, width)),
+            (zone.x0, ("left", center_y, height)),
+        ] {
+            if distance < edge_distance {
+                edge = candidate;
+                edge_distance = distance;
+            }
+        }
+        edge
+    };
     let byte = |value: f32| value.round().clamp(0.0, 255.0) as u8;
     PreviewSegment {
         id: zone.id,
@@ -112,7 +124,7 @@ impl Shared {
         serde_json::to_string(&*preview).unwrap_or_else(|_| "[]".into())
     }
 
-    fn update_preview(&self, zones: &[Zone], colors: &[crate::sampling::Color]) {
+    fn update_preview(&self, mode: &str, zones: &[Zone], colors: &[crate::sampling::Color]) {
         if !self.preview_enabled.load(Ordering::Acquire) {
             return;
         }
@@ -129,7 +141,31 @@ impl Shared {
             zones
                 .iter()
                 .zip(colors)
-                .map(|(zone, color)| preview_segment(zone, *color)),
+                .enumerate()
+                .map(|(index, (zone, color))| {
+                    // Coarse zones have explicit edge ownership; their corner
+                    // bounds also touch adjacent edges, so distance ties misclassify them.
+                    let edge_hint = if mode == "3D" && zones.len() == 10 {
+                        Some(match index {
+                            0..=2 => "top",
+                            3..=4 => "right",
+                            5..=7 => "bottom",
+                            8..=9 => "left",
+                            _ => unreachable!(),
+                        })
+                    } else if mode == "4D" && zones.len() == 34 {
+                        Some(match index {
+                            0..=5 | 27..=33 => "bottom",
+                            6..=11 => "left",
+                            12..=20 => "top",
+                            21..=26 => "right",
+                            _ => unreachable!(),
+                        })
+                    } else {
+                        None
+                    };
+                    preview_segment(zone, *color, edge_hint)
+                }),
         );
     }
 
@@ -579,7 +615,7 @@ pub fn run(mut config: Config) -> Result<()> {
                     (&mode_colors, sampled)
                 }
             };
-            shared.update_preview(&preview_zones, preview_colors);
+            shared.update_preview(&config.mode, &preview_zones, preview_colors);
             let packet_len = encode_packet(&zones, colors, &mut packet)?;
             if shared.is_stopping() {
                 break;
@@ -1025,14 +1061,14 @@ fn preview_self_test() -> Result<()> {
             b: 60.0,
         },
     ];
-    shared.update_preview(&zones, &colors);
+    shared.update_preview("4D", &zones, &colors);
     if shared.preview_json() != "[]" {
         return Err(AppError::new(
             "runtime self-test: preview updated while disabled",
         ));
     }
     shared.set_preview_enabled(true);
-    shared.update_preview(&zones, &colors);
+    shared.update_preview("4D", &zones, &colors);
     let preview: Value = serde_json::from_str(&shared.preview_json())
         .map_err(|_| AppError::new("runtime self-test: preview serialization failed"))?;
     let values = preview
@@ -1066,6 +1102,77 @@ fn preview_self_test() -> Result<()> {
             "runtime self-test: disabled preview retained a published snapshot",
         ));
     }
+    let panels34: Vec<_> = (0..34)
+        .map(|i| {
+            let (x, y) = if i < 7 {
+                (300 - 50 * i as i64, 50)
+            } else if i < 12 {
+                (0, 50 + 50 * (i as i64 - 6))
+            } else if i < 21 {
+                (50 * (i as i64 - 11), 300)
+            } else if i < 27 {
+                (450, 300 - 50 * (i as i64 - 20))
+            } else {
+                (450 - 50 * (i as i64 - 26), 0)
+            };
+            crate::sampling::PanelPosition { id: i as u16, x, y }
+        })
+        .collect();
+    let zones34 = crate::sampling::make_zones(&panels34, &Config::default())?;
+    let preview_shared = Shared::new(Config::default());
+    preview_shared.set_preview_enabled(true);
+    let colors34 = vec![Color::default(); zones34.len()];
+    preview_shared.update_preview("4D", &zones34, &colors34);
+    let preview = preview_shared
+        .preview
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut edge_counts = [0; 4];
+    for segment in preview.iter() {
+        let edge = match segment.edge {
+            "top" => 0,
+            "right" => 1,
+            "bottom" => 2,
+            "left" => 3,
+            _ => unreachable!(),
+        };
+        edge_counts[edge] += 1;
+    }
+    if edge_counts != [9, 6, 13, 6] {
+        return Err(AppError::new(format!(
+            "runtime self-test: 34-panel preview edge counts are {edge_counts:?}, expected [9, 6, 13, 6]"
+        )));
+    }
+    drop(preview);
+
+    for depth in [5, 8, 20] {
+        let coarse = zones_for_mode("3D", &zones34, depth)?;
+        preview_shared.update_preview("3D", &coarse, &[Color::default(); 10]);
+        let published: Value = serde_json::from_str(&preview_shared.preview_json())
+            .map_err(|_| AppError::new("runtime self-test: 3D preview serialization failed"))?;
+        let segments = published.as_array().filter(|segments| segments.len() == 10)
+            .ok_or_else(|| AppError::new("runtime self-test: 3D preview zone count"))?;
+        let expected_edges = ["top", "top", "top", "right", "right",
+            "bottom", "bottom", "bottom", "left", "left"];
+        let expected_positions = [1.0 / 6.0, 0.5, 5.0 / 6.0, 0.25, 0.75,
+            1.0 / 6.0, 0.5, 5.0 / 6.0, 0.25, 0.75];
+        for (index, segment) in segments.iter().enumerate() {
+            let expected_span = if expected_edges[index] == "left"
+                || expected_edges[index] == "right" { 0.5 } else { 1.0 / 3.0 };
+            if segment["id"] != index as u64
+                || segment["edge"] != expected_edges[index]
+                || (segment["position"].as_f64().unwrap_or(-1.0)
+                    - expected_positions[index]).abs() > 0.0001
+                || (segment["span"].as_f64().unwrap_or(-1.0)
+                    - expected_span).abs() > 0.0001
+            {
+                return Err(AppError::new(format!(
+                    "runtime self-test: 3D zone {index} has wrong edge geometry at depth {depth}"
+                )));
+            }
+        }
+    }
+
     Ok(())
 }
 

@@ -137,7 +137,7 @@ pub fn make_zones(panels: &[PanelPosition], cfg: &Config) -> Result<Vec<Zone>> {
                     / ((max_x as i128 - min_x as i128) as f32)
             }
         };
-        let interval = |first: usize, end: usize, i: usize, vertical: bool| {
+        let interval = |first: usize, end: usize, i: usize, vertical: bool, edge: (f32, f32)| {
             let center = tangent(i, vertical);
             let a = if i == first {
                 center + (center - tangent(i + 1, vertical)) * 0.5
@@ -149,10 +149,21 @@ pub fn make_zones(panels: &[PanelPosition], cfg: &Config) -> Result<Vec<Zone>> {
             } else {
                 (center + tangent(i + 1, vertical)) * 0.5
             };
-            (a.min(b).max(0.0), a.max(b).min(1.0))
+            let first_center = tangent(first, vertical);
+            let last_center = tangent(end - 1, vertical);
+            let outer_a = first_center + (first_center - tangent(first + 1, vertical)) * 0.5;
+            let outer_b = last_center + (last_center - tangent(end - 2, vertical)) * 0.5;
+            let lower = outer_a.min(outer_b);
+            let upper = outer_a.max(outer_b);
+            let fit = |value: f32| {
+                (edge.0 + (value - lower) / (upper - lower) * (edge.1 - edge.0))
+                    .clamp(edge.0, edge.1)
+            };
+            let (a, b) = (fit(a), fit(b));
+            (a.min(b), a.max(b))
         };
         for i in 0..6 {
-            let (x0, x1) = interval(0, 6, i, false);
+            let (x0, x1) = interval(0, 6, i, false, (0.0, 0.5));
             zones[i] = Zone {
                 id: panels[i].id,
                 x0,
@@ -162,7 +173,7 @@ pub fn make_zones(panels: &[PanelPosition], cfg: &Config) -> Result<Vec<Zone>> {
             };
         }
         for i in 6..12 {
-            let (y0, y1) = interval(6, 12, i, true);
+            let (y0, y1) = interval(6, 12, i, true, (0.0, 1.0));
             zones[i] = Zone {
                 id: panels[i].id,
                 x0: 0.0,
@@ -172,7 +183,7 @@ pub fn make_zones(panels: &[PanelPosition], cfg: &Config) -> Result<Vec<Zone>> {
             };
         }
         for i in 12..21 {
-            let (x0, x1) = interval(12, 21, i, false);
+            let (x0, x1) = interval(12, 21, i, false, (0.0, 1.0));
             zones[i] = Zone {
                 id: panels[i].id,
                 x0,
@@ -182,7 +193,7 @@ pub fn make_zones(panels: &[PanelPosition], cfg: &Config) -> Result<Vec<Zone>> {
             };
         }
         for i in 21..27 {
-            let (y0, y1) = interval(21, 27, i, true);
+            let (y0, y1) = interval(21, 27, i, true, (0.0, 1.0));
             zones[i] = Zone {
                 id: panels[i].id,
                 x0: 1.0 - border,
@@ -192,7 +203,7 @@ pub fn make_zones(panels: &[PanelPosition], cfg: &Config) -> Result<Vec<Zone>> {
             };
         }
         for i in 27..34 {
-            let (x0, x1) = interval(27, 34, i, false);
+            let (x0, x1) = interval(27, 34, i, false, (0.5, 1.0));
             zones[i] = Zone {
                 id: panels[i].id,
                 x0,
@@ -966,6 +977,52 @@ pub fn self_test() -> Result<()> {
     {
         return Err(AppError::new("sampler 40-panel geometry self-test failed"));
     }
+    let panels34: Vec<_> = (0..34)
+        .map(|i| {
+            let (x, y) = if i < 7 {
+                (300 - 50 * i as i64, 50)
+            } else if i < 12 {
+                (0, 50 + 50 * (i as i64 - 6))
+            } else if i < 21 {
+                (50 * (i as i64 - 11), 300)
+            } else if i < 27 {
+                (450, 300 - 50 * (i as i64 - 20))
+            } else {
+                (450 - 50 * (i as i64 - 26), 0)
+            };
+            PanelPosition { id: i as u16, x, y }
+        })
+        .collect();
+    let zones34 = make_zones(&panels34, &cfg)?;
+    let mut bottom_zones = zones34[..6]
+        .iter()
+        .chain(&zones34[27..])
+        .collect::<Vec<_>>();
+    bottom_zones.sort_by(|a, b| a.x0.total_cmp(&b.x0));
+    let bottom_covers_edge = bottom_zones.len() == 13
+        && bottom_zones[0].x0.abs() < 0.001
+        && (bottom_zones[12].x1 - 1.0).abs() < 0.001
+        && bottom_zones
+            .windows(2)
+            .all(|pair| (pair[0].x1 - pair[1].x0).abs() < 0.001);
+    if zones34.len() != 34
+        || zones34
+            .iter()
+            .zip(&panels34)
+            .any(|(zone, panel)| zone.id != panel.id)
+        || !bottom_covers_edge
+        || zones34[6..12]
+            .iter()
+            .any(|zone| ((zone.y1 - zone.y0) - 1.0 / 6.0).abs() > 0.001)
+        || zones34[12..21]
+            .iter()
+            .any(|zone| ((zone.x1 - zone.x0) - 1.0 / 9.0).abs() > 0.001)
+        || zones34[21..27]
+            .iter()
+            .any(|zone| ((zone.y1 - zone.y0) - 1.0 / 6.0).abs() > 0.001)
+    {
+        return Err(AppError::new("sampler 34-panel geometry self-test failed"));
+    }
     let edge_zones = zones_for_mode("3D", &[], cfg.edge_depth)?;
     if edge_zones.len() != 10
         || edge_zones[0].y0 != 0.0
@@ -1410,12 +1467,32 @@ mod tests {
             })
             .collect();
         let zones34 = make_zones(&panels34, &cfg).unwrap();
+        let mut bottom_zones = zones34[..6]
+            .iter()
+            .chain(&zones34[27..])
+            .collect::<Vec<_>>();
+        bottom_zones.sort_by(|a, b| a.x0.total_cmp(&b.x0));
+        assert_eq!(bottom_zones.len(), 13);
+        assert!(bottom_zones[0].x0.abs() < 0.001);
+        assert!((bottom_zones[12].x1 - 1.0).abs() < 0.001);
+        assert!(bottom_zones
+            .windows(2)
+            .all(|pair| (pair[0].x1 - pair[1].x0).abs() < 0.001));
         assert_eq!(zones34[0].id, 0);
         assert_eq!(zones34[33].id, 33);
         assert!(zones34
             .iter()
             .zip(&panels34)
             .all(|(zone, panel)| zone.id == panel.id));
+        assert!(zones34[6..12]
+            .iter()
+            .all(|zone| ((zone.y1 - zone.y0) - 1.0 / 6.0).abs() < 0.001));
+        assert!(zones34[12..21]
+            .iter()
+            .all(|zone| ((zone.x1 - zone.x0) - 1.0 / 9.0).abs() < 0.001));
+        assert!(zones34[21..27]
+            .iter()
+            .all(|zone| ((zone.y1 - zone.y0) - 1.0 / 6.0).abs() < 0.001));
         assert!(zones34[21].x0 > 0.8 && zones34[27].y0 > 0.8);
     }
 

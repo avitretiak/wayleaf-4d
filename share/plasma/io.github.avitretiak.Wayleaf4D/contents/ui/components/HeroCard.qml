@@ -29,6 +29,7 @@ Rectangle {
     implicitWidth: 280 * u
     implicitHeight: 160 * u
     radius: 12 * u
+    antialiasing: true
     color: Qt.rgba(
         Kirigami.Theme.backgroundColor.r * 0.94 + Kirigami.Theme.textColor.r * 0.06,
         Kirigami.Theme.backgroundColor.g * 0.94 + Kirigami.Theme.textColor.g * 0.06,
@@ -62,8 +63,8 @@ Rectangle {
             mode: root.mode
             running: root.backend.running
             brightness: root.previewBrightness
-            x: index === 0 || index === 2 ? 22 * root.u : index === 1 ? root.width - 14 * root.u : 8 * root.u
-            y: index === 0 ? 8 * root.u : index === 2 ? root.height - 14 * root.u : 22 * root.u
+            x: index === 0 || index === 2 ? 22 * root.u : index === 1 ? root.width - 12 * root.u : 6 * root.u
+            y: index === 0 ? 6 * root.u : index === 2 ? root.height - 12 * root.u : 22 * root.u
             width: horizontal ? root.width - 44 * root.u : 6 * root.u
             height: horizontal ? 6 * root.u : root.height - 44 * root.u
             z: 2
