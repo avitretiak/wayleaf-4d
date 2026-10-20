@@ -16,6 +16,6 @@ pkgbase = wayleaf-4d
 	optdepends = gpu-screen-recorder: screen capture for 2D, 3D, and 4D modes
 	optdepends = avahi: mDNS device discovery
 	source = https://github.com/avitretiak/wayleaf-4d/releases/download/v0.4.0/wayleaf-4d-0.4.0.tar.gz
-	sha256sums = 56a5dbb4693b9ada6687b637e7209a9cc30dbe97ee58fbe2882d021cf7039324
+	sha256sums = 53b32dd9af666b178a2b23512510a7627e7c3a50ef9cd2fbbc27be36197c89c3
 
 pkgname = wayleaf-4d

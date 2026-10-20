@@ -24,7 +24,7 @@ source=(
   "https://github.com/avitretiak/wayleaf-4d/releases/download/v${pkgver}/wayleaf-4d-${pkgver}.tar.gz"
 )
 sha256sums=(
-  '56a5dbb4693b9ada6687b637e7209a9cc30dbe97ee58fbe2882d021cf7039324'
+  '53b32dd9af666b178a2b23512510a7627e7c3a50ef9cd2fbbc27be36197c89c3'
 )
 
 prepare() {
