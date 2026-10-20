@@ -81,8 +81,14 @@ impl LetterboxDetector {
             self.candidate = None;
         }
 
-        let x = detect_axis(data, stride, width, height, false).unwrap_or(self.current_x);
-        let y = detect_axis(data, stride, width, height, true).unwrap_or(self.current_y);
+        let mut x = detect_axis(data, stride, width, height, false).unwrap_or(self.current_x);
+        let mut y = detect_axis(data, stride, width, height, true).unwrap_or(self.current_y);
+        let changed = x != self.current_x || y != self.current_y;
+        let full_frame = x == AxisCrop::full(width) && y == AxisCrop::full(height);
+        if changed && !full_frame && !common_picture_aspect(x, y) {
+            x = self.current_x;
+            y = self.current_y;
+        }
         if x == self.current_x && y == self.current_y {
             self.candidate = None;
         } else {
@@ -175,6 +181,22 @@ fn detect_axis(
 
 fn pixel_tolerance(size: usize) -> usize {
     ((size as f32 * CROP_TOLERANCE_FRACTION).round() as usize).max(2)
+}
+
+fn common_picture_aspect(x: AxisCrop, y: AxisCrop) -> bool {
+    const FOUR_THREE: f32 = 4.0 / 3.0;
+    const FOUR_THREE_TOLERANCE: f32 = 0.04;
+    const WIDESCREEN_CINEMA_MIN: f32 = 1.80;
+    const WIDESCREEN_CINEMA_MAX: f32 = 2.45;
+
+    let width = x.end.saturating_sub(x.start);
+    let height = y.end.saturating_sub(y.start);
+    if width == 0 || height == 0 {
+        return false;
+    }
+    let aspect = width as f32 / height as f32;
+    (aspect - FOUR_THREE).abs() <= FOUR_THREE_TOLERANCE
+        || (WIDESCREEN_CINEMA_MIN..=WIDESCREEN_CINEMA_MAX).contains(&aspect)
 }
 
 fn near(a: AxisCrop, b: AxisCrop, tolerance: usize) -> bool {
@@ -298,21 +320,28 @@ mod tests {
     }
 
     #[test]
-    fn symmetric_bars_are_accepted_after_confidence() {
+    fn stable_dark_borders_with_unusual_active_aspect_do_not_crop() {
         let mut data = frame(160, 90, 0);
         paint(&mut data, 160, 0, 160, 14, 76, 160);
+        assert_eq!(settled(&data, 160, 90, 500), Rect::default());
+    }
+
+    #[test]
+    fn symmetric_bars_are_accepted_after_confidence() {
+        let mut data = frame(160, 90, 0);
+        paint(&mut data, 160, 0, 160, 11, 79, 160);
         let mut d = LetterboxDetector::new();
         assert_eq!(tick(&mut d, &data, 160, 90, 250), Rect::default());
         let rect = tick(&mut d, &data, 160, 90, 250);
-        assert!((rect.y0 - 14.0 / 90.0).abs() < 0.02);
-        assert!((rect.y1 - 76.0 / 90.0).abs() < 0.02);
+        assert!((rect.y0 - 11.0 / 90.0).abs() < 0.02);
+        assert!((rect.y1 - 79.0 / 90.0).abs() < 0.02);
     }
 
     #[test]
     fn transient_candidate_does_not_flip_immediately() {
         let mut d = LetterboxDetector::new();
         let mut bars = frame(160, 90, 0);
-        paint(&mut bars, 160, 0, 160, 14, 76, 160);
+        paint(&mut bars, 160, 0, 160, 11, 79, 160);
         assert_eq!(tick(&mut d, &bars, 160, 90, 100), Rect::default());
         let black = frame(160, 90, 0);
         assert_eq!(tick(&mut d, &black, 160, 90, 100), Rect::default());
@@ -322,10 +351,10 @@ mod tests {
     fn subtitles_in_black_bar_preserve_crop_and_dark_scene_holds() {
         let mut d = LetterboxDetector::new();
         let mut bars = frame(160, 90, 0);
-        paint(&mut bars, 160, 0, 160, 14, 76, 160);
+        paint(&mut bars, 160, 0, 160, 11, 79, 160);
         tick(&mut d, &bars, 160, 90, 300);
         let crop = tick(&mut d, &bars, 160, 90, 300);
-        assert!((crop.y0 - 14.0 / 90.0).abs() < 0.02);
+        assert!((crop.y0 - 11.0 / 90.0).abs() < 0.02);
 
         let mut subtitle = bars.clone();
         paint(&mut subtitle, 160, 60, 100, 80, 84, 255);
@@ -340,7 +369,7 @@ mod tests {
     fn bad_edge_frame_does_not_replace_stable_crop() {
         let mut d = LetterboxDetector::new();
         let mut bars = frame(160, 90, 0);
-        paint(&mut bars, 160, 0, 160, 14, 76, 160);
+        paint(&mut bars, 160, 0, 160, 11, 79, 160);
         tick(&mut d, &bars, 160, 90, 300);
         let crop = tick(&mut d, &bars, 160, 90, 300);
         let mut bad_edge = bars.clone();
@@ -352,16 +381,16 @@ mod tests {
     fn combined_bars_and_candidate_jitter_preserve_geometry() {
         let mut d = LetterboxDetector::new();
         let mut bars = frame(200, 120, 0);
-        paint(&mut bars, 200, 16, 184, 12, 108, 160);
+        paint(&mut bars, 200, 20, 180, 26, 94, 160);
         tick(&mut d, &bars, 200, 120, 300);
         let crop = tick(&mut d, &bars, 200, 120, 300);
-        assert!((crop.x0 - 16.0 / 200.0).abs() < 0.02);
-        assert!((crop.x1 - 184.0 / 200.0).abs() < 0.02);
-        assert!((crop.y0 - 12.0 / 120.0).abs() < 0.02);
-        assert!((crop.y1 - 108.0 / 120.0).abs() < 0.02);
+        assert!((crop.x0 - 20.0 / 200.0).abs() < 0.02);
+        assert!((crop.x1 - 180.0 / 200.0).abs() < 0.02);
+        assert!((crop.y0 - 26.0 / 120.0).abs() < 0.02);
+        assert!((crop.y1 - 94.0 / 120.0).abs() < 0.02);
 
         let mut jitter = frame(200, 120, 0);
-        paint(&mut jitter, 200, 18, 182, 12, 108, 160);
+        paint(&mut jitter, 200, 18, 182, 26, 94, 160);
         for _ in 0..4 {
             assert_eq!(tick(&mut d, &jitter, 200, 120, 100), crop);
         }
@@ -371,7 +400,7 @@ mod tests {
     fn dimension_change_discards_pending_candidate() {
         let mut d = LetterboxDetector::new();
         let mut bars = frame(160, 90, 0);
-        paint(&mut bars, 160, 0, 160, 14, 76, 160);
+        paint(&mut bars, 160, 0, 160, 11, 79, 160);
         assert_eq!(tick(&mut d, &bars, 160, 90, 300), Rect::default());
         let mut new_bars = frame(200, 120, 0);
         paint(&mut new_bars, 200, 0, 200, 18, 102, 160);
@@ -385,7 +414,7 @@ mod tests {
     fn credible_edges_eventually_uncrop() {
         let mut d = LetterboxDetector::new();
         let mut bars = frame(160, 90, 0);
-        paint(&mut bars, 160, 0, 160, 14, 76, 160);
+        paint(&mut bars, 160, 0, 160, 11, 79, 160);
         tick(&mut d, &bars, 160, 90, 300);
         let cropped = tick(&mut d, &bars, 160, 90, 300);
         assert_ne!(cropped, Rect::default());
@@ -397,9 +426,9 @@ mod tests {
     #[test]
     fn pillarbox_and_asymmetric_edges_are_handled_independently() {
         let mut pillars = frame(160, 90, 0);
-        paint(&mut pillars, 160, 14, 146, 0, 90, 160);
+        paint(&mut pillars, 160, 20, 140, 0, 90, 160);
         let rect = settled(&pillars, 160, 90, 300);
-        assert!((rect.x0 - 14.0 / 160.0).abs() < 0.02);
+        assert!((rect.x0 - 20.0 / 160.0).abs() < 0.02);
         assert_eq!(rect.y0, 0.0);
         let mut asymmetric = frame(160, 90, 0);
         paint(&mut asymmetric, 160, 0, 160, 5, 76, 160);
@@ -410,7 +439,7 @@ mod tests {
     fn dimensions_and_reset_return_to_full_frame() {
         let mut d = LetterboxDetector::new();
         let mut bars = frame(160, 90, 0);
-        paint(&mut bars, 160, 0, 160, 14, 76, 160);
+        paint(&mut bars, 160, 0, 160, 11, 79, 160);
         tick(&mut d, &bars, 160, 90, 300);
         assert_ne!(tick(&mut d, &bars, 160, 90, 300), Rect::default());
         assert_eq!(
@@ -429,7 +458,7 @@ mod tests {
         for interval in [1000, 200, 100] {
             let mut d = LetterboxDetector::new();
             let mut bars = frame(160, 90, 0);
-            paint(&mut bars, 160, 0, 160, 14, 76, 160);
+            paint(&mut bars, 160, 0, 160, 11, 79, 160);
             assert_eq!(tick(&mut d, &bars, 160, 90, interval), Rect::default());
             let required_observations = 500_u64.div_ceil(interval).max(2);
             for observation in 1..required_observations {

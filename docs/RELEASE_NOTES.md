@@ -2,6 +2,10 @@
 
 For installation and requirements, see the [README](../README.md). Current controls and configuration are documented in the [User Guide](USAGE.md).
 
+## 0.4.3 — 2026-10-20
+
+- Black-bar crops now require common active-picture aspect ratios, rejecting stable dark borders that imply an unusual crop.
+
 ## 0.4.2 — 2026-10-20
 
 - GPU capture accepts the `AB4H` half-float ABGR format produced by HDR/direct-scanout paths; its EGL DMA-BUF is imported and sampled as floating-point color, while PQ/HLG conversion remains metadata-driven.

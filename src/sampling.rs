@@ -1313,7 +1313,7 @@ pub fn self_test() -> Result<()> {
     screen_config.max_step = 255;
     let mut screen_frame = vec![0u8; stride * h];
     for y in 6..18 {
-        for x in 0..w {
+        for x in 8..24 {
             let pixel = y * stride + x * 4;
             screen_frame[pixel..pixel + 3].copy_from_slice(&[200, 0, 0]);
         }
@@ -1823,7 +1823,7 @@ mod tests {
         cfg.letterbox = true;
         let mut letterboxed = solid_frame(w, h, [0, 0, 0]);
         for y in 12..36 {
-            for x in 0..w {
+            for x in 16..48 {
                 let p = (y * w + x) * 4;
                 letterboxed[p..p + 3].copy_from_slice(&[80, 40, 20]);
             }
