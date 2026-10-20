@@ -2,6 +2,10 @@
 
 For installation and requirements, see the [README](../README.md). Current controls and configuration are documented in the [User Guide](USAGE.md).
 
+## 0.4.1 — 2026-10-20
+
+- Fine-tune slider tooltips now include the setting name, and label widths adapt to the popup, improving clarity without allowing long labels to crowd out the controls.
+
 ## 0.4.0 — 2026-10-20
 
 - Screen-derived RGB transitions now use proportional vector limiting with the existing exponential response, actual timing at normal 1–10 Hz, and bounded advancement after long capture gaps.

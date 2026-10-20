@@ -38,7 +38,7 @@ Item {
         return Number(value).toLocaleString(Qt.locale(), "f", decimals) + suffix
     }
 
-    readonly property string tooltipText: root.description + "\nRange " + root.formatted(root.minimum * root.displayMultiplier) + " to "
+    readonly property string tooltipText: root.label + "\n" + root.description + "\nRange " + root.formatted(root.minimum * root.displayMultiplier) + " to "
         + root.formatted(root.maximum * root.displayMultiplier) + " · Default "
         + root.formatted(root.defaultValue * root.displayMultiplier)
 
@@ -100,7 +100,7 @@ Item {
         Label {
             id: settingLabel
             text: root.label
-            Layout.preferredWidth: Kirigami.Units.gridUnit * 6.5
+            Layout.preferredWidth: Math.min(Kirigami.Units.gridUnit * 14, root.width * 0.28)
             Layout.minimumWidth: Kirigami.Units.gridUnit * 5
             elide: Text.ElideRight
             Accessible.name: root.label + (root.modified ? ", changed from default" : "")
