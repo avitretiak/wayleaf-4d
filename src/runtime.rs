@@ -337,7 +337,7 @@ fn settings_to_dbus(settings: &Value) -> WorkerResult<HashMap<String, OwnedValue
                     })?;
                 OwnedValue::from(number)
             }
-            "letterbox" | "midtone_lift" | "strict_black" | "reverse_direction" => {
+            "letterbox" | "midtone_lift" | "strict_black" | "spatial_blend" | "reverse_direction" => {
                 OwnedValue::from(value.as_bool().ok_or_else(|| {
                     WorkerError::Failed("worker setting has an invalid boolean".to_owned())
                 })?)
@@ -371,7 +371,7 @@ fn settings_from_dbus(settings: HashMap<String, OwnedValue>) -> WorkerResult<Map
             | "perimeter_offset" => {
                 Value::from(i32::try_from(value).map_err(|_| invalid())?)
             }
-            "letterbox" | "midtone_lift" | "strict_black" | "reverse_direction" => {
+            "letterbox" | "midtone_lift" | "strict_black" | "spatial_blend" | "reverse_direction" => {
                 Value::from(bool::try_from(value).map_err(|_| invalid())?)
             }
             "monitor" | "mode" | "static_color" | "start_corner" => {
@@ -443,12 +443,12 @@ fn mode_sampler_config(config: &Config) -> Config {
             sampling.black_threshold = 0.0;
             sampling.midtone_lift = false;
             sampling.strict_black = false;
+            sampling.spatial_blend = false;
         }
         "3D" => {
             sampling.letterbox = false;
             sampling.center_bleed = 0;
             sampling.feather_depth = 0;
-            sampling.black_threshold = 0.0;
             sampling.midtone_lift = false;
             sampling.strict_black = false;
         }
@@ -729,6 +729,65 @@ fn capture_latency_summary(samples: &mut [f64]) -> (f64, f64) {
     (median, p95)
 }
 
+#[derive(Default)]
+struct CaptureColorStats {
+    samples: u64,
+    red: u64,
+    green: u64,
+    blue: u64,
+    red_green: i64,
+    blue_green: i64,
+    spread: u64,
+    neutral_1: u64,
+    neutral_2: u64,
+}
+
+impl CaptureColorStats {
+    fn sample(data: &[u8], stride: usize, width: usize, height: usize) -> Self {
+        let mut stats = Self::default();
+        for y in (0..height).step_by(4) {
+            for x in (0..width).step_by(4) {
+                let offset = y * stride + x * 4;
+                let [red, green, blue] = [data[offset], data[offset + 1], data[offset + 2]];
+                let high = red.max(green).max(blue);
+                let low = red.min(green).min(blue);
+                let spread = u64::from(high - low);
+                stats.samples += 1;
+                stats.red += u64::from(red);
+                stats.green += u64::from(green);
+                stats.blue += u64::from(blue);
+                stats.red_green += i64::from(red) - i64::from(green);
+                stats.blue_green += i64::from(blue) - i64::from(green);
+                stats.spread += spread;
+                stats.neutral_1 += if spread <= 1 { 1 } else { 0 };
+                stats.neutral_2 += if spread <= 2 { 1 } else { 0 };
+            }
+        }
+        stats
+    }
+
+    fn means(&self) -> [f64; 3] {
+        let count = self.samples.max(1) as f64;
+        [
+            self.red as f64 / count,
+            self.green as f64 / count,
+            self.blue as f64 / count,
+        ]
+    }
+
+    fn mean_spread(&self) -> f64 {
+        self.spread as f64 / self.samples.max(1) as f64
+    }
+
+    fn neutral_percentages(&self) -> [f64; 2] {
+        let count = self.samples.max(1) as f64;
+        [
+            self.neutral_1 as f64 * 100.0 / count,
+            self.neutral_2 as f64 * 100.0 / count,
+        ]
+    }
+}
+
 pub fn capture_test(config: &Config) -> Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     register_signals(stop.clone())?;
@@ -815,12 +874,13 @@ pub fn capture_debug(config: &Config) -> Result<()> {
     let mut intervals = Vec::with_capacity(100);
     let mut scene_cuts = 0;
     let mut active_changes = 0;
+    let mut packet = [0u8; 322];
     let mut frames = 0_usize;
     let stdout = std::io::stdout();
     let mut output = std::io::BufWriter::new(stdout.lock());
     writeln!(
         output,
-        "# capture-debug: no UDP frames sent; each zone is controller-ID:target-RGB>output-RGB"
+        "# capture-debug: scanout-RGB statistics are post-GPU capture; each zone is controller-ID:target-RGB>smoothed-RGB>encoded-packet-RGB; no UDP frames sent"
     )
     .map_err(diagnostic_io)?;
     eprintln!("Sampling for 10 seconds; no desktop images or settings are saved");
@@ -851,6 +911,11 @@ pub fn capture_debug(config: &Config) -> Result<()> {
         )?;
         let colors = sampler.out();
         let raw = sampler.raw();
+        encode_packet(&zones, colors, &mut packet)?;
+        let frame_stats = CaptureColorStats::sample(frame.data, frame.stride, frame.width, frame.height);
+        let [mean_r, mean_g, mean_b] = frame_stats.means();
+        let mean_spread = frame_stats.mean_spread();
+        let [neutral_1, neutral_2] = frame_stats.neutral_percentages();
         let cut = sampler.scene_cut();
         let active = sampler.active();
         if cut {
@@ -863,8 +928,12 @@ pub fn capture_debug(config: &Config) -> Result<()> {
         frames += 1;
         write!(
             output,
-            "frame={frames:04} arrival_ms={:.1} cut={} active={:.3},{:.3},{:.3},{:.3} zones=",
+            "frame={frames:04} arrival_ms={:.1} capture={}x{} rgb={mean_r:.1},{mean_g:.1},{mean_b:.1} rg={:+.1} bg={:+.1} spread={mean_spread:.1} neutral1={neutral_1:.1}% neutral2={neutral_2:.1}% cut={} active={:.3},{:.3},{:.3},{:.3} zones=",
             started.elapsed().as_secs_f64() * 1000.0,
+            frame.width,
+            frame.height,
+            frame_stats.red_green as f64 / frame_stats.samples.max(1) as f64,
+            frame_stats.blue_green as f64 / frame_stats.samples.max(1) as f64,
             u8::from(cut),
             active.x0,
             active.x1,
@@ -877,16 +946,20 @@ pub fn capture_debug(config: &Config) -> Result<()> {
             if index > 0 {
                 write!(output, " ").map_err(diagnostic_io)?;
             }
+            let offset = 2 + index * 8;
             write!(
                 output,
-                "{}:{},{},{}>{},{},{}",
+                "{}:{},{},{}>{},{},{}>{},{},{}",
                 zone.id,
                 target.r.round() as i32,
                 target.g.round() as i32,
                 target.b.round() as i32,
                 output_color.r.round() as i32,
                 output_color.g.round() as i32,
-                output_color.b.round() as i32
+                output_color.b.round() as i32,
+                packet[offset + 2],
+                packet[offset + 3],
+                packet[offset + 4]
             )
             .map_err(diagnostic_io)?;
         }
@@ -962,6 +1035,7 @@ pub fn self_test() -> Result<()> {
         black_threshold: 0.05,
         midtone_lift: true,
         strict_black: true,
+        spatial_blend: true,
         ..default.clone()
     });
     if two_d.max_step != 1
@@ -972,6 +1046,7 @@ pub fn self_test() -> Result<()> {
         || two_d.black_threshold != 0.0
         || two_d.midtone_lift
         || two_d.strict_black
+        || two_d.spatial_blend
         || two_d.brightness != default.brightness
         || two_d.saturation_boost != default.saturation_boost
         || two_d.smooth != default.smooth
@@ -1000,7 +1075,7 @@ pub fn self_test() -> Result<()> {
         || three_d.letterbox
         || three_d.center_bleed != 0
         || three_d.feather_depth != 0
-        || three_d.black_threshold != 0.0
+        || three_d.black_threshold != three_d_input.black_threshold
         || three_d.midtone_lift
         || three_d.strict_black
         || three_d.brightness != three_d_input.brightness
@@ -1190,6 +1265,7 @@ fn settings_transaction_self_test() -> Result<()> {
         ("mode".to_owned(), mode),
         ("static_color".to_owned(), static_color),
         ("start_corner".to_owned(), OwnedValue::from(zbus::zvariant::Str::from("top_right"))),
+        ("spatial_blend".to_owned(), OwnedValue::from(true)),
         ("reverse_direction".to_owned(), OwnedValue::from(true)),
         ("perimeter_offset".to_owned(), OwnedValue::from(-39_i32)),
     ]);
@@ -1204,6 +1280,7 @@ fn settings_transaction_self_test() -> Result<()> {
     if returned.get("mode") != Some(&Value::String("2D".into()))
         || returned.get("static_color") != Some(&Value::String("#40a0ff".into()))
         || returned.get("start_corner") != Some(&Value::String("top_right".into()))
+        || returned.get("spatial_blend") != Some(&Value::Bool(true))
         || returned.get("reverse_direction") != Some(&Value::Bool(true))
         || returned.get("perimeter_offset") != Some(&Value::from(-39))
     {
@@ -1295,5 +1372,41 @@ struct RemoveFile(std::path::PathBuf);
 impl Drop for RemoveFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[cfg(test)]
+mod capture_debug_stats_tests {
+    use super::CaptureColorStats;
+
+    fn frame_with_color(color: [u8; 4]) -> Vec<u8> {
+        let mut frame = vec![0; 8 * 8 * 4];
+        for pixel in frame.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&color);
+        }
+        frame
+    }
+
+    #[test]
+    fn grayscale_capture_is_reported_as_neutral() {
+        let frame = frame_with_color([64, 64, 64, 255]);
+        let stats = CaptureColorStats::sample(&frame, 8 * 4, 8, 8);
+
+        assert_eq!(stats.samples, 4);
+        assert_eq!(stats.means(), [64.0, 64.0, 64.0]);
+        assert_eq!(stats.mean_spread(), 0.0);
+        assert_eq!(stats.neutral_percentages(), [100.0, 100.0]);
+    }
+
+    #[test]
+    fn magenta_capture_is_reported_as_channel_skew() {
+        let frame = frame_with_color([128, 64, 128, 255]);
+        let stats = CaptureColorStats::sample(&frame, 8 * 4, 8, 8);
+
+        assert_eq!(stats.means(), [128.0, 64.0, 128.0]);
+        assert_eq!(stats.red_green, 4 * 64);
+        assert_eq!(stats.blue_green, 4 * 64);
+        assert_eq!(stats.mean_spread(), 64.0);
+        assert_eq!(stats.neutral_percentages(), [0.0, 0.0]);
     }
 }

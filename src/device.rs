@@ -300,7 +300,10 @@ fn parse_selected_effect(body: &[u8]) -> Option<String> {
     };
     if selected.is_empty()
         || selected.chars().any(char::is_control)
-        || matches!(selected.as_str(), "*Static*" | "*Dynamic*" | "*Solid*")
+        || matches!(
+            selected.as_str(),
+            "*Static*" | "*Dynamic*" | "*Solid*" | "*ExtControl*"
+        )
         || selected.eq_ignore_ascii_case("extControl")
     {
         return None;
@@ -511,6 +514,8 @@ pub fn self_test() -> Result<()> {
             && parse_selected_effect(b"Favorite scene").as_deref() == Some("Favorite scene")
             && parse_selected_effect(b"\"*Static*\"").is_none()
             && parse_selected_effect(b"\"extControl\"").is_none()
+            && parse_selected_effect(b"\"*ExtControl*\"").is_none()
+            && parse_selected_effect(br#"{"select":"*ExtControl*"}"#).is_none()
             && parse_selected_effect(b"").is_none()
             && parse_selected_effect(b"{}").is_none(),
         "device self-test: restore only a saved selected effect",

@@ -30,7 +30,7 @@ shaders:
 	$(SHADER_COMPILER) --qt6 -o $(SHADER_DIR)/glow_ring.vert.qsb $(SHADER_DIR)/glow_ring.vert
 	$(SHADER_COMPILER) --qt6 -o $(SHADER_DIR)/glow_ring.frag.qsb $(SHADER_DIR)/glow_ring.frag
 
-$(WORKER): Makefile Cargo.toml Cargo.lock $(wildcard src/*.rs)
+$(WORKER): Makefile Cargo.toml Cargo.lock $(wildcard src/*.rs src/sampling/*.rs)
 	cargo build --release --locked --target-dir $(CARGO_TARGET_DIR)
 	cp $(CARGO_TARGET_DIR)/release/wayleaf-4d $@
 

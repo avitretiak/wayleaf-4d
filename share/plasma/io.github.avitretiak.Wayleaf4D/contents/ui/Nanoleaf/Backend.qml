@@ -12,22 +12,22 @@ Item {
     property var settings: ({
         mode: "4D",
         static_color: "#ffffff",
-        brightness: 1.5,
-        saturation_boost: 1.25,
+        brightness: 1.0,
+        saturation_boost: 1.0,
         fps: 10,
-        smooth: 0.35,
-        black_threshold: 0.01,
+        smooth: 0.25,
+        black_threshold: 0.05,
         max_step: 12,
         edge_depth: 8,
         center_bleed: 0,
-        peak_mix: 15,
+        peak_mix: 10,
         feather_depth: 5,
         letterbox: true,
         midtone_lift: false,
         strict_black: false,
         start_corner: "bottom_center",
-        reverse_direction: false,
-        perimeter_offset: 0
+        perimeter_offset: 0,
+        spatial_blend: false
     })
     property string status: "stopped"
     property bool running: false

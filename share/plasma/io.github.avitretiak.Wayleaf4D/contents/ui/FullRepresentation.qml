@@ -23,10 +23,10 @@ Item {
     readonly property var presetKeys: ["saturation_boost", "smooth", "max_step", "edge_depth", "feather_depth", "center_bleed", "peak_mix", "black_threshold", "fps"]
     readonly property var legacyPresetKeys: ["saturation_boost", "smooth", "max_step", "edge_depth", "center_bleed", "peak_mix", "fps"]
     readonly property var settingDefaults: ({
-        saturation_boost: 1.25, smooth: 0.35, max_step: 12, edge_depth: 8,
-        feather_depth: 5, center_bleed: 0, peak_mix: 15, black_threshold: 0.01,
+        brightness: 1.0, saturation_boost: 1.0, smooth: 0.25, max_step: 12, edge_depth: 8,
+        feather_depth: 5, center_bleed: 0, peak_mix: 10, black_threshold: 0.05,
         fps: 10, letterbox: true, midtone_lift: false, strict_black: false,
-        start_corner: "bottom_center", reverse_direction: false, perimeter_offset: 0
+        spatial_blend: false, start_corner: "bottom_center", reverse_direction: false, perimeter_offset: 0
     })
     readonly property var swatches: [
         { name: "Warm white", color: "#ffc58f" },
@@ -44,9 +44,9 @@ Item {
     readonly property real popupHeightLimit: Screen.height * 0.7
     readonly property real bodyHeightLimit: Math.max(Kirigami.Units.gridUnit * 5, Screen.height * 0.44)
     readonly property var fineTuneKeys: mode === "1D" ? []
-        : mode === "2D" ? ["saturation_boost", "smooth", "fps"]
-            : mode === "3D" ? ["saturation_boost", "smooth", "max_step", "edge_depth", "peak_mix", "fps"]
-                : ["saturation_boost", "smooth", "midtone_lift", "edge_depth", "feather_depth", "max_step", "center_bleed", "peak_mix", "black_threshold", "letterbox", "strict_black", "fps"]
+        : mode === "2D" ? ["saturation_boost", "smooth", "max_step", "fps"]
+            : mode === "3D" ? ["saturation_boost", "smooth", "max_step", "edge_depth", "peak_mix", "black_threshold", "fps", "spatial_blend"]
+                : ["saturation_boost", "smooth", "midtone_lift", "edge_depth", "feather_depth", "max_step", "center_bleed", "peak_mix", "black_threshold", "letterbox", "strict_black", "spatial_blend", "fps"]
     readonly property int fineTuneCount: fineTuneKeys.length
     readonly property var zoneColors: groupedZones()
 
@@ -62,20 +62,12 @@ Item {
             return ({ saturation_boost: 1.0, smooth: 0.25, max_step: 8, edge_depth: 8,
                 feather_depth: 5, center_bleed: 0, peak_mix: 5, black_threshold: 0.01, fps: 10 })
         if (name === "Balanced")
-            return ({ saturation_boost: 1.25, smooth: 0.35, max_step: 12, edge_depth: 8,
-                feather_depth: 5, center_bleed: 0, peak_mix: 15, black_threshold: 0.01, fps: 10 })
+            return ({ saturation_boost: 1.0, smooth: 0.25, max_step: 12, edge_depth: 8,
+                feather_depth: 5, center_bleed: 0, peak_mix: 10, black_threshold: 0.05, fps: 10 })
         if (name === "Vivid")
             return ({ saturation_boost: 1.9, smooth: 0.5, max_step: 18, edge_depth: 8,
                 feather_depth: 5, center_bleed: 0, peak_mix: 25, black_threshold: 0.01, fps: 10 })
         return null
-    }
-
-    function legacyPresetValues(name) {
-        const values = presetValues(name)
-        if (values) {
-            values.saturation_boost = name === "Subtle" ? 0.8 : name === "Balanced" ? 1.0 : 1.9
-        }
-        return values
     }
 
     function valuesFromSettings(settings) {
@@ -101,8 +93,21 @@ Item {
     }
 
     function sameLegacyPreset(values, preset) {
-        const expected = legacyPresetValues(preset)
-        return expected !== null && sameValues(values, expected)
+        if (preset === "Balanced") {
+            const previousExplicitBalanced = Object.assign({}, presetValues("Balanced"), {
+                saturation_boost: 1.25, smooth: 0.35, black_threshold: 0.07
+            })
+            const previousHistoricalBalanced = Object.assign({}, previousExplicitBalanced, {
+                saturation_boost: 1.0, black_threshold: 0.01
+            })
+            return sameValues(values, previousExplicitBalanced) || sameValues(values, previousHistoricalBalanced)
+        }
+        const expected = presetValues(preset)
+        if (expected === null)
+            return false
+        expected.saturation_boost = preset === "Subtle" ? 0.8 : 1.9
+        expected.black_threshold = 0.01
+        return sameValues(values, expected)
     }
 
 
@@ -259,8 +264,8 @@ Item {
         }
         saveCustomSettings(values)
         userTouchedSettings = true
-        selectedPreset = "Balanced"
-        configuration.selectedPreset = "Balanced"
+        selectedPreset = "Custom"
+        configuration.selectedPreset = "Custom"
         for (const key of fineTuneKeys)
             backend.setSetting(key, settingDefaults[key])
     }
@@ -576,16 +581,17 @@ Item {
                             }
                             SettingSlider {
                                 backend: root.backend; Layout.fillWidth: true; settingKey: "saturation_boost"
-                                label: "Saturation"; description: "Emphasizes saturated screen colors."
-                                minimum: 0; maximum: 3; decimals: 2; defaultValue: 1.25
+                                label: "Color enhancement"; description: "Weights saturated pixels more strongly; above 1 also boosts output saturation. Below 1 reduces weighting, not output saturation."
+                                minimum: 0; maximum: 3; decimals: 2; defaultValue: 1.0
                                 onValueEdited: (key, value) => root.noteFineTuneEdit(key, value)
                             }
                             SettingSlider {
                                 backend: root.backend; Layout.fillWidth: true; settingKey: "smooth"
-                                label: "Response"; description: "Higher values follow screen changes faster."
-                                minimum: 0.05; maximum: 1; decimals: 2; defaultValue: 0.35
+                                label: "Transition speed"; description: "Higher values follow screen changes faster; lower values transition more gradually."
+                                minimum: 0.05; maximum: 1; decimals: 2; defaultValue: 0.25
                                 onValueEdited: (key, value) => root.noteFineTuneEdit(key, value)
                             }
+
                             RowLayout {
                                 Layout.fillWidth: true
                                 visible: root.mode === "4D"
@@ -595,41 +601,42 @@ Item {
                                     checked: Boolean(root.backend.settings.midtone_lift)
                                     onClicked: root.backend.setSetting("midtone_lift", checked)
                                     Accessible.name: "Midtone lift"
-                                    Accessible.description: "Optional lift for dim and midtone colors."
+                                    Accessible.description: "Lifts dim and midtone colors."
                                 }
                             }
                         }
 
                         ColumnLayout {
                             Layout.fillWidth: true
-                            visible: root.mode === "3D" || root.mode === "4D"
+                            visible: root.mode !== "1D"
                             RowLayout {
                                 Layout.fillWidth: true
-                                Label { text: "Edges"; color: Kirigami.Theme.disabledTextColor; font: Kirigami.Theme.smallFont }
+                                Label { text: root.mode === "2D" ? "Transition speed" : "Edges"; color: Kirigami.Theme.disabledTextColor; font: Kirigami.Theme.smallFont }
                                 Item { Layout.fillWidth: true }
                                 ToolButton {
                                     text: "Reset"
-                                    visible: root.groupModified(root.mode === "4D" ? ["edge_depth", "feather_depth", "max_step"] : ["edge_depth", "max_step"])
+                                    visible: root.groupModified(root.mode === "4D" ? ["edge_depth", "feather_depth", "max_step"] : root.mode === "3D" ? ["edge_depth", "max_step"] : ["max_step"])
                                     enabled: !root.backend.busy && !root.backend.deviceBusy
-                                    onClicked: root.resetGroup(root.mode === "4D" ? ["edge_depth", "feather_depth", "max_step"] : ["edge_depth", "max_step"])
+                                    onClicked: root.resetGroup(root.mode === "4D" ? ["edge_depth", "feather_depth", "max_step"] : root.mode === "3D" ? ["edge_depth", "max_step"] : ["max_step"])
                                 }
                             }
                             SettingSlider {
                                 backend: root.backend; Layout.fillWidth: true; settingKey: "edge_depth"
-                                label: "Sample depth"; description: "How far inward from each edge to sample."
+                                visible: root.mode === "3D" || root.mode === "4D"
+                                label: "Edge sample depth"; description: "How far inward from each edge to sample."
                                 minimum: 5; maximum: 20; defaultValue: 8; suffix: "%"
                                 onValueEdited: (key, value) => root.noteFineTuneEdit(key, value)
                             }
                             SettingSlider {
                                 backend: root.backend; Layout.fillWidth: true; settingKey: "feather_depth"
                                 visible: root.mode === "4D"
-                                label: "Inward feather"; description: "Tapers edge sampling inward."
+                                label: "Edge feathering"; description: "Higher values taper edge sampling farther inward."
                                 minimum: 0; maximum: 20; defaultValue: 5; suffix: "%"
                                 onValueEdited: (key, value) => root.noteFineTuneEdit(key, value)
                             }
                             SettingSlider {
                                 backend: root.backend; Layout.fillWidth: true; settingKey: "max_step"
-                                label: "Max step"; description: "Limits each update's color change."
+                                label: "Max change per update"; description: "Sets the maximum RGB change each update can make; lower values slow transitions and black fades."
                                 minimum: 1; maximum: 255; defaultValue: 12
                                 onValueEdited: (key, value) => root.noteFineTuneEdit(key, value)
                             }
@@ -643,66 +650,84 @@ Item {
                                 Label { text: "Blend"; color: Kirigami.Theme.disabledTextColor; font: Kirigami.Theme.smallFont }
                                 Item { Layout.fillWidth: true }
                                 ToolButton {
+                                    objectName: "blend-reset-button"
                                     text: "Reset"
-                                    visible: root.groupModified(root.mode === "4D" ? ["center_bleed", "peak_mix"] : ["peak_mix"])
+                                    visible: root.groupModified(root.mode === "4D"
+                                        ? ["center_bleed", "peak_mix", "spatial_blend"]
+                                        : ["peak_mix", "spatial_blend"])
                                     enabled: !root.backend.busy && !root.backend.deviceBusy
-                                    onClicked: root.resetGroup(root.mode === "4D" ? ["center_bleed", "peak_mix"] : ["peak_mix"])
+                                    onClicked: root.resetGroup(root.mode === "4D"
+                                        ? ["center_bleed", "peak_mix", "spatial_blend"]
+                                        : ["peak_mix", "spatial_blend"])
                                 }
                             }
                             SettingSlider {
                                 backend: root.backend; Layout.fillWidth: true; settingKey: "center_bleed"
                                 visible: root.mode === "4D"
-                                label: "Center color"; description: "Blends the central picture color into edge zones."
+                                label: "Center influence"; description: "Higher values blend more central-picture color into edge zones."
                                 minimum: 0; maximum: 50; defaultValue: 0; suffix: "%"
                                 onValueEdited: (key, value) => root.noteFineTuneEdit(key, value)
                             }
+                            RowLayout {
+                                visible: root.mode === "3D" || root.mode === "4D"
+                                Label { text: "Neighbor blending"; Layout.fillWidth: true }
+                                Switch {
+                                    objectName: "setting-spatial_blend"
+                                    checked: Boolean(root.backend.settings.spatial_blend)
+                                    enabled: !root.backend.busy && !root.backend.deviceBusy && root.backend.status !== "starting" && root.backend.status !== "stopping"
+                                    onClicked: root.backend.setSetting("spatial_blend", checked)
+                                    Accessible.name: "Neighbor blending"
+                                    Accessible.description: "Blends neighboring zones by a fixed 20% using encoded RGB, while preserving zones whose sampled color is exact black."
+                                }
+                            }
                             SettingSlider {
                                 backend: root.backend; Layout.fillWidth: true; settingKey: "peak_mix"
-                                label: "Brightest pixel"; description: "Blends the brightest pixel from each zone."
-                                minimum: 0; maximum: 35; defaultValue: 15; suffix: "%"
+                                label: "Highlight influence"; description: "Higher values blend more of the brightest pixel from each zone."
+                                minimum: 0; maximum: 35; defaultValue: 10; suffix: "%"
                                 onValueEdited: (key, value) => root.noteFineTuneEdit(key, value)
                             }
                         }
 
                         ColumnLayout {
                             Layout.fillWidth: true
-                            visible: root.mode === "4D"
+                            visible: root.mode === "3D" || root.mode === "4D"
                             RowLayout {
                                 Layout.fillWidth: true
                                 Label { text: "Black handling"; color: Kirigami.Theme.disabledTextColor; font: Kirigami.Theme.smallFont }
                                 Item { Layout.fillWidth: true }
                                 ToolButton {
                                     text: "Reset"
-                                    visible: root.groupModified(["black_threshold", "letterbox", "strict_black"])
+                                    visible: root.groupModified(root.mode === "4D" ? ["black_threshold", "letterbox", "strict_black"] : ["black_threshold"])
                                     enabled: !root.backend.busy && !root.backend.deviceBusy
-                                    onClicked: root.resetGroup(["black_threshold", "letterbox", "strict_black"])
+                                    onClicked: root.resetGroup(root.mode === "4D" ? ["black_threshold", "letterbox", "strict_black"] : ["black_threshold"])
                                 }
                             }
                             SettingSlider {
                                 backend: root.backend; Layout.fillWidth: true; settingKey: "black_threshold"
-                                label: "Threshold"; description: "Suppresses near-black capture noise."
-                                minimum: 0; maximum: 0.1; decimals: 3; defaultValue: 0.01
+                                visible: root.mode === "3D" || root.mode === "4D"
+                                label: "Dark-scene cutoff"; description: "Higher values fade near-black samples more readily; wake requires a signal above 1.25× the cutoff."
+                                minimum: 0; maximum: 0.1; decimals: 3; defaultValue: 0.05
                                 onValueEdited: (key, value) => root.noteFineTuneEdit(key, value)
                             }
                             RowLayout {
-                                Layout.fillWidth: true
-                                Label { text: "Letterbox detection"; Layout.fillWidth: true }
+                                visible: root.mode === "4D"
+                                Label { text: "Ignore black bars"; Layout.fillWidth: true }
                                 Switch {
                                     objectName: "setting-letterbox"
                                     checked: Boolean(root.backend.settings.letterbox)
                                     onClicked: root.backend.setSetting("letterbox", checked)
-                                    Accessible.name: "Letterbox detection"
+                                    Accessible.name: "Ignore black bars"
                                     Accessible.description: "Detects black bars and samples the active picture."
                                 }
                             }
                             RowLayout {
-                                Layout.fillWidth: true
-                                Label { text: "Strict black"; Layout.fillWidth: true }
+                                visible: root.mode === "4D"
+                                Label { text: "Immediate black"; Layout.fillWidth: true }
                                 Switch {
                                     objectName: "setting-strict_black"
                                     checked: Boolean(root.backend.settings.strict_black)
                                     onClicked: root.backend.setSetting("strict_black", checked)
-                                    Accessible.name: "Strict black"
+                                    Accessible.name: "Immediate black"
                                     Accessible.description: "Sends exact black immediately instead of smoothing dark transitions."
                                 }
                             }
@@ -724,7 +749,7 @@ Item {
                             }
                             SettingSlider {
                                 backend: root.backend; Layout.fillWidth: true; settingKey: "fps"
-                                label: "Send rate"; description: "Samples and sends at up to 10 Hz."
+                                label: "Update rate"; description: "Higher values sample and send more often, up to 10 Hz."
                                 minimum: 1; maximum: 10; defaultValue: 10; suffix: " Hz"
                                 onValueEdited: (key, value) => root.noteFineTuneEdit(key, value)
                             }

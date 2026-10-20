@@ -38,6 +38,10 @@ Item {
         return Number(value).toLocaleString(Qt.locale(), "f", decimals) + suffix
     }
 
+    readonly property string tooltipText: root.description + "\nRange " + root.formatted(root.minimum * root.displayMultiplier) + " to "
+        + root.formatted(root.maximum * root.displayMultiplier) + " · Default "
+        + root.formatted(root.defaultValue * root.displayMultiplier)
+
     function commitStoredValue(value) {
         debounce.stop()
         pendingValueValid = false
@@ -100,9 +104,7 @@ Item {
             Layout.minimumWidth: Kirigami.Units.gridUnit * 5
             elide: Text.ElideRight
             Accessible.name: root.label + (root.modified ? ", changed from default" : "")
-            ToolTip.text: "Range " + root.formatted(root.minimum * root.displayMultiplier) + " to "
-                + root.formatted(root.maximum * root.displayMultiplier) + " · Default "
-                + root.formatted(root.defaultValue * root.displayMultiplier)
+            ToolTip.text: root.tooltipText
             ToolTip.visible: labelHover.hovered || activeFocus
             ToolTip.delay: 500
             HoverHandler { id: labelHover }
@@ -119,6 +121,7 @@ Item {
         Slider {
             id: slider
             objectName: "setting-" + root.settingKey + "-slider"
+            readonly property string tooltipText: root.tooltipText
             Layout.fillWidth: true
             from: root.low
             to: root.high
@@ -132,9 +135,7 @@ Item {
             Accessible.name: root.label
             Accessible.description: root.description + " Range " + root.formatted(root.minimum * root.displayMultiplier)
                 + " to " + root.formatted(root.maximum * root.displayMultiplier) + ". Use arrow keys or the mouse wheel to adjust. Double-click to reset."
-            ToolTip.text: "Range " + root.formatted(root.minimum * root.displayMultiplier) + " to "
-                + root.formatted(root.maximum * root.displayMultiplier) + " · Default "
-                + root.formatted(root.defaultValue * root.displayMultiplier)
+            ToolTip.text: slider.tooltipText
             ToolTip.visible: slider.hovered || slider.activeFocus
             ToolTip.delay: 500
             TapHandler { onDoubleTapped: root.resetToDefault() }

@@ -169,8 +169,10 @@ Rectangle {
         value: root.brightness * 50
         onMoved: root.backend.setSetting("brightness", Math.round(value) / 50)
         Accessible.name: "Brightness"
-        Accessible.description: "Scales the output brightness."
+        Accessible.description: "Scales Wayleaf's output RGB, not the controller's global brightness. 50% is neutral (1×); higher values amplify colors and may clip highlights."
         objectName: "control-brightness"
+        ToolTip.text: Accessible.description
+        ToolTip.visible: hovered
     }
     Label {
         x: root.width - 62 * root.u

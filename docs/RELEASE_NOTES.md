@@ -2,11 +2,25 @@
 
 For installation and requirements, see the [README](../README.md). Current controls and configuration are documented in the [User Guide](USAGE.md).
 
+## 0.4.0 (unreleased)
+
+- Screen-derived RGB transitions now use proportional vector limiting with the existing exponential response, actual timing at normal 1–10 Hz, and bounded advancement after long capture gaps.
+- Near-black confirmation and a higher wake threshold resist threshold flicker; confirmed black fades to exact off while respecting Max change per update. Immediate black remains the instant-off override.
+- Letterbox detection now requires persistent border/interior evidence, tolerates localized subtitle interference, and retains a confirmed crop through ambiguous dark frames.
+- Packet output holds only a shared intensity anchor and re-quantizes current RGB differences on every update. This fixes retained tint and rounding-boundary color flashes for near-neutral as well as exactly neutral input, while retaining float response state, resolvable color, gradual intensity changes, and exact black/white.
+- The `*ExtControl*` sentinel is not restored as a saved scene. Failure cleanup and service restart policy are otherwise unchanged; the stashed immediate-power-off policy is not applied.
+- New-install brightness is now 1.0. Balanced and new-install/fine-tune reset defaults use Color enhancement 1.0, Transition speed 0.25, and Dark-scene cutoff 0.05. Brightness stays independent of Looks and fine-tune resets; existing saved values are preserved. The cutoff reflects the user's observed red/yellow flicker on gray below 0.05, not a universal flicker guarantee or a new minimum. Subtle/Vivid retain their 0.01 cutoff.
+- Fine-tuning labels now describe each control's effect; configuration keys are unchanged. Confirmed-black packet output cannot brighten a channel by one RGB code while fading, including when Max change per update is lowered.
+
+- Added an optional Custom spatial-gradient toggle for 3D–4D. It blends neighboring zones using geometry; it defaults off and is independent of Looks and strip alignment. Brightest-pixel blend slider tooltip/reset now use the 10% default.
+
 ## 0.3.5
 
 - More options opens at its button anchor; Qt positions the menu against the available popup bounds.
 - Strip alignment is available in Device details, independently of Looks.
 - Custom fine-tuning controls are directly visible. Resetting all fine-tuning restores and selects Balanced defaults; Custom remains selectable.
+- Saturation weighting and final saturation enhancement are smoothly attenuated below 15% normalized luma for more restrained chroma in dark content.
+- Black-threshold gating is retained in 3D–4D (disabled in 2D); maximum step applies in 2D–4D, including across 2D scene cuts.
 - Preset saturation is 1.0 for Subtle, 1.25 for Balanced, and 1.9 for Vivid. Existing saved named preset values retain their selection unless reset.
 - Device details content now has consistent inset padding and spacing in its scroll area.
 - A disconnected selected monitor or missing KMS primary plane is treated as temporary; systemd retries the worker after 15 seconds, allowing capture to resume when the display returns without toggling sync.

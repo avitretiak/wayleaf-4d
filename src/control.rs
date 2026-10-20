@@ -1149,7 +1149,7 @@ fn value_to_owned(key: &str, value: &Value) -> std::result::Result<OwnedValue, S
                 .ok_or_else(invalid)?;
             Ok(OwnedValue::from(number))
         }
-        "letterbox" | "midtone_lift" | "strict_black" | "reverse_direction" => {
+        "letterbox" | "midtone_lift" | "strict_black" | "reverse_direction" | "spatial_blend" => {
             value.as_bool().map(OwnedValue::from).ok_or_else(invalid)
         }
         "monitor" | "mode" | "static_color" | "start_corner" => value

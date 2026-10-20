@@ -106,7 +106,7 @@ The worker returns these 19 settings through `GetSettings`. Ranges are enforced 
 | `brightness` | Float 0–2 | Software RGB multiplier; 1 is neutral |
 | `saturation_boost` | Float 0–3 | Saturation-weighted sampling and additional color boost |
 | `smooth` | Float 0.05–1 | Temporal response; higher follows changes faster |
-| `max_step` | Integer 1–255 | Time-normalized RGB-change limit |
+| `max_step` | Integer 1–255 | Time-normalized RGB-change ceiling applied proportionally to the whole transition |
 | `fps` | Integer 1–10 Hz | Capture/send rate; 1D sends at 10 Hz |
 | `edge_depth` | Integer 5–20% | Screen-edge sampling depth |
 | `feather_depth` | Integer 0–20% | Additional inward sampling with tapered weights |
@@ -128,8 +128,8 @@ Floating-point settings must be finite. Integer settings require integer values.
 Mode applicability:
 
 - **1D:** static color and brightness; no capture processing.
-- **2D:** brightness, saturation, smoothing, and frame rate.
-- **3D:** additionally edge depth, maximum step, brightest-pixel blend, and physical alignment.
+- **2D:** brightness, saturation, smoothing, maximum step, and frame rate.
+- **3D:** additionally edge depth, black threshold, brightest-pixel blend, and physical alignment.
 - **4D:** all sampling controls.
 
 Alignment is independent of Look presets and Custom data. White balance, tint, per-channel gains, and adjustable gamma are not Wayleaf settings.
@@ -140,9 +140,10 @@ Connection address, authentication token, and fallback UDP port are separate con
 
 Wayleaf's `saturation_boost` is not the controller's `sat` percentage:
 
-- Every value affects saturated-pixel weighting during averaging: `1 + saturation_boost * saturation²`.
+- Saturated-pixel weighting is `1 + saturation_boost * saturation² * low_light_strength`; the smoothstep strength rises from zero to one over encoded luma 0–0.15.
 - The final HSV saturation-boost stage applies only above 1.
 - Values below 1 reduce saturated-pixel weighting but do not directly desaturate the final color in HSV.
+- Output saturation enhancement uses `1 + (saturation_boost - 1) * low_light_strength` and remains a no-op at or below 1. Threshold confirmation/fading, vector limiting, and 8-bit output hysteresis are separate stages; they add no new D-Bus settings.
 
 Implementation: `src/sampling.rs`, `boost_saturation()` and pixel-weighting calculation. A temperature/tint or RGB-gain correction that preserves streaming would need to process RGB before packet encoding.
 

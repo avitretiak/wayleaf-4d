@@ -18,10 +18,10 @@ TestCase {
         feather_depth: 9, center_bleed: 17, peak_mix: 29, black_threshold: 0.023, fps: 7
     })
     readonly property var defaults: ({
-        mode: "4D", static_color: "#ffffff", brightness: 1.5,
-        saturation_boost: 1.25, smooth: 0.35, max_step: 12, edge_depth: 8,
-        feather_depth: 5, center_bleed: 0, peak_mix: 15, black_threshold: 0.01,
-        fps: 10, letterbox: true, midtone_lift: false, strict_black: false,
+        mode: "4D", static_color: "#ffffff", brightness: 1.0,
+        saturation_boost: 1.0, smooth: 0.25, max_step: 12, edge_depth: 8,
+        feather_depth: 5, center_bleed: 0, peak_mix: 10, black_threshold: 0.05,
+        fps: 10, letterbox: true, midtone_lift: false, strict_black: false, spatial_blend: false,
         start_corner: "bottom_center", reverse_direction: false, perimeter_offset: 0
     })
     function normalized(values) {
@@ -153,28 +153,39 @@ TestCase {
         verify(menuTopLeft.x < buttonBottomRight.x && menuBottomRight.x > buttonTopLeft.x,
             "Menu popup must stay horizontally anchored to the activated button")
         menu.close()
-
     }
+
     function verifyCustomControls(mode) {
         const keys = mode === "2D"
-            ? ["saturation_boost", "smooth", "fps"]
+            ? ["saturation_boost", "smooth", "max_step", "fps"]
             : mode === "3D"
-                ? ["saturation_boost", "smooth", "edge_depth", "max_step", "peak_mix", "fps"]
+                ? ["saturation_boost", "smooth", "edge_depth", "max_step", "peak_mix", "black_threshold", "spatial_blend", "fps"]
                 : ["saturation_boost", "smooth", "midtone_lift", "edge_depth", "feather_depth", "max_step",
-                    "center_bleed", "peak_mix", "black_threshold", "letterbox", "strict_black", "fps"]
+                    "center_bleed", "peak_mix", "black_threshold", "letterbox", "strict_black", "spatial_blend", "fps"]
         compare(popup.fineTuneCount, keys.length)
         for (const key of keys) {
-            const isSwitch = key === "midtone_lift" || key === "letterbox" || key === "strict_black"
+            const isSwitch = key === "midtone_lift" || key === "letterbox" || key === "strict_black" || key === "spatial_blend"
             const objectName = "setting-" + key + (isSwitch ? "" : "-slider")
             const control = findChild(popup, objectName)
             verify(control !== null && control.visible, mode + " Custom control not visible: " + objectName)
+        }
+        if (mode === "2D") {
+            verify(!findChild(popup, "setting-black_threshold-slider").visible)
+            verify(!findChild(popup, "setting-edge_depth-slider").visible)
+            verify(!findChild(popup, "setting-letterbox").visible)
+            verify(!findChild(popup, "setting-strict_black").visible)
+            verify(!findChild(popup, "setting-spatial_blend").visible)
+        } else if (mode === "3D") {
+            verify(findChild(popup, "setting-spatial_blend").visible)
+            verify(!findChild(popup, "setting-letterbox").visible)
+            verify(!findChild(popup, "setting-strict_black").visible)
         }
     }
 
     function test_custom_survives_balanced_and_popup_reopen() {
         verifyCustomControls("4D")
         selectLook(1)
-        compare(backendState.settings.peak_mix, 15)
+        compare(backendState.settings.peak_mix, 10)
         const snapshot = JSON.parse(savedState.customSettings)
         for (const key of Object.keys(customValues))
             verify(Math.abs(snapshot[key] - customValues[key]) < 0.000001, key)
@@ -192,11 +203,15 @@ TestCase {
 
     function test_each_preset_hides_fine_tuning_and_preserves_custom() {
         const names = ["Subtle", "Balanced", "Vivid"]
-        const expectedSaturation = [1.0, 1.25, 1.9]
+        const expectedSmooth = [0.25, 0.25, 0.5]
+        const expectedSaturation = [1.0, 1.0, 1.9]
+        const expectedBlackThreshold = [0.01, 0.05, 0.01]
         for (let i = 0; i < names.length; ++i) {
             selectLook(i)
             verify(!findChild(popup, "fine-tune-controls").visible, names[i])
             verify(Math.abs(backendState.settings.saturation_boost - expectedSaturation[i]) < 0.000001)
+            verify(Math.abs(backendState.settings.smooth - expectedSmooth[i]) < 0.000001)
+            compare(backendState.settings.black_threshold, expectedBlackThreshold[i])
             closePopup()
             openPopup()
             compare(popup.selectedPreset, names[i], "f32 values must still recognize " + names[i])
@@ -205,25 +220,32 @@ TestCase {
             verifyCustomValues()
         }
     }
+
     function test_legacy_named_preset_keeps_saved_values() {
         closePopup()
         savedState.selectedPreset = "Subtle"
         backendState.settings = normalized(Object.assign({}, defaults, {
-            saturation_boost: 0.8, smooth: 0.25, max_step: 8, peak_mix: 5
+            saturation_boost: 0.8, smooth: 0.25, max_step: 8, peak_mix: 5, black_threshold: 0.01
         }))
         openPopup()
         compare(popup.selectedPreset, "Subtle")
         compare(backendState.settings.saturation_boost, 0.8)
     }
-    function test_legacy_balanced_preset_keeps_saved_values() {
+    function test_balanced_saved_snapshots_keep_values() {
         closePopup()
         savedState.selectedPreset = "Balanced"
-        backendState.settings = normalized(Object.assign({}, defaults, {
-            saturation_boost: 1.0
-        }))
-        openPopup()
-        compare(popup.selectedPreset, "Balanced")
-        compare(backendState.settings.saturation_boost, 1.0)
+        const snapshots = [
+            { saturation_boost: 1.25, smooth: 0.35, black_threshold: 0.07 },
+            { saturation_boost: 1.0, smooth: 0.35, black_threshold: 0.01 }
+        ]
+        for (const snapshot of snapshots) {
+            backendState.settings = normalized(Object.assign({}, defaults, snapshot))
+            openPopup()
+            compare(popup.selectedPreset, "Balanced")
+            for (const key of Object.keys(snapshot))
+                compare(backendState.settings[key], snapshot[key], key)
+            closePopup()
+        }
     }
 
 
@@ -231,7 +253,7 @@ TestCase {
         closePopup()
         savedState.selectedPreset = ""
         backendState.settings = normalized(Object.assign({}, defaults, {
-            saturation_boost: 0.8, smooth: 0.25, max_step: 8, peak_mix: 5
+            saturation_boost: 0.8, smooth: 0.25, max_step: 8, peak_mix: 5, black_threshold: 0.01
         }))
         openPopup()
         compare(popup.selectedPreset, "Subtle")
@@ -279,31 +301,95 @@ TestCase {
         selectLook(1)
         selectLook(3)
         popup.resetAllFineTune()
-        compare(popup.selectedPreset, "Balanced")
-        verify(!findChild(popup, "fine-tune-controls").visible)
-        selectLook(3)
         compare(popup.selectedPreset, "Custom")
         verify(findChild(popup, "fine-tune-controls").visible)
         closePopup()
         openPopup()
         compare(popup.selectedPreset, "Custom")
-        compare(backendState.settings.peak_mix, 15)
+        verify(findChild(popup, "fine-tune-controls").visible)
+        compare(backendState.settings.peak_mix, 10)
+    }
+
+    function test_blend_group_reset_includes_spatial_gradient() {
+        backendState.settings = normalized(Object.assign({}, defaults, {
+            saturation_boost: 2.27,
+            peak_mix: 10,
+            spatial_blend: true
+        }))
+        compare(popup.selectedPreset, "Custom")
+        const scroll = findChild(popup, "body-controls-scroll")
+        const blendReset = findChild(popup, "blend-reset-button")
+        verify(blendReset !== null, "Blend Reset must appear for spatial gradient")
+        const position = blendReset.mapToItem(scroll.contentItem, 0, 0)
+        scroll.contentItem.contentY = Math.max(0, position.y - scroll.height + blendReset.height)
+        wait(0)
+        verify(blendReset.visible)
+        mouseClick(blendReset)
+        compare(backendState.settings.spatial_blend, false)
+        compare(backendState.settings.saturation_boost, 2.27)
+        compare(backendState.settings.peak_mix, 10)
+        compare(popup.selectedPreset, "Custom")
+        verify(!popup.settingModified("spatial_blend"))
     }
 
     function test_reset_uses_balanced_defaults() {
         selectLook(1)
         selectLook(3)
         popup.resetAllFineTune()
-        compare(backendState.settings.saturation_boost, 1.25)
-        compare(popup.selectedPreset, "Balanced")
-        verify(!findChild(popup, "fine-tune-controls").visible)
+        compare(backendState.settings.saturation_boost, 1.0)
+        compare(backendState.settings.smooth, 0.25)
+        compare(backendState.settings.black_threshold, 0.05)
+        compare(popup.selectedPreset, "Custom")
+        verify(findChild(popup, "fine-tune-controls").visible)
         closePopup()
         openPopup()
-        compare(popup.selectedPreset, "Balanced")
-        compare(backendState.settings.saturation_boost, 1.25)
-        verify(!findChild(popup, "fine-tune-controls").visible)
+        compare(popup.selectedPreset, "Custom")
+        compare(backendState.settings.saturation_boost, 1.0)
+        compare(backendState.settings.smooth, 0.25)
+        compare(backendState.settings.black_threshold, 0.05)
+        verify(findChild(popup, "fine-tune-controls").visible)
     }
 
+    function test_spatial_gradient_toggle_reset_and_look_independence() {
+        const toggle = findChild(popup, "setting-spatial_blend")
+        verify(toggle !== null && toggle.visible)
+        verify(toggle.Accessible.description.indexOf("20%") >= 0)
+        verify(toggle.Accessible.description.indexOf("exact black") >= 0)
+        const scroll = findChild(popup, "body-controls-scroll")
+        verify(scroll !== null)
+        const revealToggle = () => {
+            const position = toggle.mapToItem(scroll.contentItem, 0, toggle.height)
+            scroll.contentItem.contentY = Math.max(0, position.y - scroll.height)
+            wait(0)
+        }
+        revealToggle()
+        verify(toggle.mapToItem(scroll.contentItem, 0, 0).y >= scroll.contentItem.contentY)
+        verify(toggle.mapToItem(scroll.contentItem, 0, toggle.height).y <= scroll.contentItem.contentY + scroll.height)
+        toggle.forceActiveFocus()
+        keyClick(Qt.Key_Space)
+        tryCompare(backendState.settings, "spatial_blend", true)
+        popup.choosePreset("Balanced")
+        compare(backendState.settings.spatial_blend, true)
+        popup.choosePreset("Custom")
+        compare(backendState.settings.spatial_blend, true)
+        verify(popup.settingModified("spatial_blend"))
+        popup.resetGroup(["spatial_blend"])
+        compare(backendState.settings.spatial_blend, false)
+        popup.choosePreset("Balanced")
+        compare(backendState.settings.spatial_blend, false)
+        popup.choosePreset("Custom")
+        revealToggle()
+        toggle.forceActiveFocus()
+        keyClick(Qt.Key_Space)
+        tryCompare(backendState.settings, "spatial_blend", true)
+        popup.resetAllFineTune()
+        compare(backendState.settings.spatial_blend, false)
+        backendState.setSetting("mode", "1D")
+        verify(!toggle.visible)
+        compare(backendState.settings.spatial_blend, false)
+        backendState.setSetting("mode", "3D")
+        verify(toggle.visible)
+    }
     function test_custom_edit_survives_immediate_preset_switch() {
         selectLook(1)
         selectLook(3)
@@ -393,6 +479,16 @@ TestCase {
         compare(backendState.settings.reverse_direction, false)
         compare(backendState.settings.perimeter_offset, 0)
         compare(backendState.settings.brightness, brightness)
+        backendState.setSetting("brightness", 1.7)
+        compare(backendState.settings.brightness, 1.7)
+        popup.choosePreset("Subtle")
+        compare(backendState.settings.brightness, 1.7)
+        popup.choosePreset("Balanced")
+        compare(backendState.settings.brightness, 1.7)
+        popup.choosePreset("Vivid")
+        compare(backendState.settings.brightness, 1.7)
+        popup.choosePreset("Custom")
+        compare(backendState.settings.brightness, 1.7)
         for (const mode of ["1D", "2D", "3D"]) {
             backendState.setSetting("mode", mode)
             verify(!alignment.visible)

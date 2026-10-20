@@ -1,5 +1,11 @@
 use crate::{AppError, Config, Result};
 use std::time::Duration;
+mod letterbox;
+#[cfg(test)]
+mod temporal_tests;
+#[cfg(test)]
+mod spatial_tests;
+use letterbox::LetterboxDetector;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Color {
@@ -36,6 +42,25 @@ pub struct Zone {
     pub x1: f32,
     pub y0: f32,
     pub y1: f32,
+}
+
+fn spatial_weight_table(zones: &[Zone]) -> Vec<Vec<(usize, f32)>> {
+    let mut table = Vec::with_capacity(zones.len());
+    for (index, zone) in zones.iter().enumerate() {
+        let mut neighbors = Vec::new();
+        for (other_index, other) in zones.iter().enumerate() {
+            if index == other_index { continue; }
+            let dx = (zone.x0 + zone.x1 - other.x0 - other.x1) * 0.5;
+            let dy = (zone.y0 + zone.y1 - other.y0 - other.y1) * 0.5;
+            let distance_squared = dx * dx + dy * dy;
+            if distance_squared < 0.35 * 0.35 {
+                let distance = distance_squared.sqrt();
+                neighbors.push((other_index, (1.0 - distance / 0.35).powi(2)));
+            }
+        }
+        table.push(neighbors);
+    }
+    table
 }
 
 #[derive(Clone, Debug)]
@@ -408,6 +433,14 @@ fn pixel(data: &[u8], stride: usize, x: usize, y: usize) -> Color {
 fn luma(c: Color) -> f32 {
     (0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b) / 255.0
 }
+// Chroma is less reliable in dim captures; taper saturation weighting/boost below 15% luma.
+const LOW_LIGHT_CHROMA_LUMA: f32 = 0.15;
+
+#[inline]
+fn low_light_chroma_strength(luminance: f32) -> f32 {
+    let t = (luminance / LOW_LIGHT_CHROMA_LUMA).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
 
 #[inline]
 fn saturation(c: Color) -> f32 {
@@ -500,73 +533,26 @@ fn boost_saturation(c: Color, factor: f32) -> Color {
     }
 }
 
-fn row_luma(data: &[u8], stride: usize, width: usize, y: usize) -> f32 {
-    let mut sum = 0u32;
-    let mut n = 0u32;
-    for x in (0..width).step_by(4) {
-        sum += (luma(pixel(data, stride, x, y)) * 255.0) as u32;
-        n += 1;
-    }
-    if n != 0 {
-        sum as f32 / n as f32
-    } else {
-        0.0
-    }
-}
 
-fn col_luma(data: &[u8], stride: usize, height: usize, x: usize) -> f32 {
-    let mut sum = 0u32;
-    let mut n = 0u32;
-    for y in (0..height).step_by(4) {
-        sum += (luma(pixel(data, stride, x, y)) * 255.0) as u32;
-        n += 1;
-    }
-    if n != 0 {
-        sum as f32 / n as f32
+#[inline]
+fn packet_triplet(channels: [f32; 3], previous: [u8; 3]) -> [u8; 3] {
+    let channels = channels.map(|value| value.clamp(0.0, 255.0));
+    let peak = channels[0].max(channels[1]).max(channels[2]);
+    let previous_peak = previous[0].max(previous[1]).max(previous[2]);
+    // Hold only the shared intensity anchor, never the preceding chroma.
+    let packet_peak = if peak == 0.0 || peak == 255.0 || (peak - previous_peak as f32).abs() > 0.75
+    {
+        peak.round() as u8
     } else {
-        0.0
-    }
-}
-
-fn detect_active_rect(data: &[u8], stride: usize, width: usize, height: usize) -> Rect {
-    let mut top = 0usize;
-    let mut bottom = 0usize;
-    let mut left = 0usize;
-    let mut right = 0usize;
-    for y in 0..height / 3 {
-        if row_luma(data, stride, width, y) > 12.0 {
-            break;
+        previous_peak
+    };
+    channels.map(|value| {
+        if value == 0.0 || value == 255.0 {
+            value as u8
+        } else {
+            packet_peak.saturating_sub((peak - value).round() as u8)
         }
-        top = y + 1;
-    }
-    for i in 0..height / 3 {
-        if row_luma(data, stride, width, height - 1 - i) > 12.0 {
-            break;
-        }
-        bottom = i + 1;
-    }
-    for x in 0..width / 3 {
-        if col_luma(data, stride, height, x) > 12.0 {
-            break;
-        }
-        left = x + 1;
-    }
-    for i in 0..width / 3 {
-        if col_luma(data, stride, height, width - 1 - i) > 12.0 {
-            break;
-        }
-        right = i + 1;
-    }
-    let mut rect = Rect::default();
-    if top >= 4 && top.abs_diff(bottom) <= 6 {
-        rect.y0 = top as f32 / height as f32;
-        rect.y1 = (height - bottom) as f32 / height as f32;
-    }
-    if left >= 4 && left.abs_diff(right) <= 6 {
-        rect.x0 = left as f32 / width as f32;
-        rect.x1 = (width - right) as f32 / width as f32;
-    }
-    rect
+    })
 }
 
 #[inline]
@@ -574,31 +560,58 @@ fn coord(value: f32) -> usize {
     value as usize
 }
 
+#[derive(Clone, Copy, Default)]
+struct ZoneTemporalState {
+    packet: [u8; 3],
+    black_elapsed: f32,
+    confirmed_black: bool,
+    fade_start: Color,
+    fade_elapsed: f32,
+    fade_duration: f32,
+    fade_max_step: i32,
+}
+
 pub struct Sampler {
     zones: Vec<Zone>,
     previous: Vec<Color>,
     out: Vec<Color>,
     raw: Vec<Color>,
+    temporal: Vec<ZoneTemporalState>,
+    spatial_weights: Vec<Vec<(usize, f32)>>,
+    spatial_enabled: bool,
     active: Rect,
-    letterbox_enabled: bool,
+    detector: LetterboxDetector,
     frames: u64,
     global: Color,
     scene_cut: bool,
+    dimensions: (usize, usize),
 }
 
 impl Sampler {
+    fn set_spatial_blend(&mut self, enabled: bool) {
+        if self.spatial_enabled != enabled {
+            self.spatial_enabled = enabled;
+            for state in &mut self.temporal {
+                state.packet = [0; 3];
+            }
+        }
+    }
     pub fn new(zones: Vec<Zone>) -> Self {
         let n = zones.len();
         Self {
+            spatial_weights: spatial_weight_table(&zones),
+            spatial_enabled: false,
             zones,
             previous: vec![Color::default(); n],
             out: vec![Color::default(); n],
             raw: vec![Color::default(); n],
+            temporal: vec![ZoneTemporalState::default(); n],
             active: Rect::default(),
+            detector: LetterboxDetector::new(),
             frames: 0,
             global: Color::default(),
             scene_cut: false,
-            letterbox_enabled: false,
+            dimensions: (0, 0),
         }
     }
 
@@ -607,14 +620,20 @@ impl Sampler {
             || next.iter().zip(&self.zones).any(|(a, b)| {
                 a.id != b.id || a.x0 != b.x0 || a.x1 != b.x1 || a.y0 != b.y0 || a.y1 != b.y1
             });
-        self.zones = next;
         if changed {
-            self.previous.resize(self.zones.len(), Color::default());
-            self.out.resize(self.zones.len(), Color::default());
-            self.raw.resize(self.zones.len(), Color::default());
+            self.zones = next;
+            self.spatial_weights = spatial_weight_table(&self.zones);
+            let n = self.zones.len();
+            self.previous.resize(n, Color::default());
+            self.out.resize(n, Color::default());
+            self.raw.resize(n, Color::default());
+            self.temporal.resize(n, ZoneTemporalState::default());
             self.previous.fill(Color::default());
             self.out.fill(Color::default());
             self.raw.fill(Color::default());
+            self.temporal.fill(ZoneTemporalState::default());
+        } else {
+            self.zones = next;
         }
     }
 
@@ -653,7 +672,7 @@ impl Sampler {
         cfg: &Config,
         elapsed: Duration,
     ) -> Result<&[Color]> {
-        self.sample_inner(data, stride, width, height, cfg, elapsed, true, true)
+        self.sample_inner(data, stride, width, height, cfg, elapsed, true)
     }
 
     pub fn sample_full_screen(
@@ -665,7 +684,7 @@ impl Sampler {
         cfg: &Config,
         elapsed: Duration,
     ) -> Result<&[Color]> {
-        self.sample_inner(data, stride, width, height, cfg, elapsed, false, false)
+        self.sample_inner(data, stride, width, height, cfg, elapsed, false)
     }
 
     fn sample_inner(
@@ -677,8 +696,10 @@ impl Sampler {
         cfg: &Config,
         elapsed: Duration,
         use_letterbox: bool,
-        use_max_step: bool,
     ) -> Result<&[Color]> {
+        self.set_spatial_blend(
+            cfg.spatial_blend && matches!(cfg.mode.as_str(), "3D" | "4D"),
+        );
         let row_bytes = width
             .checked_mul(4)
             .ok_or_else(|| AppError::new("capture dimensions overflow"))?;
@@ -693,17 +714,25 @@ impl Sampler {
         {
             return Err(AppError::new("invalid capture buffer dimensions or stride"));
         }
+        let expected = Duration::from_secs_f32(1.0 / cfg.fps.max(1) as f32);
+        let gap_limit = expected.saturating_mul(2).max(Duration::from_millis(500));
+        let effective_elapsed = if elapsed > gap_limit {
+            elapsed.min(Duration::from_millis(100))
+        } else {
+            elapsed
+        };
+        if self.dimensions != (width, height) {
+            self.dimensions = (width, height);
+            self.detector.reset();
+            self.active = Rect::default();
+        }
         if use_letterbox && cfg.letterbox {
-            if self.frames == 0
-                || !self.letterbox_enabled
-                || self.frames.wrapping_add(1).is_multiple_of(15)
-            {
-                self.active = detect_active_rect(data, stride, width, height);
-            }
-            self.letterbox_enabled = true;
+            self.active = self
+                .detector
+                .update(data, stride, width, height, effective_elapsed);
         } else {
             self.active = Rect::default();
-            self.letterbox_enabled = false;
+            self.detector.reset();
         }
         self.frames = self.frames.wrapping_add(1);
 
@@ -761,17 +790,9 @@ impl Sampler {
         self.global = current_global;
 
         let feather = cfg.feather_depth as f32 / 100.0;
-        let elapsed = elapsed.as_secs_f32().min(0.1);
-        let alpha = if self.scene_cut {
-            1.0
-        } else {
-            1.0 - (1.0 - cfg.smooth).powf(elapsed * 30.0)
-        };
-        let step = if use_max_step {
-            cfg.max_step as f32 * elapsed * 30.0
-        } else {
-            255.0
-        };
+        let elapsed = effective_elapsed.as_secs_f32();
+        let alpha = 1.0 - (1.0 - cfg.smooth).powf(elapsed * 30.0);
+        let step = cfg.max_step as f32 * elapsed * 30.0;
         let peak_mix = cfg.peak_mix as f32 / 100.0;
         let center_bleed = cfg.center_bleed as f32 / 100.0;
         let sat_boost = cfg.saturation_boost;
@@ -842,7 +863,8 @@ impl Sampler {
                     let c = pixel(data, stride, x, y);
                     let sat = saturation(c);
                     let lum = luma(c);
-                    let weight = (1.0 + sat_boost * sat * sat) * spatial;
+                    let chroma_weight = low_light_chroma_strength(lum);
+                    let weight = (1.0 + sat_boost * sat * sat * chroma_weight) * spatial;
                     r += (c.r * weight) as f64;
                     g += (c.g * weight) as f64;
                     b += (c.b * weight) as f64;
@@ -871,12 +893,12 @@ impl Sampler {
                 target = mix(target, peak, peak_mix);
             }
             target = mix(target, center, center_bleed);
+            let gate_luma = luma(target);
             if threshold > 0.0 {
-                let lum = luma(target);
-                if lum <= threshold {
+                if gate_luma <= threshold {
                     target = Color::default();
                 } else {
-                    let ramp = ((lum - threshold) / threshold).clamp(0.0, 1.0);
+                    let ramp = ((gate_luma - threshold) / threshold).clamp(0.0, 1.0);
                     target = Color {
                         r: target.r * ramp,
                         g: target.g * ramp,
@@ -884,7 +906,9 @@ impl Sampler {
                     };
                 }
             }
-            target = boost_saturation(target, sat_boost);
+            let effective_sat_boost =
+                1.0 + (sat_boost - 1.0) * low_light_chroma_strength(luma(target));
+            target = boost_saturation(target, effective_sat_boost);
             if midtone_lift {
                 let lift = |mut x: f32| {
                     x /= 255.0;
@@ -902,23 +926,167 @@ impl Sampler {
                 b: (target.b * brightness).clamp(0.0, 255.0),
             };
             self.raw[i] = target;
-            if strict_black && target.r == 0.0 && target.g == 0.0 && target.b == 0.0 {
+            let state = &mut self.temporal[i];
+            let zero_target = target.r == 0.0 && target.g == 0.0 && target.b == 0.0;
+            if strict_black && zero_target {
                 self.previous[i] = Color::default();
                 self.out[i] = Color::default();
+                state.packet = [0; 3];
+                state.black_elapsed = 0.0;
+                state.confirmed_black = false;
+                state.fade_start = Color::default();
+                state.fade_elapsed = 0.0;
+                state.fade_duration = 0.0;
                 continue;
             }
+            let near_black = threshold > 0.0 && gate_luma <= threshold;
+            let exit_black = threshold > 0.0 && gate_luma > threshold * 1.25;
+            let immediate_zero = zero_target && (threshold == 0.0 || gate_luma > threshold);
+            if immediate_zero {
+                state.black_elapsed = 0.0;
+                if !state.confirmed_black {
+                    state.confirmed_black = true;
+                    state.fade_start = self.previous[i];
+                    state.fade_elapsed = 0.0;
+                    let max_rgb = state
+                        .fade_start
+                        .r
+                        .max(state.fade_start.g)
+                        .max(state.fade_start.b);
+                    state.fade_duration = 0.3f32.max(max_rgb / (cfg.max_step.max(1) as f32 * 30.0));
+                    state.fade_max_step = cfg.max_step;
+                }
+            } else if near_black {
+                state.black_elapsed += elapsed;
+                if state.black_elapsed >= 0.15 && !state.confirmed_black {
+                    state.confirmed_black = true;
+                    state.fade_start = self.previous[i];
+                    state.fade_elapsed = 0.0;
+                    let max_rgb = state
+                        .fade_start
+                        .r
+                        .max(state.fade_start.g)
+                        .max(state.fade_start.b);
+                    state.fade_duration = 0.3f32.max(max_rgb / (cfg.max_step.max(1) as f32 * 30.0));
+                    state.fade_max_step = cfg.max_step;
+                }
+            } else if !zero_target && (threshold == 0.0 || exit_black) {
+                state.black_elapsed = 0.0;
+                state.confirmed_black = false;
+                state.fade_elapsed = 0.0;
+                state.fade_duration = 0.0;
+                state.fade_max_step = 0;
+            } else if !state.confirmed_black {
+                state.black_elapsed = 0.0;
+            }
             let prev = self.previous[i];
-            let candidate = mix(prev, target, alpha);
-            let bounded = |a: f32, b: f32| a + (b - a).clamp(-step, step);
-            let next = Color {
-                r: bounded(prev.r, candidate.r),
-                g: bounded(prev.g, candidate.g),
-                b: bounded(prev.b, candidate.b),
-            };
-            self.previous[i] = next;
-            self.out[i] = next;
+            if state.confirmed_black {
+                if cfg.max_step < state.fade_max_step {
+                    state.fade_start = self.previous[i];
+                    state.fade_elapsed = 0.0;
+                    let max_rgb = state
+                        .fade_start
+                        .r
+                        .max(state.fade_start.g)
+                        .max(state.fade_start.b);
+                    state.fade_duration = 0.3f32.max(max_rgb / (cfg.max_step.max(1) as f32 * 30.0));
+                    state.fade_max_step = cfg.max_step;
+                }
+                state.fade_elapsed += elapsed;
+                let t = (state.fade_elapsed / state.fade_duration).clamp(0.0, 1.0);
+                self.previous[i] = Color {
+                    r: state.fade_start.r * (1.0 - t),
+                    g: state.fade_start.g * (1.0 - t),
+                    b: state.fade_start.b * (1.0 - t),
+                };
+                if t >= 1.0 {
+                    self.previous[i] = Color::default();
+                }
+            } else if near_black {
+                // Hold the previous float color during entry confirmation.
+            } else {
+                let delta = Color {
+                    r: alpha * (target.r - prev.r),
+                    g: alpha * (target.g - prev.g),
+                    b: alpha * (target.b - prev.b),
+                };
+                let max_delta = delta.r.abs().max(delta.g.abs()).max(delta.b.abs());
+                let scale = if max_delta > step && max_delta > 0.0 {
+                    step / max_delta
+                } else {
+                    1.0
+                };
+                let mut response = Color {
+                    r: prev.r + delta.r * scale,
+                    g: prev.g + delta.g * scale,
+                    b: prev.b + delta.b * scale,
+                };
+                let movement = (target.r - prev.r)
+                    .abs()
+                    .max((target.g - prev.g).abs())
+                    .max((target.b - prev.b).abs());
+                let target_scale = target
+                    .r
+                    .abs()
+                    .max(target.g.abs())
+                    .max(target.b.abs())
+                    .max(1.0);
+                if elapsed > 0.0
+                    && movement <= 4.0 * f32::EPSILON * target_scale
+                    && movement <= step
+                {
+                    response = target;
+                }
+                self.previous[i] = response;
+            }
         }
+        self.write_output();
         Ok(&self.out)
+    }
+
+    fn write_output(&mut self) {
+        for i in 0..self.zones.len() {
+            let source = self.previous[i];
+            let output = if self.spatial_enabled
+                && (source.r != 0.0 || source.g != 0.0 || source.b != 0.0)
+            {
+                let mut weighted = Color::default();
+                let mut total_weight = 0.0;
+                for &(neighbor, weight) in &self.spatial_weights[i] {
+                    let color = self.previous[neighbor];
+                    weighted.r += color.r * weight;
+                    weighted.g += color.g * weight;
+                    weighted.b += color.b * weight;
+                    total_weight += weight;
+                }
+                if total_weight > 0.0 {
+                    mix(source, Color {
+                        r: weighted.r / total_weight,
+                        g: weighted.g / total_weight,
+                        b: weighted.b / total_weight,
+                    }, 0.2)
+                } else {
+                    source
+                }
+            } else {
+                source
+            };
+            let mut packet = packet_triplet(
+                [output.r, output.g, output.b],
+                self.temporal[i].packet,
+            );
+            if self.temporal[i].confirmed_black {
+                for (channel, previous) in packet.iter_mut().zip(self.temporal[i].packet) {
+                    *channel = (*channel).min(previous);
+                }
+            }
+            self.temporal[i].packet = packet;
+            self.out[i] = Color {
+                r: packet[0] as f32,
+                g: packet[1] as f32,
+                b: packet[2] as f32,
+            };
+        }
     }
 }
 
@@ -1170,18 +1338,21 @@ pub fn self_test() -> Result<()> {
         &low_step_config,
         Duration::from_millis(34),
     )?[0];
-    if full != low_step {
-        return Err(AppError::new("2D applied hidden max-step filtering"));
+    if full == low_step || low_step.r <= 0.0 || low_step.r >= full.r * 0.1 {
+        return Err(AppError::new("2D maximum-step filtering self-test failed"));
     }
     let mut cropped_sampler = Sampler::new(full_zone);
-    let cropped = cropped_sampler.sample(
-        &screen_frame,
-        stride,
-        w,
-        h,
-        &screen_config,
-        Duration::from_millis(34),
-    )?[0];
+    for _ in 0..5 {
+        cropped_sampler.sample(
+            &screen_frame,
+            stride,
+            w,
+            h,
+            &screen_config,
+            Duration::from_millis(100),
+        )?;
+    }
+    let cropped = cropped_sampler.out()[0];
     if full.r <= 0.0 || full.r >= cropped.r * 0.75 {
         return Err(AppError::new("2D full-screen sampling self-test failed"));
     }
@@ -1374,7 +1545,7 @@ pub fn self_test() -> Result<()> {
     )?[0];
     let expected_step =
         temporal_cfg.max_step as f32 * Duration::from_millis(34).as_secs_f32().min(0.1) * 30.0;
-    if (stepped.r - expected_step).abs() > 0.001 {
+    if (stepped.r - expected_step).abs() > 0.5 {
         return Err(AppError::new("sampler temporal step self-test failed"));
     }
     let invalid = temporal.sample(
@@ -1660,12 +1831,226 @@ mod tests {
         sampler
             .sample(&letterboxed, w * 4, w, h, &cfg, Duration::from_millis(34))
             .unwrap();
+        assert_eq!(sampler.active(), Rect::default());
+        for _ in 0..14 {
+            sampler
+                .sample(&letterboxed, w * 4, w, h, &cfg, Duration::from_millis(34))
+                .unwrap();
+        }
         assert!(sampler.active().y0 > 0.0);
         cfg.letterbox = false;
         sampler
             .sample(&data, w * 4, w, h, &cfg, Duration::from_millis(34))
             .unwrap();
         assert_eq!(sampler.active(), Rect::default());
+    }
+
+    #[test]
+    fn low_light_chroma_noise_is_not_exaggerated() {
+        let w = 64;
+        let h = 48;
+        let zone = Zone {
+            id: 1,
+            edge: None,
+            x0: 0.0,
+            x1: 1.0,
+            y0: 0.0,
+            y1: 1.0,
+        };
+        let cfg = Config {
+            letterbox: false,
+            smooth: 1.0,
+            max_step: 255,
+            black_threshold: 0.0,
+            saturation_boost: 1.25,
+            brightness: 1.0,
+            peak_mix: 0,
+            center_bleed: 0,
+            feather_depth: 0,
+            ..Config::default()
+        };
+        let mut outputs = Vec::with_capacity(3);
+        for noise_channel in 0..3 {
+            let mut frame = solid_frame(w, h, [12, 12, 12]);
+            for y in (0..h).step_by(8) {
+                for x in (0..w).step_by(8) {
+                    let pixel = (y * w + x) * 4;
+                    for channel in 0..3 {
+                        if channel != noise_channel {
+                            frame[pixel + channel] = 0;
+                        }
+                    }
+                }
+            }
+            let mut sampler = Sampler::new(vec![zone.clone()]);
+            let color = sampler
+                .sample(&frame, w * 4, w, h, &cfg, Duration::from_millis(34))
+                .unwrap()[0];
+            let min = color.r.min(color.g).min(color.b);
+            let max = color.r.max(color.g).max(color.b);
+            assert!(
+                max - min < 1.2,
+                "low-light chroma noise was exaggerated: {color:?}"
+            );
+            outputs.push(color);
+        }
+        for first in 0..outputs.len() {
+            for second in first + 1..outputs.len() {
+                let delta = (outputs[first].r - outputs[second].r)
+                    .abs()
+                    .max((outputs[first].g - outputs[second].g).abs())
+                    .max((outputs[first].b - outputs[second].b).abs());
+                assert!(
+                    delta < 1.5,
+                    "low-light noise changed hue between channels: {delta}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn black_threshold_suppresses_dim_red_and_preserves_dim_neutral() {
+        let w = 64;
+        let h = 48;
+        let zone = Zone {
+            id: 1,
+            edge: None,
+            x0: 0.0,
+            x1: 1.0,
+            y0: 0.0,
+            y1: 1.0,
+        };
+        let cfg = Config {
+            letterbox: false,
+            smooth: 1.0,
+            max_step: 255,
+            black_threshold: 0.01,
+            saturation_boost: 1.25,
+            brightness: 1.0,
+            peak_mix: 0,
+            center_bleed: 0,
+            feather_depth: 0,
+            ..Config::default()
+        };
+        let dim_red = solid_frame(w, h, [8, 0, 0]);
+        let dim_gray = solid_frame(w, h, [15, 15, 15]);
+        let mut sampler = Sampler::new(vec![zone]);
+        assert_eq!(
+            sampler
+                .sample(&dim_red, w * 4, w, h, &cfg, Duration::from_millis(34))
+                .unwrap()[0],
+            Color::default()
+        );
+        assert_eq!(sampler.raw()[0], Color::default());
+        assert_eq!(
+            sampler
+                .sample(&dim_gray, w * 4, w, h, &cfg, Duration::from_millis(34))
+                .unwrap()[0],
+            Color {
+                r: 15.0,
+                g: 15.0,
+                b: 15.0,
+            }
+        );
+    }
+
+    #[test]
+    fn full_screen_scene_cuts_respect_the_maximum_step() {
+        let w = 64;
+        let h = 48;
+        let zone = Zone {
+            id: 1,
+            edge: None,
+            x0: 0.0,
+            x1: 1.0,
+            y0: 0.0,
+            y1: 1.0,
+        };
+        let cfg = Config {
+            letterbox: false,
+            smooth: 1.0,
+            max_step: 10,
+            black_threshold: 0.0,
+            saturation_boost: 0.0,
+            brightness: 1.0,
+            peak_mix: 0,
+            center_bleed: 0,
+            feather_depth: 0,
+            ..Config::default()
+        };
+        let black = solid_frame(w, h, [0, 0, 0]);
+        let red = solid_frame(w, h, [200, 20, 10]);
+        let mut sampler = Sampler::new(vec![zone]);
+        sampler
+            .sample_full_screen(&black, w * 4, w, h, &cfg, Duration::from_millis(34))
+            .unwrap();
+        let color = sampler
+            .sample_full_screen(&red, w * 4, w, h, &cfg, Duration::from_millis(34))
+            .unwrap()[0];
+        let step = cfg.max_step as f32 * 0.034 * 30.0;
+        assert!(sampler.scene_cut());
+        assert!(color.r <= step + 0.001);
+        assert!(color.g <= step + 0.001);
+        assert!(color.b <= step + 0.001);
+    }
+
+    #[test]
+    fn scene_cuts_keep_response_smoothing_for_local_zone_changes() {
+        let w = 64;
+        let h = 48;
+        let zone = Zone {
+            id: 1,
+            edge: None,
+            x0: 0.0,
+            x1: 0.15,
+            y0: 0.4,
+            y1: 0.6,
+        };
+        let mut cfg = Config {
+            letterbox: false,
+            smooth: 1.0,
+            max_step: 255,
+            black_threshold: 0.0,
+            saturation_boost: 0.0,
+            brightness: 1.0,
+            peak_mix: 0,
+            center_bleed: 0,
+            feather_depth: 0,
+            ..Config::default()
+        };
+        let mut first = solid_frame(w, h, [0, 0, 0]);
+        for y in 19..29 {
+            for x in 0..10 {
+                let pixel = (y * w + x) * 4;
+                first[pixel..pixel + 3].copy_from_slice(&[40, 60, 80]);
+            }
+        }
+        let mut second = first.clone();
+        for y in 19..29 {
+            for x in 0..10 {
+                let pixel = (y * w + x) * 4;
+                second[pixel..pixel + 3].copy_from_slice(&[20, 60, 80]);
+            }
+        }
+        for y in 12..36 {
+            for x in 16..48 {
+                let pixel = (y * w + x) * 4;
+                second[pixel..pixel + 3].fill(255);
+            }
+        }
+        let mut sampler = Sampler::new(vec![zone]);
+        sampler
+            .sample(&first, w * 4, w, h, &cfg, Duration::from_millis(34))
+            .unwrap();
+        cfg.smooth = 0.1;
+        let color = sampler
+            .sample(&second, w * 4, w, h, &cfg, Duration::from_millis(34))
+            .unwrap()[0];
+        assert!(sampler.scene_cut());
+        assert!(
+            color.r > 20.0 && color.r < 40.0,
+            "scene cut skipped configured smoothing: {color:?}"
+        );
     }
 
     #[test]
@@ -1693,5 +2078,44 @@ mod tests {
             .sample(&perimeter, w * 4, w, h, &cfg, Duration::from_millis(34))
             .unwrap();
         assert!(sampler.scene_cut());
+    }
+
+    #[test]
+    fn black_fade_remains_monotonic_when_max_step_changes() {
+        let w = 32;
+        let h = 24;
+        let zone = Zone {
+            id: 1,
+            edge: None,
+            x0: 0.0,
+            x1: 1.0,
+            y0: 0.0,
+            y1: 1.0,
+        };
+        let warm = solid_frame(w, h, [200, 80, 20]);
+        let black = solid_frame(w, h, [0, 0, 0]);
+        let mut cfg = Config {
+            fps: 10,
+            smooth: 1.0,
+            max_step: 255,
+            black_threshold: 0.0,
+            saturation_boost: 0.0,
+            peak_mix: 0,
+            center_bleed: 0,
+            feather_depth: 0,
+            ..Config::default()
+        };
+        let mut sampler = Sampler::new(vec![zone]);
+        sampler
+            .sample_full_screen(&warm, w * 4, w, h, &cfg, Duration::from_millis(34))
+            .unwrap();
+        let before = sampler
+            .sample_full_screen(&black, w * 4, w, h, &cfg, Duration::from_millis(34))
+            .unwrap()[0];
+        cfg.max_step = 1;
+        let after = sampler
+            .sample_full_screen(&black, w * 4, w, h, &cfg, Duration::from_millis(34))
+            .unwrap()[0];
+        assert!(after.r <= before.r && after.g <= before.g && after.b <= before.b);
     }
 }

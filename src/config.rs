@@ -33,6 +33,7 @@ pub struct Config {
     pub letterbox: bool,
     pub midtone_lift: bool,
     pub strict_black: bool,
+    pub spatial_blend: bool,
     pub start_corner: String,
     pub reverse_direction: bool,
     pub perimeter_offset: i32,
@@ -57,15 +58,16 @@ impl Default for Config {
             max_step: 12,
             edge_depth: 8,
             center_bleed: 0,
-            peak_mix: 15,
+            peak_mix: 10,
             feather_depth: 5,
-            brightness: 1.5,
-            smooth: 0.35,
-            black_threshold: 0.01,
-            saturation_boost: 1.25,
+            brightness: 1.0,
+            smooth: 0.25,
+            black_threshold: 0.05,
+            saturation_boost: 1.0,
             letterbox: true,
             midtone_lift: false,
             strict_black: false,
+            spatial_blend: false,
             start_corner: "bottom_center".into(),
             reverse_direction: false,
             perimeter_offset: 0,
@@ -187,6 +189,7 @@ impl Config {
             "letterbox": self.letterbox,
             "midtone_lift": self.midtone_lift,
             "strict_black": self.strict_black,
+            "spatial_blend": self.spatial_blend,
         })
     }
 
@@ -216,7 +219,8 @@ impl Config {
                 "start_corner" => next.start_corner = json_string(value, key)?,
                 "reverse_direction" => next.reverse_direction = json_bool(value, key)?,
                 "perimeter_offset" => next.perimeter_offset = json_i32(value, key)?,
-                _ => return Err(AppError::new("unknown setting key")),
+                "spatial_blend" => next.spatial_blend = json_bool(value, key)?,
+                _ => return Err(AppError::new("unsupported setting")),
             }
         }
         next.validate()?;
@@ -401,6 +405,9 @@ fn load_values(config: &mut Config, root: &Value) -> Result<()> {
     }
     if let Some(value) = object.get("strict_black") {
         config.strict_black = json_bool(value, "strict_black")?;
+    }
+    if let Some(value) = object.get("spatial_blend") {
+        config.spatial_blend = json_bool(value, "spatial_blend")?;
     }
     if !object.contains_key("start_corner") {
         if let Some(corner) = object.get("corner").and_then(Value::as_str) {
@@ -675,6 +682,29 @@ mod tests {
     }
 
     #[test]
+    fn spatial_blend_persists_and_rejects_non_boolean_settings() {
+        let path = test_path();
+        let mut config = Config {
+            config_path: path.clone(),
+            ..Config::default()
+        };
+        assert!(config
+            .apply_settings(&json!({"spatial_blend":"true"}))
+            .is_err());
+        assert!(!config.spatial_blend);
+        config
+            .apply_settings(&json!({"spatial_blend":true}))
+            .expect("apply spatial setting");
+        config.save().expect("save spatial setting");
+        let loaded = Config::load(&path).expect("reload spatial setting");
+        assert!(loaded.spatial_blend);
+        let _ = fs::remove_file(&path);
+        if let Ok(lock) = lock_path(&path) {
+            let _ = fs::remove_file(lock);
+        }
+    }
+
+    #[test]
     fn save_preserves_unknown_values_and_forget_removes_only_credentials() {
         let path = test_path();
         write_atomic(
@@ -766,24 +796,31 @@ mod tests {
     }
 
     #[test]
-    fn saturation_default_and_saved_values_are_preserved() {
-        let missing_path = test_path();
-        let missing = Config::load(&missing_path).expect("load missing config");
-        assert_eq!(missing.saturation_boost, 1.25);
-
-        let path = test_path();
-        write_atomic(&path, br#"{"saturation_boost":1.0}"#).expect("seed saved saturation");
-        let saved = Config::load(&path).expect("load saved saturation");
-        assert_eq!(saved.saturation_boost, 1.0);
-        saved
-            .save_settings(&json!({"monitor":"DP-3"}))
-            .expect("save unrelated setting");
-        let reloaded = Config::load(&path).expect("reload saved saturation");
-        assert_eq!(reloaded.saturation_boost, 1.0);
-
-        for path in [&missing_path, &path] {
-            let _ = fs::remove_file(path);
-            if let Ok(lock) = lock_path(path) {
+    fn saved_color_settings_survive_default_changes_and_partial_saves() {
+        for threshold in [0.01, 0.07] {
+            let path = test_path();
+            let settings = json!({
+                "brightness": 1.5,
+                "saturation_boost": 1.25,
+                "smooth": 0.35,
+                "black_threshold": threshold
+            });
+            write_atomic(&path, &serde_json::to_vec(&settings).expect("encode settings"))
+                .expect("seed previous saved values");
+            let saved = Config::load(&path).expect("load previous saved values");
+            let check = |config: &Config| {
+                assert_eq!(config.brightness, 1.5);
+                assert_eq!(config.saturation_boost, 1.25);
+                assert_eq!(config.smooth, 0.35);
+                assert_eq!(config.black_threshold, threshold as f32);
+            };
+            check(&saved);
+            saved
+                .save_settings(&json!({"monitor":"DP-3"}))
+                .expect("save unrelated setting");
+            check(&Config::load(&path).expect("reload previous saved values"));
+            let _ = fs::remove_file(&path);
+            if let Ok(lock) = lock_path(&path) {
                 let _ = fs::remove_file(lock);
             }
         }
@@ -792,7 +829,6 @@ mod tests {
     #[test]
     fn alignment_settings_validate_and_round_trip() {
         let mut config = Config::default();
-        assert_eq!(config.saturation_boost, 1.25);
         assert_eq!(config.start_corner, "bottom_center");
         assert!(!config.reverse_direction);
         assert_eq!(config.perimeter_offset, 0);
