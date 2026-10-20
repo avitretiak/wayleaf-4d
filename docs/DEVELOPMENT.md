@@ -23,6 +23,8 @@ The control process handles settings and device management without capturing the
 
 DRM enumeration selects only connected connectors with an active CRTC. If the configured monitor is absent, KMS returns no primary plane, or the helper temporarily returns an empty successful response, the worker reports a temporary capture failure (exit status 75); the user service retries after 15 seconds. This lets display/KMS recovery resume sync without a widget toggle. Invalid or ambiguous monitor selections and protocol incompatibilities remain permanent startup errors.
 
+GPU capture imports AB4H (`DRM_FORMAT_ABGR16161616F`) as four half-float channels through EGL DMA-BUF; the shader samples its floating-point RGB values directly. PQ/HLG conversion remains driven by KMS HDR metadata, not inferred from the pixel format.
+
 The capture shader converts top-origin KMS source coordinates to the imported texture's Y convention after applying plane rotation. `glReadPixels` rows are then flipped once into top-down RGBA for sampling.
 
 The worker assigns colors to discovered controller IDs according to the selected mode; sampling behavior and panel-layout geometry are detailed in [Sampling and panel layouts](#sampling-and-panel-layouts).

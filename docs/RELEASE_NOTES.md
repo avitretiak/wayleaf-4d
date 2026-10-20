@@ -2,6 +2,11 @@
 
 For installation and requirements, see the [README](../README.md). Current controls and configuration are documented in the [User Guide](USAGE.md).
 
+## 0.4.2 — 2026-10-20
+
+- GPU capture accepts the `AB4H` half-float ABGR format produced by HDR/direct-scanout paths; its EGL DMA-BUF is imported and sampled as floating-point color, while PQ/HLG conversion remains metadata-driven.
+- `--capture-debug` streams read-only capture statistics until Ctrl-C, so diagnostics can be started on demand and kept open through a display-mode transition.
+
 ## 0.4.1 — 2026-10-20
 
 - Fine-tune slider tooltips now include the setting name, and label widths adapt to the popup, improving clarity without allowing long labels to crowd out the controls.

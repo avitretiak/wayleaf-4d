@@ -32,6 +32,7 @@ const EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT: i32 = 0x3444;
 const EGL_EXTENSIONS: i32 = 0x3055;
 const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 const DRM_FORMAT_ABGR16161616: u32 = fourcc(*b"AB48");
+const DRM_FORMAT_ABGR16161616F: u32 = fourcc(*b"AB4H");
 
 const GL_VERTEX_SHADER: u32 = 0x8B31;
 const GL_FRAGMENT_SHADER: u32 = 0x8B30;
@@ -704,6 +705,7 @@ fn is_supported_rgb(format: u32) -> bool {
     matches!(
         format,
         DRM_FORMAT_ABGR16161616
+            | DRM_FORMAT_ABGR16161616F
             | 0x3432_5258 // XR24
             | 0x3432_5241 // AR24
             | 0x3432_4258 // XB24
@@ -1311,6 +1313,11 @@ mod tests {
         })))
         .is_err());
     }
+    #[test]
+    fn half_float_abgr_format_is_supported() {
+        assert!(is_supported_rgb(DRM_FORMAT_ABGR16161616F));
+    }
+
 
     #[test]
     fn explicit_modifiers_are_never_dropped_without_egl_support() {

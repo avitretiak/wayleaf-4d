@@ -114,7 +114,7 @@ The self-test is local: it does not contact the controller or request screen cap
 Diagnostic modes:
 
 - `--capture-test --monitor NAME` captures for up to five seconds and reports frame count, dimensions, rate, and capture latency. It requires the GSR KMS helper and GPU stack, but not controller credentials; it sends no UDP frames and saves no images. Specify a monitor when more than one is available.
-- `--capture-debug --monitor NAME` requires saved controller credentials (or `--ip` and `--token`) and a valid monitor. For ten seconds it reports post-GPU capture RGB statistics and per-segment `target>smoothed>encoded-packet` RGB values. It sends no UDP frames, saves no images/settings, and does not use portal selection or save a restore token.
+- `--capture-debug --monitor NAME` requires saved controller credentials (or `--ip` and `--token`) and a valid monitor. It reports post-GPU capture RGB statistics and per-segment `target>smoothed>encoded-packet` RGB values until interrupted with Ctrl-C. It sends no UDP frames, saves no images/settings, and does not use portal selection or save a restore token.
 
 When the selected display is disconnected, KMS returns no primary plane, or the helper temporarily returns an empty successful response, the worker exits with temporary status 75 and systemd retries it after 15 seconds. This keeps the requested sync active; capture and output may pause until the display/KMS path recovers. Explicit Stop is not retried. For permanent errors, inspect `journalctl --user -u wayleaf-4d.service -b`, fix the reported cause, then use Run again. Use `wayleaf-4d --list-monitors` to find a monitor name and `--monitor NAME` for a standalone run or diagnostic.
 

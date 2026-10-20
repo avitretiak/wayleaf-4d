@@ -26,7 +26,6 @@ const BUS_NAME: &str = "io.github.avitretiak.Wayleaf4D";
 const OBJECT_PATH: &str = "/io/github/avitretiak/Wayleaf4D";
 const MAX_CAPTURE_TEST: Duration = Duration::from_secs(5);
 const CAPTURE_TEST_FRAMES: usize = 30;
-const DEBUG_DURATION: Duration = Duration::from_secs(10);
 const SIGNAL_POLL: Duration = Duration::from_millis(50);
 
 struct WorkerState {
@@ -883,11 +882,11 @@ pub fn capture_debug(config: &Config) -> Result<()> {
         "# capture-debug: scanout-RGB statistics are post-GPU capture; each zone is controller-ID:target-RGB>smoothed-RGB>encoded-packet-RGB; no UDP frames sent"
     )
     .map_err(diagnostic_io)?;
-    eprintln!("Sampling for 10 seconds; no desktop images or settings are saved");
+    eprintln!("Sampling until interrupted; no desktop images or settings are saved");
 
-    while started.elapsed() < DEBUG_DURATION && !stop.load(Ordering::Acquire) {
+    while !stop.load(Ordering::Acquire) {
         wait_until(&stop, deadline);
-        if stop.load(Ordering::Acquire) || started.elapsed() >= DEBUG_DURATION {
+        if stop.load(Ordering::Acquire) {
             break;
         }
         let before = Instant::now();
