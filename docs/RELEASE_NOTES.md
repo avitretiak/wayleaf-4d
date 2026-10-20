@@ -2,13 +2,13 @@
 
 For installation and requirements, see the [README](../README.md). Current controls and configuration are documented in the [User Guide](USAGE.md).
 
-## 0.4.0 (unreleased)
+## 0.4.0 — 2026-10-20
 
 - Screen-derived RGB transitions now use proportional vector limiting with the existing exponential response, actual timing at normal 1–10 Hz, and bounded advancement after long capture gaps.
 - Near-black confirmation and a higher wake threshold resist threshold flicker; confirmed black fades to exact off while respecting Max change per update. Immediate black remains the instant-off override.
 - Letterbox detection now requires persistent border/interior evidence, tolerates localized subtitle interference, and retains a confirmed crop through ambiguous dark frames.
 - Packet output holds only a shared intensity anchor and re-quantizes current RGB differences on every update. This fixes retained tint and rounding-boundary color flashes for near-neutral as well as exactly neutral input, while retaining float response state, resolvable color, gradual intensity changes, and exact black/white.
-- The `*ExtControl*` sentinel is not restored as a saved scene. Failure cleanup and service restart policy are otherwise unchanged; the stashed immediate-power-off policy is not applied.
+- The `*ExtControl*` sentinel is not restored as a saved scene. Failure cleanup and service restart policy are unchanged.
 - New-install brightness is now 1.0. Balanced and new-install/fine-tune reset defaults use Color enhancement 1.0, Transition speed 0.25, and Dark-scene cutoff 0.05. Brightness stays independent of Looks and fine-tune resets; existing saved values are preserved. The cutoff reflects the user's observed red/yellow flicker on gray below 0.05, not a universal flicker guarantee or a new minimum. Subtle/Vivid retain their 0.01 cutoff.
 - Fine-tuning labels now describe each control's effect; configuration keys are unchanged. Confirmed-black packet output cannot brighten a channel by one RGB code while fading, including when Max change per update is lowered.
 
