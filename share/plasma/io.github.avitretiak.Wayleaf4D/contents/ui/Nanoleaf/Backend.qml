@@ -27,7 +27,8 @@ Item {
         strict_black: false,
         start_corner: "bottom_center",
         perimeter_offset: 0,
-        spatial_blend: false
+        spatial_blend: false,
+        capture_area_filter: false
     })
     property string status: "stopped"
     property bool running: false

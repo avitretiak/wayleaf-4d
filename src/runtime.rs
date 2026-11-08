@@ -337,7 +337,7 @@ fn settings_to_dbus(settings: &Value) -> WorkerResult<HashMap<String, OwnedValue
                     })?;
                 OwnedValue::from(number)
             }
-            "letterbox" | "midtone_lift" | "strict_black" | "spatial_blend" | "reverse_direction" => {
+            "letterbox" | "midtone_lift" | "strict_black" | "spatial_blend" | "capture_area_filter" | "reverse_direction" => {
                 OwnedValue::from(value.as_bool().ok_or_else(|| {
                     WorkerError::Failed("worker setting has an invalid boolean".to_owned())
                 })?)
@@ -371,7 +371,7 @@ fn settings_from_dbus(settings: HashMap<String, OwnedValue>) -> WorkerResult<Map
             | "perimeter_offset" => {
                 Value::from(i32::try_from(value).map_err(|_| invalid())?)
             }
-            "letterbox" | "midtone_lift" | "strict_black" | "spatial_blend" | "reverse_direction" => {
+            "letterbox" | "midtone_lift" | "strict_black" | "spatial_blend" | "capture_area_filter" | "reverse_direction" => {
                 Value::from(bool::try_from(value).map_err(|_| invalid())?)
             }
             "monitor" | "mode" | "static_color" | "start_corner" => {
@@ -576,7 +576,7 @@ pub fn run(mut config: Config) -> Result<()> {
                 let capture = capture
                     .as_mut()
                     .ok_or_else(|| AppError::new("capture missing for screen-sampling mode"))?;
-                let frame = capture.frame()?;
+                let frame = capture.frame(config.capture_area_filter)?;
                 let sampled_at = Instant::now();
                 if shared.is_stopping() {
                     break;
@@ -790,7 +790,7 @@ impl CaptureColorStats {
 
 const PLANE_DIAGNOSTIC_INTERVAL: Duration = Duration::from_millis(200);
 
-pub fn capture_planes(monitor_name: &str) -> Result<()> {
+pub fn capture_planes(monitor_name: &str, area_filter: bool) -> Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     register_signals(stop.clone())?;
     if stop.load(Ordering::Acquire) {
@@ -815,8 +815,8 @@ pub fn capture_planes(monitor_name: &str) -> Result<()> {
         if stop.load(Ordering::Acquire) {
             break;
         }
-        let diagnostic = capture.diagnostic_frame()?;
-        let layout = plane_layout(&monitor, diagnostic.planes);
+        let diagnostic = capture.diagnostic_frame(area_filter)?;
+        let layout = plane_layout(&monitor, diagnostic.planes, diagnostic.crtc_gamma_applied);
         if layout != previous_layout {
             writeln!(output, "{layout}").map_err(diagnostic_io)?;
             output.flush().map_err(diagnostic_io)?;
@@ -856,10 +856,10 @@ pub fn capture_planes(monitor_name: &str) -> Result<()> {
     Ok(())
 }
 
-fn plane_layout(monitor: &Monitor, planes: &[PlaneDiagnostic]) -> String {
+fn plane_layout(monitor: &Monitor, planes: &[PlaneDiagnostic], crtc_gamma_applied: bool) -> String {
     let mut layout = format!(
-        "monitor={} connector={} mode={}x{}",
-        monitor.name, monitor.connector_id, monitor.width, monitor.height
+        "monitor={} connector={} mode={}x{} crtc_gamma_applied={}",
+        monitor.name, monitor.connector_id, monitor.width, monitor.height, crtc_gamma_applied
     );
     for plane in planes {
         use std::fmt::Write as _;
@@ -926,7 +926,7 @@ mod plane_role_tests {
 
 #[cfg(test)]
 mod settings_transaction_tests {
-    use super::{Config, Shared, WorkerError, WorkerInterface};
+    use super::{settings_from_dbus, settings_to_dbus, Config, Shared, WorkerError, WorkerInterface};
     use std::collections::HashMap;
     use std::fs;
     use std::sync::Arc;
@@ -958,6 +958,14 @@ mod settings_transaction_tests {
 
     fn patch(brightness: f64) -> HashMap<String, OwnedValue> {
         HashMap::from([("brightness".to_owned(), OwnedValue::from(brightness))])
+    }
+
+    #[test]
+    fn capture_filter_round_trips_worker_dbus_settings() {
+        let values = serde_json::json!({"capture_area_filter": true});
+        let wire = settings_to_dbus(&values).unwrap();
+        assert_eq!(settings_from_dbus(wire).unwrap()["capture_area_filter"], true);
+        assert!(settings_from_dbus(HashMap::from([("capture_area_filter".into(), OwnedValue::from(1i32))])).is_err());
     }
 
     #[test]
@@ -1007,8 +1015,10 @@ mod settings_transaction_tests {
             shared: shared.clone(),
         };
 
+        let mut updates = patch(0.73);
+        updates.insert("capture_area_filter".into(), OwnedValue::from(true));
         interface
-            .set_settings(patch(0.73))
+            .set_settings(updates)
             .expect("apply and persist settings");
 
         let published = shared
@@ -1017,10 +1027,12 @@ mod settings_transaction_tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(published.revision, 1);
         assert!((published.config.brightness - 0.73).abs() < f32::EPSILON);
+        assert!(published.config.capture_area_filter);
         drop(published);
 
         let saved = Config::load(&path).expect("read persisted config");
         assert!((saved.brightness - 0.73).abs() < f32::EPSILON);
+        assert!(saved.capture_area_filter);
         assert_eq!(saved.fps, Config::default().fps);
     }
 }
@@ -1046,7 +1058,7 @@ pub fn capture_test(config: &Config) -> Result<()> {
     {
         let before = Instant::now();
         let (frame_width, frame_height) = {
-            let frame = capture.frame()?;
+            let frame = capture.frame(config.capture_area_filter)?;
             (frame.width, frame.height)
         };
         let latency = before.elapsed().as_secs_f64() * 1000.0;
@@ -1128,7 +1140,7 @@ pub fn capture_debug(config: &Config) -> Result<()> {
             break;
         }
         let before = Instant::now();
-        let frame = capture.frame()?;
+        let frame = capture.frame(config.capture_area_filter)?;
         let sampled_at = Instant::now();
         let latency = sampled_at.duration_since(before).as_secs_f64() * 1000.0;
         latencies.push(latency);

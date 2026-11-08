@@ -980,6 +980,15 @@ Item {
             enabled: !root.backend.busy && !root.backend.deviceBusy
             onTriggered: root.backend.setStartAtLogin(checked)
         }
+        MenuItem {
+            objectName: "capture-area-filter"
+            text: "Filter fine patterns"
+            checkable: true
+            checked: root.backend.settings.capture_area_filter === true
+            enabled: root.mode !== "1D"
+            onTriggered: root.backend.setSetting("capture_area_filter", checked)
+            Accessible.description: "Reduce color artifacts from fine screen patterns. May use more GPU time."
+        }
         MenuItem { text: "About capture…"; onTriggered: aboutDialog.open() }
         MenuItem { text: "Diagnostics and help…"; onTriggered: diagnosticsDialog.open() }
         MenuSeparator {}

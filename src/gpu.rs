@@ -1,5 +1,5 @@
 use crate::capture::PlaneDiagnostic;
-use crate::kms::{Monitor, Plane};
+use crate::kms::{GammaLut, Monitor, Plane};
 use crate::{AppError, Result};
 use glow::HasContext;
 use libloading::Library;
@@ -43,8 +43,11 @@ const FRAGMENT_SHADER: &str = r#"
 #version 300 es
 precision highp float;
 uniform sampler2D image;
+uniform sampler2D crtc_lut;
+uniform int crtc_lut_size;
 uniform vec4 src;
 uniform int rotation;
+uniform int area_filter;
 uniform int hdr_eotf;
 uniform float hdr_peak_pq;
 uniform float hdr_white_pq;
@@ -60,11 +63,67 @@ const float PQ_C3=18.6875;
 float pq_lum(float p){float e=pow(max(p,0.0),1.0/PQ_M2); return pow(max(e-PQ_C1,0.0)/(PQ_C2-PQ_C3*e),1.0/PQ_M1);}
 float lum_pq(float l){float x=pow(clamp(l,0.0,1.0),PQ_M1); return pow((PQ_C1+PQ_C2*x)/(1.0+PQ_C3*x),PQ_M2);}
 float eetf(float p){float target=hdr_white_pq/hdr_peak_pq; float knee=1.5*target-0.5; float e=min(p/hdr_peak_pq,1.0); if(knee<1.0 && e>knee){float t=(e-knee)/(1.0-knee); float t2=t*t; float t3=t2*t; e=(2.0*t3-3.0*t2+1.0)*knee+(t3-2.0*t2+t)*(1.0-knee)+(-2.0*t3+3.0*t2)*target;} return e*hdr_peak_pq;}
-float rec709(float v){return v<0.018 ? 4.5*v : 1.099*pow(v,0.45)-0.099;}
-vec3 tone(vec3 pq){vec3 l=vec3(pq_lum(pq.r),pq_lum(pq.g),pq_lum(pq.b)); float m=max(l.r,max(l.g,l.b)); if(m>0.0) l*=pq_lum(eetf(lum_pq(m)))/m; l=mat3(1.660491,-0.124550,-0.018151,-0.587641,1.132900,-0.100579,-0.072850,-0.008349,1.118730)*l; l=clamp(l*hdr_white_scale,0.0,1.0); return vec3(rec709(l.r),rec709(l.g),rec709(l.b));}
+float srgb(float v){return v<=0.0031308 ? 12.92*v : 1.055*pow(v,1.0/2.4)-0.055;}
+vec3 tone_linear(vec3 l){float m=max(l.r,max(l.g,l.b)); if(m>0.0) l*=pq_lum(eetf(lum_pq(m)))/m; l=mat3(1.660491,-0.124550,-0.018151,-0.587641,1.132900,-0.100579,-0.072850,-0.008349,1.118730)*l; l=clamp(l*hdr_white_scale,0.0,1.0); return vec3(srgb(l.r),srgb(l.g),srgb(l.b));}
+vec3 tone(vec3 pq){return tone_linear(vec3(pq_lum(pq.r),pq_lum(pq.g),pq_lum(pq.b)));}
 float hlg_scene(float e){return e<=0.5 ? e*e/3.0 : (exp((e-0.55991073)/0.17883277)+0.28466892)/12.0;}
 vec3 hlg_tone(vec3 signal){vec3 scene=vec3(hlg_scene(signal.r),hlg_scene(signal.g),hlg_scene(signal.b)); float y=dot(scene,vec3(0.2627,0.6780,0.0593)); float gamma=max(1.0,1.2+0.42*log(hdr_peak_nits/1000.0)/log(10.0)); vec3 nits=scene*(pow(max(y,0.0),gamma-1.0)*hdr_peak_nits); return tone(vec3(lum_pq(nits.r/10000.0),lum_pq(nits.g/10000.0),lum_pq(nits.b/10000.0)));}
-void main(){vec2 q=uv; if(rotation==1) q=vec2(q.y,1.0-q.x); else if(rotation==2) q=vec2(1.0-q.x,1.0-q.y); else if(rotation==3) q=vec2(1.0-q.y,q.x); q.y=1.0-q.y; vec2 tc=src.xy+q*src.zw; vec4 px=texture(image,tc); if(hdr_eotf==2) px.rgb=tone(px.rgb); else if(hdr_eotf==3) px.rgb=hlg_tone(px.rgb); color=px;}
+vec3 crtc_gamma(vec3 rgb){
+  if(crtc_lut_size<2) return rgb;
+  vec3 p=clamp(rgb,0.0,1.0)*float(crtc_lut_size-1);
+  ivec3 a=ivec3(floor(p)), b=min(a+1,ivec3(crtc_lut_size-1));
+  vec3 lo=vec3(texelFetch(crtc_lut,ivec2(a.r%256,a.r/256),0).r,
+               texelFetch(crtc_lut,ivec2(a.g%256,a.g/256),0).g,
+               texelFetch(crtc_lut,ivec2(a.b%256,a.b/256),0).b);
+  vec3 hi=vec3(texelFetch(crtc_lut,ivec2(b.r%256,b.r/256),0).r,
+               texelFetch(crtc_lut,ivec2(b.g%256,b.g/256),0).g,
+               texelFetch(crtc_lut,ivec2(b.b%256,b.b/256),0).b);
+  return mix(lo,hi,fract(p));
+}
+// Interpolate HDR in linear light: hardware bilinear filtering would mix encoded PQ/HLG first.
+vec4 linear_texel(ivec2 pos){
+  vec4 p=texelFetch(image,pos,0);
+  p.rgb=crtc_gamma(p.rgb);
+  if(hdr_eotf==2) p.rgb=vec3(pq_lum(p.r),pq_lum(p.g),pq_lum(p.b));
+  else {
+    vec3 scene=vec3(hlg_scene(p.r),hlg_scene(p.g),hlg_scene(p.b));
+    float y=dot(scene,vec3(0.2627,0.6780,0.0593));
+    float gamma=max(1.0,1.2+0.42*log(hdr_peak_nits/1000.0)/log(10.0));
+    p.rgb=scene*(pow(max(y,0.0),gamma-1.0)*hdr_peak_nits/10000.0);
+  }
+  return p;
+}
+vec4 linear_sample(vec2 tc, vec2 dimensions, vec2 lo, vec2 hi){
+  vec2 p=tc*dimensions-0.5;
+  ivec2 base=ivec2(floor(p)); vec2 f=fract(p);
+  ivec2 minp=ivec2(floor(lo*dimensions)), maxp=ivec2(floor(hi*dimensions));
+  vec4 a=linear_texel(clamp(base,minp,maxp));
+  vec4 b=linear_texel(clamp(base+ivec2(1,0),minp,maxp));
+  vec4 c=linear_texel(clamp(base+ivec2(0,1),minp,maxp));
+  vec4 d=linear_texel(clamp(base+ivec2(1,1),minp,maxp));
+  return mix(mix(a,b,f.x),mix(c,d,f.x),f.y);
+}
+void main(){vec2 q=uv; if(rotation==1) q=vec2(q.y,1.0-q.x); else if(rotation==2) q=vec2(1.0-q.x,1.0-q.y); else if(rotation==3) q=vec2(1.0-q.y,q.x); q.y=1.0-q.y; vec2 tc=src.xy+q*src.zw; vec4 px;
+  vec2 dx=dFdx(tc), dy=dFdy(tc);
+  if(area_filter==0) { px=texture(image,tc); px.rgb=crtc_gamma(px.rgb); }
+  else {
+    vec2 dimensions=vec2(textureSize(image,0));
+    int nx=int(clamp(ceil(length(dx*dimensions)*0.5),1.0,8.0));
+    int ny=int(clamp(ceil(length(dy*dimensions)*0.5),1.0,8.0));
+    vec2 lo=src.xy+0.5/dimensions, hi=src.xy+src.zw-0.5/dimensions;
+    lo=min(lo,hi);
+    px=vec4(0.0);
+    for(int y=0;y<8;y++) { if(y>=ny) break;
+      for(int x=0;x<8;x++) { if(x>=nx) break;
+        vec2 offset=dx*((float(x)+0.5)/float(nx)-0.5)+dy*((float(y)+0.5)/float(ny)-0.5);
+        vec2 pos=clamp(tc+offset,lo,hi);
+        px+=(hdr_eotf==2 || hdr_eotf==3) ? linear_sample(pos,dimensions,lo,hi) : texture(image,pos);
+      }
+    }
+    px/=float(nx*ny);
+  }
+  if(area_filter!=0 && (hdr_eotf==2 || hdr_eotf==3)) px.rgb=tone_linear(px.rgb);
+  else if(hdr_eotf==2) px.rgb=tone(px.rgb); else if(hdr_eotf==3) px.rgb=hlg_tone(px.rgb); color=px;}
 "#;
 
 pub struct Gpu {
@@ -78,12 +137,18 @@ pub struct Gpu {
     dst_uniform: Option<glow::UniformLocation>,
     src_uniform: Option<glow::UniformLocation>,
     rotation_uniform: Option<glow::UniformLocation>,
+    area_filter_uniform: Option<glow::UniformLocation>,
     hdr_eotf_uniform: Option<glow::UniformLocation>,
     hdr_peak_nits_uniform: Option<glow::UniformLocation>,
     hdr_peak_uniform: Option<glow::UniformLocation>,
     hdr_white_uniform: Option<glow::UniformLocation>,
     hdr_scale_uniform: Option<glow::UniformLocation>,
     sampler_uniform: Option<glow::UniformLocation>,
+    gamma_sampler_uniform: Option<glow::UniformLocation>,
+    gamma_size_uniform: Option<glow::UniformLocation>,
+    gamma_texture: Option<glow::NativeTexture>,
+    gamma_blob: Option<u32>,
+    gamma_active: bool,
     width: usize,
     height: usize,
     rgba: Vec<u8>,
@@ -129,12 +194,18 @@ impl Gpu {
             dst_uniform: None,
             src_uniform: None,
             rotation_uniform: None,
+            area_filter_uniform: None,
             hdr_eotf_uniform: None,
             hdr_peak_nits_uniform: None,
             hdr_peak_uniform: None,
             hdr_white_uniform: None,
             hdr_scale_uniform: None,
             sampler_uniform: None,
+            gamma_sampler_uniform: None,
+            gamma_size_uniform: None,
+            gamma_texture: None,
+            gamma_blob: None,
+            gamma_active: false,
             width,
             height,
             rgba: vec![0; bytes],
@@ -176,21 +247,27 @@ impl Gpu {
             self.dst_uniform = self.gl.get_uniform_location(program, "dst");
             self.src_uniform = self.gl.get_uniform_location(program, "src");
             self.rotation_uniform = self.gl.get_uniform_location(program, "rotation");
+            self.area_filter_uniform = self.gl.get_uniform_location(program, "area_filter");
             self.hdr_eotf_uniform = self.gl.get_uniform_location(program, "hdr_eotf");
             self.hdr_peak_nits_uniform = self.gl.get_uniform_location(program, "hdr_peak_nits");
             self.hdr_peak_uniform = self.gl.get_uniform_location(program, "hdr_peak_pq");
             self.hdr_white_uniform = self.gl.get_uniform_location(program, "hdr_white_pq");
             self.hdr_scale_uniform = self.gl.get_uniform_location(program, "hdr_white_scale");
             self.sampler_uniform = self.gl.get_uniform_location(program, "image");
+            self.gamma_sampler_uniform = self.gl.get_uniform_location(program, "crtc_lut");
+            self.gamma_size_uniform = self.gl.get_uniform_location(program, "crtc_lut_size");
             if self.dst_uniform.is_none()
                 || self.src_uniform.is_none()
                 || self.rotation_uniform.is_none()
+                || self.area_filter_uniform.is_none()
                 || self.hdr_eotf_uniform.is_none()
                 || self.hdr_peak_nits_uniform.is_none()
                 || self.hdr_peak_uniform.is_none()
                 || self.hdr_white_uniform.is_none()
                 || self.hdr_scale_uniform.is_none()
                 || self.sampler_uniform.is_none()
+                || self.gamma_sampler_uniform.is_none()
+                || self.gamma_size_uniform.is_none()
             {
                 return Err(AppError::new("capture shader uniforms are unavailable"));
             }
@@ -201,6 +278,17 @@ impl Gpu {
                 .map_err(|e| AppError::new(format!("creating capture VAO: {e}")))?;
             self.vao = Some(vao);
             self.gl.bind_vertex_array(Some(vao));
+
+            let gamma_texture = self.gl.create_texture()
+                .map_err(|e| AppError::new(format!("creating CRTC LUT texture: {e}")))?;
+            self.gamma_texture = Some(gamma_texture);
+            self.gl.active_texture(glow::TEXTURE1);
+            self.gl.bind_texture(glow::TEXTURE_2D, Some(gamma_texture));
+            self.gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
+            self.gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
+            self.gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA32F as i32, 1, 1, 0,
+                glow::RGBA, glow::FLOAT, glow::PixelUnpackData::Slice(None));
+            self.gl.active_texture(glow::TEXTURE0);
 
             for _ in 0..8 {
                 let texture = self
@@ -287,8 +375,8 @@ impl Gpu {
         Ok(())
     }
 
-    pub fn render(&mut self, monitor: &Monitor, planes: &[Plane]) -> Result<()> {
-        self.render_inner(monitor, planes, None)
+    pub fn render(&mut self, monitor: &Monitor, planes: &[Plane], area_filter: bool, gamma: Option<&GammaLut>) -> Result<()> {
+        self.render_inner(monitor, planes, None, area_filter, gamma)
     }
 
     pub fn render_diagnostic(
@@ -296,8 +384,10 @@ impl Gpu {
         monitor: &Monitor,
         planes: &[Plane],
         summaries: &mut Vec<PlaneDiagnostic>,
+        area_filter: bool,
+        gamma: Option<&GammaLut>,
     ) -> Result<()> {
-        self.render_inner(monitor, planes, Some(summaries))
+        self.render_inner(monitor, planes, Some(summaries), area_filter, gamma)
     }
 
     fn render_inner(
@@ -305,6 +395,8 @@ impl Gpu {
         monitor: &Monitor,
         planes: &[Plane],
         mut summaries: Option<&mut Vec<PlaneDiagnostic>>,
+        area_filter: bool,
+        gamma: Option<&GammaLut>,
     ) -> Result<()> {
         self.egl.make_current()?;
         let mut selected: [Option<&Plane>; 8] = [None; 8];
@@ -366,6 +458,37 @@ impl Gpu {
             self.gl.bind_vertex_array(self.vao);
             self.gl.active_texture(glow::TEXTURE0);
             self.gl.uniform_1_i32(self.sampler_uniform.as_ref(), 0);
+            self.gl.uniform_1_i32(self.area_filter_uniform.as_ref(), i32::from(area_filter));
+            // A CRTC LUT follows composition, so it is only equivalent here for
+            // a single full-screen HDR plane. Do not apply it per overlay.
+            let plane = selected[0].unwrap();
+            let gamma = gamma.filter(|_| crtc_gamma_applicable(monitor, plane, count));
+            self.gamma_active = gamma.is_some();
+            self.gl.active_texture(glow::TEXTURE1);
+            self.gl.bind_texture(glow::TEXTURE_2D, self.gamma_texture);
+            if let Some(lut) = gamma {
+                if self.gamma_blob != Some(lut.blob_id) {
+                    let height = lut.entries.len().div_ceil(256);
+                    let mut data = vec![0.0f32; 256 * height * 4];
+                    for (dst, src) in data.chunks_exact_mut(4).zip(&lut.entries) {
+                        for channel in 0..4 { dst[channel] = f32::from(src[channel]) / 65535.0; }
+                    }
+                    let bytes = std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len() * 4);
+                    self.gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA32F as i32, 256, height as i32,
+                        0, glow::RGBA, glow::FLOAT, glow::PixelUnpackData::Slice(Some(bytes)));
+                    let error = self.gl.get_error();
+                    if error != glow::NO_ERROR {
+                        return Err(AppError::new(format!("uploading CRTC gamma LUT failed (GL error 0x{error:04x})")));
+                    }
+                    self.gamma_blob = Some(lut.blob_id);
+                }
+                self.gl.uniform_1_i32(self.gamma_size_uniform.as_ref(), lut.entries.len() as i32);
+            } else {
+                self.gl.uniform_1_i32(self.gamma_size_uniform.as_ref(), 0);
+                self.gamma_blob = None;
+            }
+            self.gl.uniform_1_i32(self.gamma_sampler_uniform.as_ref(), 1);
+            self.gl.active_texture(glow::TEXTURE0);
             if let Some(output) = summaries.as_mut() {
                 output.clear();
                 let byte_len = self.width * self.height * 4;
@@ -711,7 +834,8 @@ impl Gpu {
                 "synthetic HDR capture orientation/color check failed",
             ));
         }
-        if baseline[0] <= 230 || baseline[1] <= 100 || baseline[2] == 0 {
+        // 10 nits against 203-nit white encodes to approximately 63 in sRGB.
+        if baseline[0] <= 230 || baseline[1] <= 100 || baseline[2].abs_diff(63) > 4 {
             return Err(AppError::new("synthetic HDR tone-map output out of range"));
         }
         if gpu.rgba.chunks_exact(4).any(|pixel| {
@@ -726,12 +850,162 @@ impl Gpu {
         {
             return Err(AppError::new("synthetic HLG decode/tone-map check failed"));
         }
+        gpu.synthetic_area_filter_test()?;
+        Ok(())
+    }
+
+    fn synthetic_area_filter_test(&self) -> Result<()> {
+        let mut pixels = vec![0u8; 12 * 12 * 4];
+        let mut outputs = [[0u8; 4]; 2];
+        let mut matches = true;
+        unsafe {
+            let texture = self.gl.create_texture()
+                .map_err(|e| AppError::new(format!("creating filter test texture: {e}")))?;
+            self.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+            self.gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+            self.gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+            self.gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+            self.gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+            self.gl.bind_framebuffer(glow::FRAMEBUFFER, self.framebuffer);
+            self.gl.viewport(0, 0, 1, 1);
+            self.gl.use_program(self.program);
+            self.gl.bind_vertex_array(self.vao);
+            self.gl.uniform_1_i32(self.sampler_uniform.as_ref(), 0);
+            self.gl.uniform_1_i32(self.hdr_eotf_uniform.as_ref(), 0);
+            self.gl.uniform_4_f32(self.dst_uniform.as_ref(), -1.0, -1.0, 1.0, 1.0);
+            self.gl.uniform_4_f32(self.src_uniform.as_ref(), 0.0, 0.0, 1.0, 1.0);
+            for phase in 0..3 {
+                for y in 0..12 {
+                    for x in 0..12 {
+                        let i = (y * 12 + x) * 4;
+                        pixels[i..i + 4].copy_from_slice(&[0, 0, 0, 255]);
+                        pixels[i + (x + phase) % 3] = 255;
+                    }
+                }
+                self.gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA8 as i32, 12, 12, 0,
+                    glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(Some(&pixels)));
+                for rotation in 0..4 {
+                    self.gl.uniform_1_i32(self.rotation_uniform.as_ref(), rotation);
+                    for filtered in 0..2 {
+                        self.gl.uniform_1_i32(self.area_filter_uniform.as_ref(), filtered);
+                        self.gl.draw_arrays(glow::TRIANGLES, 0, 3);
+                        self.gl.read_pixels(0, 0, 1, 1, glow::RGBA, glow::UNSIGNED_BYTE,
+                            glow::PixelPackData::Slice(Some(&mut outputs[filtered as usize])));
+                    }
+                    matches &= outputs[1][..3].iter().all(|v| v.abs_diff(85) <= 2);
+                    matches &= outputs[0][..3].iter().any(|v| v.abs_diff(85) > 20);
+                }
+            }
+            // A checkerboard must reduce to the same light as a uniform field
+            // of half its luminance, for both PQ and HLG, regardless of rotation.
+            self.gl.uniform_1_f32(self.hdr_white_uniform.as_ref(), pq_encode(203.0));
+            self.gl.uniform_1_f32(self.hdr_scale_uniform.as_ref(), 10000.0 / 203.0);
+            self.gl.uniform_1_f32(self.hdr_peak_nits_uniform.as_ref(), 1000.0);
+            self.gl.uniform_1_f32(self.hdr_peak_uniform.as_ref(), pq_encode(1000.0));
+            for eotf in [2, 3] {
+                self.gl.uniform_1_i32(self.hdr_eotf_uniform.as_ref(), eotf);
+                let white = if eotf == 2 { pq_encode(203.0) } else { 0.75 };
+                let average = if eotf == 2 {
+                    pq_encode(101.5)
+                } else {
+                    let target = hlg_reference_luminance(white, 1000.0) / 2.0;
+                    let (mut lo, mut hi) = (0.0, white);
+                    for _ in 0..24 {
+                        let mid = (lo + hi) * 0.5;
+                        if hlg_reference_luminance(mid, 1000.0) < target { lo = mid; } else { hi = mid; }
+                    }
+                    (lo + hi) * 0.5
+                };
+                let mut hdr_pixels = vec![0u8; 12 * 12 * 8];
+                for phase in 0..2 {
+                    for (index, pixel) in hdr_pixels.chunks_exact_mut(8).enumerate() {
+                        let x = index % 12;
+                        let y = index / 12;
+                        let level = if phase == 0 { average } else if (x + y) % 2 == 0 { white } else { 0.0 };
+                        let value = f32_to_f16(level).to_ne_bytes();
+                        for channel in 0..3 { pixel[channel * 2..channel * 2 + 2].copy_from_slice(&value); }
+                        pixel[6..8].copy_from_slice(&f32_to_f16(1.0).to_ne_bytes());
+                    }
+                    self.gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA16F as i32, 12, 12, 0,
+                        glow::RGBA, glow::HALF_FLOAT, glow::PixelUnpackData::Slice(Some(&hdr_pixels)));
+                    self.gl.uniform_1_i32(self.area_filter_uniform.as_ref(), phase);
+                    for rotation in 0..4 {
+                        self.gl.uniform_1_i32(self.rotation_uniform.as_ref(), rotation);
+                        self.gl.draw_arrays(glow::TRIANGLES, 0, 3);
+                        let mut out = [0u8; 4];
+                        self.gl.read_pixels(0, 0, 1, 1, glow::RGBA, glow::UNSIGNED_BYTE,
+                            glow::PixelPackData::Slice(Some(&mut out)));
+                        if phase == 0 { outputs[0] = out; }
+                        else { matches &= (0..4).all(|c| out[c].abs_diff(outputs[0][c]) <= 3); }
+                    }
+                }
+            }
+            // A post-composition CRTC LUT must be applied before PQ decode.
+            // Compare interpolation at three different channel positions with
+            // the equivalent direct PQ input, with and without area filtering.
+            self.gl.uniform_1_i32(self.hdr_eotf_uniform.as_ref(), 2);
+            self.gl.uniform_1_i32(self.rotation_uniform.as_ref(), 0);
+            let (low, high) = (pq_encode(10.0), pq_encode(203.0));
+            let expected_pq = [0.25, 0.5, 0.75].map(|x| low + (high - low) * x);
+            let mut lut = vec![0.0f32; 256 * 4];
+            for entry in 0..2 {
+                lut[entry * 4..entry * 4 + 3].fill(if entry == 0 { low } else { high });
+                lut[entry * 4 + 3] = 1.0;
+            }
+            self.gl.active_texture(glow::TEXTURE1);
+            self.gl.bind_texture(glow::TEXTURE_2D, self.gamma_texture);
+            let lut_bytes = std::slice::from_raw_parts(lut.as_ptr().cast::<u8>(), lut.len() * 4);
+            self.gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA32F as i32, 256, 1, 0,
+                glow::RGBA, glow::FLOAT, glow::PixelUnpackData::Slice(Some(lut_bytes)));
+            self.gl.uniform_1_i32(self.gamma_sampler_uniform.as_ref(), 1);
+            self.gl.active_texture(glow::TEXTURE0);
+            self.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+            for phase in 0..2 {
+                let rgb = if phase == 0 { expected_pq } else { [0.25, 0.5, 0.75] };
+                let mut input = vec![0u8; 12 * 12 * 8];
+                for pixel in input.chunks_exact_mut(8) {
+                    for channel in 0..3 {
+                        pixel[channel * 2..channel * 2 + 2].copy_from_slice(&f32_to_f16(rgb[channel]).to_ne_bytes());
+                    }
+                    pixel[6..8].copy_from_slice(&f32_to_f16(1.0).to_ne_bytes());
+                }
+                self.gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA16F as i32, 12, 12, 0,
+                    glow::RGBA, glow::HALF_FLOAT, glow::PixelUnpackData::Slice(Some(&input)));
+                self.gl.uniform_1_i32(self.gamma_size_uniform.as_ref(), if phase == 0 { 0 } else { 2 });
+                for filtered in 0..2 {
+                    self.gl.uniform_1_i32(self.area_filter_uniform.as_ref(), filtered);
+                    self.gl.draw_arrays(glow::TRIANGLES, 0, 3);
+                    let mut out = [0u8; 4];
+                    self.gl.read_pixels(0, 0, 1, 1, glow::RGBA, glow::UNSIGNED_BYTE,
+                        glow::PixelPackData::Slice(Some(&mut out)));
+                    if phase == 0 { outputs[filtered as usize] = out; }
+                    else { matches &= (0..4).all(|c| out[c].abs_diff(outputs[filtered as usize][c]) <= 3); }
+                }
+            }
+            self.gl.uniform_1_i32(self.gamma_size_uniform.as_ref(), 0);
+            let error = self.gl.get_error();
+            self.gl.bind_vertex_array(None);
+            self.gl.use_program(None);
+            self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            self.gl.delete_texture(texture);
+            if error != glow::NO_ERROR || !matches {
+                return Err(AppError::new("synthetic fine-pattern filter check failed"));
+            }
+        }
         Ok(())
     }
 
     pub fn frame(&self) -> (&[u8], usize, usize, usize) {
         (&self.rgba, self.width, self.height, self.width * 4)
     }
+
+    pub fn crtc_gamma_active(&self) -> bool { self.gamma_active }
+}
+
+fn crtc_gamma_applicable(monitor: &Monitor, plane: &Plane, plane_count: usize) -> bool {
+    plane_count == 1 && matches!(plane.hdr, Some(hdr) if hdr.eotf == 2 || hdr.eotf == 3)
+        && plane.dst_x == 0 && plane.dst_y == 0
+        && plane.dst_w == monitor.width as i32 && plane.dst_h == monitor.height as i32
 }
 
 impl Drop for Gpu {
@@ -742,6 +1016,9 @@ impl Drop for Gpu {
                 self.gl.delete_texture(texture);
             }
             if let Some(texture) = self.output.take() {
+                self.gl.delete_texture(texture);
+            }
+            if let Some(texture) = self.gamma_texture.take() {
                 self.gl.delete_texture(texture);
             }
             if let Some(framebuffer) = self.framebuffer.take() {
@@ -1481,6 +1758,23 @@ mod tests {
             zpos: 0,
             hdr,
         }
+    }
+
+    #[test]
+    fn crtc_gamma_only_applies_to_a_single_fullscreen_hdr_plane() {
+        let monitor = Monitor { name: "fixture".into(), card_path: "fixture".into(), connector_id: 1, width: 1, height: 1 };
+        let hdr = HdrMetadata { metadata_type: 0, infoframe_metadata_type: 0, eotf: 2,
+            max_luminance: 1000, min_luminance: 0, max_cll: 1000, max_fall: 1000 };
+        let mut p = plane(Some(hdr));
+        assert!(crtc_gamma_applicable(&monitor, &p, 1));
+        assert!(!crtc_gamma_applicable(&monitor, &p, 2));
+        p.dst_x = 1;
+        assert!(!crtc_gamma_applicable(&monitor, &p, 1));
+        p.dst_x = 0;
+        p.hdr = None;
+        assert!(!crtc_gamma_applicable(&monitor, &p, 1));
+        p.hdr = Some(HdrMetadata { eotf: 0, ..hdr });
+        assert!(!crtc_gamma_applicable(&monitor, &p, 1));
     }
 
     #[test]

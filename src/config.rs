@@ -34,6 +34,7 @@ pub struct Config {
     pub midtone_lift: bool,
     pub strict_black: bool,
     pub spatial_blend: bool,
+    pub capture_area_filter: bool,
     pub start_corner: String,
     pub reverse_direction: bool,
     pub perimeter_offset: i32,
@@ -68,6 +69,7 @@ impl Default for Config {
             midtone_lift: false,
             strict_black: false,
             spatial_blend: false,
+            capture_area_filter: false,
             start_corner: "bottom_center".into(),
             reverse_direction: false,
             perimeter_offset: 0,
@@ -190,6 +192,7 @@ impl Config {
             "midtone_lift": self.midtone_lift,
             "strict_black": self.strict_black,
             "spatial_blend": self.spatial_blend,
+            "capture_area_filter": self.capture_area_filter,
         })
     }
 
@@ -220,6 +223,7 @@ impl Config {
                 "reverse_direction" => next.reverse_direction = json_bool(value, key)?,
                 "perimeter_offset" => next.perimeter_offset = json_i32(value, key)?,
                 "spatial_blend" => next.spatial_blend = json_bool(value, key)?,
+                "capture_area_filter" => next.capture_area_filter = json_bool(value, key)?,
                 _ => return Err(AppError::new("unsupported setting")),
             }
         }
@@ -405,6 +409,9 @@ fn load_values(config: &mut Config, root: &Value) -> Result<()> {
     }
     if let Some(value) = object.get("strict_black") {
         config.strict_black = json_bool(value, "strict_black")?;
+    }
+    if let Some(value) = object.get("capture_area_filter") {
+        config.capture_area_filter = json_bool(value, "capture_area_filter")?;
     }
     if let Some(value) = object.get("spatial_blend") {
         config.spatial_blend = json_bool(value, "spatial_blend")?;
@@ -679,6 +686,20 @@ mod tests {
         assert!(config.settings_json().get("token").is_none());
         assert!(config.settings_json().get("ip").is_none());
         assert!(config.settings_json().get("port").is_none());
+    }
+
+    #[test]
+    fn capture_area_filter_defaults_off_validates_and_persists() {
+        let path = test_path();
+        let mut config = Config { config_path: path.clone(), ..Config::default() };
+        assert!(!config.capture_area_filter);
+        assert!(config.apply_settings(&json!({"capture_area_filter": "true"})).is_err());
+        assert!(!config.capture_area_filter);
+        config.apply_settings(&json!({"capture_area_filter": true})).unwrap();
+        config.save_settings(&json!({"capture_area_filter": true})).unwrap();
+        assert!(Config::load(&path).unwrap().capture_area_filter);
+        let _ = fs::remove_file(&path);
+        if let Ok(lock) = lock_path(&path) { let _ = fs::remove_file(lock); }
     }
 
     #[test]

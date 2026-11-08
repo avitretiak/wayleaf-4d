@@ -1,11 +1,12 @@
 use crate::gpu::{self, Gpu};
-use crate::kms::{self, HdrMetadata, KmsClient, Monitor};
+use crate::kms::{self, GammaTracker, HdrMetadata, KmsClient, Monitor};
 use crate::Result;
 
 pub struct Capture {
     monitor: Monitor,
     gpu: Gpu,
     kms: KmsClient,
+    gamma: Option<GammaTracker>,
     diagnostics: Vec<PlaneDiagnostic>,
 }
 
@@ -39,6 +40,7 @@ pub struct PlaneDiagnostic {
 pub struct DiagnosticFrame<'a> {
     pub frame: Frame<'a>,
     pub planes: &'a [PlaneDiagnostic],
+    pub crtc_gamma_applied: bool,
 }
 
 pub struct Frame<'a> {
@@ -53,16 +55,19 @@ impl Capture {
         let monitor = kms::select_monitor(monitor_name)?;
         let kms = KmsClient::new(&monitor)?;
         let gpu = Gpu::new(&monitor)?;
+        let gamma = GammaTracker::new(&monitor);
         Ok(Self {
             monitor,
             gpu,
             kms,
+            gamma,
             diagnostics: Vec::new(),
         })
     }
-    pub fn frame(&mut self) -> Result<Frame<'_>> {
+    pub fn frame(&mut self, area_filter: bool) -> Result<Frame<'_>> {
         let planes = self.kms.capture()?;
-        self.gpu.render(&self.monitor, planes)?;
+        let gamma = self.gamma.as_mut().and_then(GammaTracker::current);
+        self.gpu.render(&self.monitor, planes, area_filter, gamma)?;
         let (data, width, height, stride) = self.gpu.frame();
         Ok(Frame {
             data,
@@ -72,10 +77,11 @@ impl Capture {
         })
     }
 
-    pub fn diagnostic_frame(&mut self) -> Result<DiagnosticFrame<'_>> {
+    pub fn diagnostic_frame(&mut self, area_filter: bool) -> Result<DiagnosticFrame<'_>> {
         let planes = self.kms.capture()?;
+        let gamma = self.gamma.as_mut().and_then(GammaTracker::current);
         self.gpu
-            .render_diagnostic(&self.monitor, planes, &mut self.diagnostics)?;
+            .render_diagnostic(&self.monitor, planes, &mut self.diagnostics, area_filter, gamma)?;
         let (data, width, height, stride) = self.gpu.frame();
         let frame = Frame {
             data,
@@ -86,6 +92,7 @@ impl Capture {
         Ok(DiagnosticFrame {
             frame,
             planes: &self.diagnostics,
+            crtc_gamma_applied: self.gpu.crtc_gamma_active(),
         })
     }
 

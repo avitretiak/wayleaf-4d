@@ -27,6 +27,8 @@ const MAX_FDS: usize = MAX_ITEMS * MAX_DMA_BUFS;
 const HELPER: &str = "/usr/bin/gsr-kms-server";
 const DRM_MODE_CONNECTED: i32 = 1;
 const DRM_MODE_OBJECT_CONNECTOR: u32 = 0xc0c0_c0c0;
+const DRM_MODE_OBJECT_CRTC: u32 = 0xcccc_cccc;
+const DRM_CLIENT_CAP_ATOMIC: u64 = 3;
 
 #[derive(Clone, Serialize)]
 pub struct Monitor {
@@ -73,6 +75,61 @@ pub struct HdrMetadata {
     pub min_luminance: u16,
     pub max_cll: u16,
     pub max_fall: u16,
+}
+
+/// The CRTC's post-composition gamma LUT, refreshed when its DRM blob changes.
+pub struct GammaLut {
+    pub blob_id: u32,
+    pub entries: Vec<[u16; 4]>,
+}
+
+pub struct GammaTracker {
+    fd: File,
+    connector_id: u32,
+    cached: Option<GammaLut>,
+}
+
+impl GammaTracker {
+    pub fn new(monitor: &Monitor) -> Option<Self> {
+        let fd = OpenOptions::new().read(true).custom_flags(libc::O_CLOEXEC)
+            .open(&monitor.card_path).ok()?;
+        // Atomic properties, including GAMMA_LUT, are per-client capabilities.
+        if unsafe { drmSetClientCap(fd.as_raw_fd(), DRM_CLIENT_CAP_ATOMIC, 1) } != 0 { return None; }
+        Some(Self { fd, connector_id: monitor.connector_id, cached: None })
+    }
+
+    pub fn current(&mut self) -> Option<&GammaLut> {
+        let fd = self.fd.as_raw_fd();
+        let connector = NonNull::new(unsafe { drmModeGetConnectorCurrent(fd, self.connector_id) })?;
+        let connector = DrmConnector(connector);
+        let crtc = connector_crtc(fd, unsafe { connector.0.as_ref() }).ok()??;
+        let (gamma, ctm, degamma) = crtc_color_properties(fd, crtc)?;
+        // The CRTC matrix or degamma would also need to be reproduced.
+        if ctm != 0 || degamma != 0 { return None; }
+        let id = u32::try_from(gamma?).ok()?;
+        if id == 0 { self.cached = None; return None; }
+        if self.cached.as_ref().is_none_or(|lut| lut.blob_id != id) {
+            let blob = NonNull::new(unsafe { drmModeGetPropertyBlob(fd, id) })?;
+            let blob = DrmPropertyBlob(blob);
+            let data = unsafe { blob.0.as_ref() };
+            if data.data.is_null() || data.length % 8 != 0 || !(16..=131_072).contains(&data.length) {
+                self.cached = None;
+                return None;
+            }
+            let bytes = unsafe { slice::from_raw_parts(data.data.cast::<u8>(), data.length as usize) };
+            let entries = parse_gamma_lut(bytes)?;
+            self.cached = Some(GammaLut { blob_id: id, entries });
+        }
+        self.cached.as_ref()
+    }
+}
+
+fn parse_gamma_lut(bytes: &[u8]) -> Option<Vec<[u16; 4]>> {
+    if bytes.len() % 8 != 0 || !(16..=131_072).contains(&bytes.len()) { return None; }
+    Some(bytes.chunks_exact(8).map(|c| [
+        u16::from_ne_bytes([c[0], c[1]]), u16::from_ne_bytes([c[2], c[3]]),
+        u16::from_ne_bytes([c[4], c[5]]), u16::from_ne_bytes([c[6], c[7]]),
+    ]).collect())
 }
 
 pub struct KmsClient {
@@ -719,6 +776,29 @@ fn object_property(fd: RawFd, object_id: u32, object_type: u32, wanted: &str) ->
     None
 }
 
+fn crtc_color_properties(fd: RawFd, crtc: u32) -> Option<(Option<u64>, u64, u64)> {
+    let props = NonNull::new(unsafe { drmModeObjectGetProperties(fd, crtc, DRM_MODE_OBJECT_CRTC) })?;
+    let props = DrmObjectProperties(props);
+    let details = unsafe { props.0.as_ref() };
+    if details.count_props > 0 && (details.props.is_null() || details.prop_values.is_null()) {
+        return None;
+    }
+    let (mut gamma, mut ctm, mut degamma) = (None, 0, 0);
+    for index in 0..details.count_props as usize {
+        let property = NonNull::new(unsafe { drmModeGetProperty(fd, *details.props.add(index)) })?;
+        let property = DrmProperty(property);
+        let name = unsafe { CStr::from_ptr(property.0.as_ref().name.as_ptr()) };
+        let value = unsafe { *details.prop_values.add(index) };
+        match name.to_bytes() {
+            b"GAMMA_LUT" => gamma = Some(value),
+            b"CTM" => ctm = value,
+            b"DEGAMMA_LUT" => degamma = value,
+            _ => {}
+        }
+    }
+    Some((gamma, ctm, degamma))
+}
+
 fn parse_control_messages(message: &libc::msghdr, received: &mut ReceivedFds) {
     let control = message.msg_control.cast::<u8>();
     let total = message.msg_controllen;
@@ -1310,8 +1390,16 @@ struct DrmModeProperty {
     _blob_ids: *mut u32,
 }
 
+#[repr(C)]
+struct DrmModePropertyBlob {
+    _id: u32,
+    length: u32,
+    data: *mut libc::c_void,
+}
+
 #[link(name = "drm")]
 extern "C" {
+    fn drmSetClientCap(fd: libc::c_int, capability: u64, value: u64) -> libc::c_int;
     fn drmModeGetResources(fd: libc::c_int) -> *mut DrmModeResources;
     fn drmModeFreeResources(resources: *mut DrmModeResources);
     fn drmModeGetConnectorCurrent(fd: libc::c_int, connector_id: u32) -> *mut DrmModeConnector;
@@ -1328,6 +1416,8 @@ extern "C" {
     fn drmModeFreeObjectProperties(properties: *mut DrmModeObjectProperties);
     fn drmModeGetProperty(fd: libc::c_int, property_id: u32) -> *mut DrmModeProperty;
     fn drmModeFreeProperty(property: *mut DrmModeProperty);
+    fn drmModeGetPropertyBlob(fd: libc::c_int, id: u32) -> *mut DrmModePropertyBlob;
+    fn drmModeFreePropertyBlob(blob: *mut DrmModePropertyBlob);
     fn drmModeGetConnectorTypeName(connector_type: u32) -> *const libc::c_char;
 }
 
@@ -1337,6 +1427,7 @@ struct DrmEncoder(NonNull<DrmModeEncoder>);
 struct DrmCrtc(NonNull<DrmModeCrtc>);
 struct DrmObjectProperties(NonNull<DrmModeObjectProperties>);
 struct DrmProperty(NonNull<DrmModeProperty>);
+struct DrmPropertyBlob(NonNull<DrmModePropertyBlob>);
 
 impl Drop for DrmResources {
     fn drop(&mut self) {
@@ -1368,10 +1459,25 @@ impl Drop for DrmProperty {
         unsafe { drmModeFreeProperty(self.0.as_ptr()) }
     }
 }
+impl Drop for DrmPropertyBlob {
+    fn drop(&mut self) {
+        unsafe { drmModeFreePropertyBlob(self.0.as_ptr()) }
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gamma_lut_parser_checks_bounds_and_preserves_channels() {
+        assert!(parse_gamma_lut(&[]).is_none());
+        assert!(parse_gamma_lut(&[0; 15]).is_none());
+        assert!(parse_gamma_lut(&vec![0; 131_080]).is_none());
+        let values = [0u16, 100, 200, 0, 65535, 60000, 50000, 0];
+        let bytes: Vec<u8> = values.into_iter().flat_map(u16::to_ne_bytes).collect();
+        assert_eq!(parse_gamma_lut(&bytes).unwrap(), vec![[0, 100, 200, 0], [65535, 60000, 50000, 0]]);
+    }
 
     #[test]
     fn empty_successful_response_is_temporary() {

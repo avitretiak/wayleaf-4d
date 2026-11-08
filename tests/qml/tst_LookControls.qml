@@ -21,7 +21,7 @@ TestCase {
         mode: "4D", static_color: "#ffffff", brightness: 1.0,
         saturation_boost: 1.0, smooth: 0.25, max_step: 12, edge_depth: 8,
         feather_depth: 5, center_bleed: 0, peak_mix: 10, black_threshold: 0.05,
-        fps: 10, letterbox: true, midtone_lift: false, strict_black: false, spatial_blend: false,
+        fps: 10, letterbox: true, midtone_lift: false, strict_black: false, spatial_blend: false, capture_area_filter: false,
         start_corner: "bottom_center", reverse_direction: false, perimeter_offset: 0
     })
     function normalized(values) {
@@ -130,6 +130,24 @@ TestCase {
         tryCompare(popup, "selectedPreset", ["Subtle", "Balanced", "Vivid", "Custom"][index])
     }
 
+
+    function test_capture_filter_is_independent_of_looks_and_inactive_in_1d() {
+        const button = findChild(popup, "more-options-button")
+        const menu = findChild(popup, "overflow-menu")
+        const filter = findChild(popup, "capture-area-filter")
+        verify(filter !== null)
+        mouseClick(button)
+        tryCompare(menu, "visible", true)
+        filter.click()
+        compare(backendState.settings.capture_area_filter, true)
+        selectLook(1)
+        compare(backendState.settings.capture_area_filter, true)
+        backendState.setSetting("mode", "1D")
+        compare(filter.enabled, false)
+        compare(backendState.settings.capture_area_filter, true)
+        backendState.setSetting("mode", "4D")
+        compare(filter.enabled, true)
+    }
 
     function test_overflow_menu_anchors_to_actual_button() {
         const button = findChild(popup, "more-options-button")

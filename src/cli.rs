@@ -58,6 +58,8 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Args> {
             "--letterbox" => config.letterbox = true,
             "--midtone-lift" => config.midtone_lift = true,
             "--no-midtone-lift" => config.midtone_lift = false,
+            "--capture-area-filter" => config.capture_area_filter = true,
+            "--no-capture-area-filter" => config.capture_area_filter = false,
             "--strict-black" => config.strict_black = true,
             "--no-strict-black" => config.strict_black = false,
             "--config" | "--ip" | "--token" | "--monitor" | "--port" | "--fps" | "--max-step"
@@ -233,6 +235,7 @@ pub fn usage() -> &'static str {
      --center-bleed 0..50 --peak-mix 0..35 --feather-depth 0..20\n\
      --no-letterbox --letterbox --midtone-lift --no-midtone-lift\n\
      --strict-black --no-strict-black --monitor NAME\n\
+     --capture-area-filter --no-capture-area-filter\n\
      --device-info --self-test --capture-test --capture-debug --capture-planes\n\
      --control --list-monitors\n\
      --version                 print Wayleaf 4D version"

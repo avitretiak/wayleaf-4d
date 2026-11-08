@@ -2,6 +2,11 @@
 
 For installation and requirements, see the [README](../README.md). Current controls and configuration are documented in the [User Guide](USAGE.md).
 
+## Unreleased
+
+- Added an optional fine-pattern capture filter to reduce color artifacts from CRT masks and other fine screen detail. It is off by default and independent of Looks and strip alignment.
+- HDR capture now uses sRGB output encoding. For a single full-screen HDR plane, it can apply an active CRTC gamma LUT before HDR conversion when no CRTC matrix or degamma LUT is active. The optional filter averages HDR in linear light.
+
 ## 0.4.4 — 2026-11-08
 
 - Preview replies from an older subscription no longer replace or clear a reopened preview.

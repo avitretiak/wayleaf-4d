@@ -1212,7 +1212,7 @@ fn value_to_owned(key: &str, value: &Value) -> std::result::Result<OwnedValue, S
                 .ok_or_else(invalid)?;
             Ok(OwnedValue::from(number))
         }
-        "letterbox" | "midtone_lift" | "strict_black" | "reverse_direction" | "spatial_blend" => {
+        "letterbox" | "midtone_lift" | "strict_black" | "reverse_direction" | "spatial_blend" | "capture_area_filter" => {
             value.as_bool().map(OwnedValue::from).ok_or_else(invalid)
         }
         "monitor" | "mode" | "static_color" | "start_corner" => value
@@ -1559,6 +1559,13 @@ mod tests {
         assert!(json.contains("192.0.2.1"));
         assert!(!json.contains("secret-marker"));
         assert!(!json.contains("\"token\""));
+    }
+
+    #[test]
+    fn capture_filter_uses_boolean_dbus_transport() {
+        let value = value_to_owned("capture_area_filter", &json!(true)).unwrap();
+        assert_eq!(owned_value_json(&value), Some(json!(true)));
+        assert!(value_to_owned("capture_area_filter", &json!("true")).is_err());
     }
 
     #[test]
