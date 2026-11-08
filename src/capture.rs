@@ -1,11 +1,44 @@
 use crate::gpu::{self, Gpu};
-use crate::kms::{self, KmsClient, Monitor};
+use crate::kms::{self, HdrMetadata, KmsClient, Monitor};
 use crate::Result;
 
 pub struct Capture {
     monitor: Monitor,
     gpu: Gpu,
     kms: KmsClient,
+    diagnostics: Vec<PlaneDiagnostic>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PlaneDiagnostic {
+    pub index: usize,
+    pub plane_type: u32,
+    pub width: u32,
+    pub height: u32,
+    pub pixel_format: u32,
+    pub modifier: u64,
+    pub rotation: u32,
+    pub src_x: i32,
+    pub src_y: i32,
+    pub src_w: i32,
+    pub src_h: i32,
+    pub dst_x: i32,
+    pub dst_y: i32,
+    pub dst_w: i32,
+    pub dst_h: i32,
+    pub zpos: i32,
+    pub hdr: Option<HdrMetadata>,
+    pub sample_count: usize,
+    pub r: f32,
+    pub g: f32,
+    pub b: f32,
+    /// Mean alpha from the imported framebuffer pixels; DRM plane alpha is not included.
+    pub a: f32,
+}
+
+pub struct DiagnosticFrame<'a> {
+    pub frame: Frame<'a>,
+    pub planes: &'a [PlaneDiagnostic],
 }
 
 pub struct Frame<'a> {
@@ -20,9 +53,13 @@ impl Capture {
         let monitor = kms::select_monitor(monitor_name)?;
         let kms = KmsClient::new(&monitor)?;
         let gpu = Gpu::new(&monitor)?;
-        Ok(Self { monitor, gpu, kms })
+        Ok(Self {
+            monitor,
+            gpu,
+            kms,
+            diagnostics: Vec::new(),
+        })
     }
-
     pub fn frame(&mut self) -> Result<Frame<'_>> {
         let planes = self.kms.capture()?;
         self.gpu.render(&self.monitor, planes)?;
@@ -32,6 +69,23 @@ impl Capture {
             width,
             height,
             stride,
+        })
+    }
+
+    pub fn diagnostic_frame(&mut self) -> Result<DiagnosticFrame<'_>> {
+        let planes = self.kms.capture()?;
+        self.gpu
+            .render_diagnostic(&self.monitor, planes, &mut self.diagnostics)?;
+        let (data, width, height, stride) = self.gpu.frame();
+        let frame = Frame {
+            data,
+            width,
+            height,
+            stride,
+        };
+        Ok(DiagnosticFrame {
+            frame,
+            planes: &self.diagnostics,
         })
     }
 

@@ -10,6 +10,7 @@ pub enum Mode {
     SelfTest,
     CaptureTest,
     CaptureDebug,
+    CapturePlanes,
     Pair,
     DeviceInfo,
     Control,
@@ -20,7 +21,6 @@ pub struct Args {
     pub config: Config,
     pub mode: Mode,
 }
-
 pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Args> {
     let args: Vec<String> = args.into_iter().collect();
     validate_mode_flags(&args)?;
@@ -37,10 +37,10 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Args> {
     let mut device_info = false;
     let mut capture_test = false;
     let mut capture_debug = false;
+    let mut capture_planes = false;
     let mut control = false;
     let mut list_monitors = false;
     let mut i = 0;
-
     while i < args.len() {
         let option = args[i].as_str();
         match option {
@@ -51,6 +51,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Args> {
             "--device-info" => device_info = true,
             "--capture-test" => capture_test = true,
             "--capture-debug" => capture_debug = true,
+            "--capture-planes" => capture_planes = true,
             "--control" => control = true,
             "--list-monitors" => list_monitors = true,
             "--no-letterbox" => config.letterbox = false,
@@ -95,6 +96,8 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Args> {
         Mode::CaptureTest
     } else if capture_debug {
         Mode::CaptureDebug
+    } else if capture_planes {
+        Mode::CapturePlanes
     } else if device_info {
         Mode::DeviceInfo
     } else if pair {
@@ -121,6 +124,7 @@ fn validate_mode_flags(args: &[String]) -> Result<()> {
             "--device-info" => Some(Mode::DeviceInfo),
             "--capture-test" => Some(Mode::CaptureTest),
             "--capture-debug" => Some(Mode::CaptureDebug),
+            "--capture-planes" => Some(Mode::CapturePlanes),
             "--control" => Some(Mode::Control),
             "--list-monitors" => Some(Mode::ListMonitors),
             _ => None,
@@ -229,7 +233,7 @@ pub fn usage() -> &'static str {
      --center-bleed 0..50 --peak-mix 0..35 --feather-depth 0..20\n\
      --no-letterbox --letterbox --midtone-lift --no-midtone-lift\n\
      --strict-black --no-strict-black --monitor NAME\n\
-     --device-info --self-test --capture-test --capture-debug\n\
+     --device-info --self-test --capture-test --capture-debug --capture-planes\n\
      --control --list-monitors\n\
      --version                 print Wayleaf 4D version"
 }
@@ -292,6 +296,43 @@ mod tests {
         assert!(args.is_err());
     }
 
+    #[test]
+    fn capture_plane_mode_parses_monitor_without_credentials() {
+        let args = parse([
+            "--config".into(),
+            unique_path().display().to_string(),
+            "--capture-planes".into(),
+            "--monitor".into(),
+            "DP-3".into(),
+        ])
+        .expect("parse plane diagnostic");
+        assert!(matches!(args.mode, Mode::CapturePlanes));
+        assert_eq!(args.config.monitor, "DP-3");
+        assert!(args.config.host.is_empty());
+        assert!(args.config.token.is_empty());
+    }
+
+    #[test]
+    fn capture_plane_mode_conflicts_with_other_modes() {
+        let error = match parse(["--capture-planes".into(), "--capture-test".into()]) {
+            Err(error) => error,
+            Ok(_) => panic!("conflicting capture modes were accepted"),
+        };
+        assert_eq!(error.message, "conflicting command-line modes");
+    }
+
+    #[test]
+    fn command_line_overrides_are_validated_after_parsing() {
+        for (option, value) in [("--fps", "0"), ("--brightness", "3")] {
+            assert!(parse([
+                "--config".into(),
+                unique_path().display().to_string(),
+                option.into(),
+                value.into(),
+            ])
+            .is_err(), "{option} accepted an out-of-range override");
+        }
+    }
     #[test]
     fn conflicting_modes_fail_before_loading_config() {
         let path = unique_path();

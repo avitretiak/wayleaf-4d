@@ -32,6 +32,7 @@ Item {
     property string status: "stopped"
     property bool running: false
     property string error: ""
+    property bool _refreshError: false
     property bool startAtLogin: false
     property bool busy: false
     property bool deviceConnected: false
@@ -205,6 +206,7 @@ Item {
         if (!settingsPending && !_settingsInFlight && state.settings && typeof state.settings === "object" && !Array.isArray(state.settings))
             settings = settingsFrom(state.settings)
         error = typeof state.error === "string" ? state.error : ""
+        _refreshError = state.refreshError === true
         applyDeviceState(state)
     }
 
@@ -240,7 +242,9 @@ Item {
                 return
             }
             const wasUnavailable = _controlUnavailable
+            const wasRefreshError = _refreshError
             _controlUnavailable = false
+            _refreshError = state.refreshError === true
             if (stateGeneration === _stateGeneration && !_localBusy) {
                 if (typeof state.status === "string")
                     status = state.status
@@ -270,7 +274,7 @@ Item {
             if (stateGeneration === _stateGeneration && !_localBusy) {
                 if (state.error)
                     error = String(state.error)
-                else if (wasUnavailable)
+                else if (wasUnavailable || wasRefreshError)
                     error = ""
             }
         }, function(detail) {
@@ -308,9 +312,10 @@ Item {
         if (!previewEnabled || !previewReady || !running || _previewCallInFlight)
             return
         _previewCallInFlight = true
+        const generation = _previewGeneration
         callControl("GetPreview", [], function(value) {
             _previewCallInFlight = false
-            if (!previewEnabled || !previewReady || !running)
+            if (generation !== _previewGeneration || !previewEnabled || !previewReady || !running)
                 return
             let zones
             try {
@@ -337,7 +342,8 @@ Item {
             })
         }, function() {
             _previewCallInFlight = false
-            previewZones = []
+            if (generation === _previewGeneration)
+                previewZones = []
         })
     }
 

@@ -2,6 +2,13 @@
 
 For installation and requirements, see the [README](../README.md). Current controls and configuration are documented in the [User Guide](USAGE.md).
 
+## 0.4.4 — 2026-11-08
+
+- Preview replies from an older subscription no longer replace or clear a reopened preview.
+- Control refresh errors clear after recovery.
+- `--capture-planes` now reports per-plane imported RGBA/sample counts and Wayleaf's software-composite RGB statistics alongside KMS layout metadata, without saving images or sending light updates.
+- Control lifecycle status now uses explicit internal states while preserving its D-Bus status values; settings transaction tests cover persistence failure and success.
+
 ## 0.4.3 — 2026-10-20
 
 - Black-bar crops now require common active-picture aspect ratios, rejecting stable dark borders that imply an unusual crop.

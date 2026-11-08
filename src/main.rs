@@ -25,6 +25,7 @@ fn dispatch() -> Result<()> {
             require_device(&config, "--capture-debug")?;
             runtime::capture_debug(&config)?;
         }
+        cli::Mode::CapturePlanes => runtime::capture_planes(&config.monitor)?,
         cli::Mode::Pair => {
             if config.host.is_empty() {
                 return Err(AppError::new("--ip is required to pair"));

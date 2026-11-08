@@ -1,8 +1,9 @@
-use crate::capture::Capture;
+use crate::capture::{Capture, PlaneDiagnostic};
 use crate::device::{
     connect_udp, enable_stream, encode_packet, panel_layout, restore_effect, selected_effect,
     send_packet,
 };
+use crate::kms::{self, Monitor};
 use crate::sampling::{
     colors_for_mode, make_zones, preview_zones_for_mode, zones_for_mode, Color, Sampler, Zone,
 };
@@ -16,7 +17,7 @@ use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use zbus::blocking::Connection;
 use zbus::fdo::{RequestNameFlags, RequestNameReply};
 use zbus::zvariant::{OwnedValue, Value as DbusValue};
@@ -784,6 +785,243 @@ impl CaptureColorStats {
             self.neutral_1 as f64 * 100.0 / count,
             self.neutral_2 as f64 * 100.0 / count,
         ]
+    }
+}
+
+const PLANE_DIAGNOSTIC_INTERVAL: Duration = Duration::from_millis(200);
+
+pub fn capture_planes(monitor_name: &str) -> Result<()> {
+    let stop = Arc::new(AtomicBool::new(false));
+    register_signals(stop.clone())?;
+    if stop.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let monitor = kms::select_monitor(monitor_name)?;
+    let mut capture = Capture::new(&monitor.name)?;
+    let stdout = std::io::stdout();
+    let mut output = std::io::BufWriter::new(stdout.lock());
+    let mut previous_layout = String::new();
+    let mut deadline = Instant::now();
+
+    writeln!(
+        output,
+        "Sampling per-plane imports and Wayleaf software composite until Ctrl-C; read-only, no images saved or UDP/device API calls"
+    )
+    .map_err(diagnostic_io)?;
+    output.flush().map_err(diagnostic_io)?;
+
+    while !stop.load(Ordering::Acquire) {
+        wait_until(&stop, deadline);
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        let diagnostic = capture.diagnostic_frame()?;
+        let layout = plane_layout(&monitor, diagnostic.planes);
+        if layout != previous_layout {
+            writeln!(output, "{layout}").map_err(diagnostic_io)?;
+            output.flush().map_err(diagnostic_io)?;
+            previous_layout = layout;
+        }
+
+        let timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        for plane in diagnostic.planes {
+            writeln!(
+                output,
+                "plane unix_ms={timestamp_ms} index={} rgba={:.1},{:.1},{:.1},{:.1} samples={}",
+                plane.index, plane.r, plane.g, plane.b, plane.a, plane.sample_count
+            )
+            .map_err(diagnostic_io)?;
+        }
+        let composite = CaptureColorStats::sample(
+            diagnostic.frame.data,
+            diagnostic.frame.stride,
+            diagnostic.frame.width,
+            diagnostic.frame.height,
+        );
+        let [red, green, blue] = composite.means();
+        writeln!(
+            output,
+            "composite unix_ms={timestamp_ms} size={}x{} rgb={red:.1},{green:.1},{blue:.1} samples={}",
+            diagnostic.frame.width,
+            diagnostic.frame.height,
+            composite.samples
+        )
+        .map_err(diagnostic_io)?;
+        output.flush().map_err(diagnostic_io)?;
+        deadline = next_deadline(deadline, Instant::now(), PLANE_DIAGNOSTIC_INTERVAL);
+    }
+    Ok(())
+}
+
+fn plane_layout(monitor: &Monitor, planes: &[PlaneDiagnostic]) -> String {
+    let mut layout = format!(
+        "monitor={} connector={} mode={}x{}",
+        monitor.name, monitor.connector_id, monitor.width, monitor.height
+    );
+    for plane in planes {
+        use std::fmt::Write as _;
+        let _ = write!(
+            layout,
+            "\nplane index={} role={} fb={}x{} format={} modifier=0x{:016x} src=({},{} {}x{}) dst=({},{} {}x{}) rotation={} zpos={} hdr={:?}",
+            plane.index,
+            plane_role_name(plane.plane_type),
+            plane.width,
+            plane.height,
+            fourcc(plane.pixel_format),
+            plane.modifier,
+            plane.src_x,
+            plane.src_y,
+            plane.src_w,
+            plane.src_h,
+            plane.dst_x,
+            plane.dst_y,
+            plane.dst_w,
+            plane.dst_h,
+            plane.rotation,
+            plane.zpos,
+            plane.hdr
+        );
+    }
+    layout
+}
+
+fn plane_role_name(plane_type: u32) -> String {
+    match plane_type {
+        0 => "Primary".to_owned(),
+        1 => "Cursor".to_owned(),
+        2 => "Overlay".to_owned(),
+        unknown => format!("Unknown({unknown})"),
+    }
+}
+
+fn fourcc(format: u32) -> String {
+    let bytes = format.to_le_bytes();
+    bytes
+        .into_iter()
+        .map(|byte| {
+            if byte.is_ascii_graphic() || byte == b' ' {
+                byte as char
+            } else {
+                '?'
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod plane_role_tests {
+    use super::plane_role_name;
+
+    #[test]
+    fn names_known_and_unknown_gsr_plane_roles() {
+        assert_eq!(plane_role_name(0), "Primary");
+        assert_eq!(plane_role_name(1), "Cursor");
+        assert_eq!(plane_role_name(2), "Overlay");
+        assert_eq!(plane_role_name(3), "Unknown(3)");
+    }
+}
+
+#[cfg(test)]
+mod settings_transaction_tests {
+    use super::{Config, Shared, WorkerError, WorkerInterface};
+    use std::collections::HashMap;
+    use std::fs;
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use zbus::zvariant::OwnedValue;
+
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "wayleaf-settings-transaction-{}-{nonce}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).expect("create isolated settings test directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn patch(brightness: f64) -> HashMap<String, OwnedValue> {
+        HashMap::from([("brightness".to_owned(), OwnedValue::from(brightness))])
+    }
+
+    #[test]
+    fn failed_persistence_does_not_publish_worker_settings_or_revision() {
+        let temp = TempDir::new();
+        let blocker = temp.0.join("not-a-directory");
+        fs::write(&blocker, b"fixture").expect("create parent-path blocker");
+        let config = Config {
+            config_path: blocker.join("config.json"),
+            ..Config::default()
+        };
+        let shared = Arc::new(Shared::new(config));
+        let interface = WorkerInterface {
+            shared: shared.clone(),
+        };
+        let original_settings = interface.get_settings().expect("read initial settings");
+
+        assert!(matches!(
+            interface.set_settings(patch(0.73)),
+            Err(WorkerError::Failed(_))
+        ));
+
+        let state = shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(state.revision, 0);
+        assert_eq!(state.config.brightness, Config::default().brightness);
+        drop(state);
+        assert_eq!(
+            interface.get_settings().expect("read settings after failed save"),
+            original_settings
+        );
+    }
+
+    #[test]
+    fn successful_settings_update_persists_and_publishes_revision() {
+        let temp = TempDir::new();
+        let path = temp.0.join("config.json");
+        let config = Config {
+            config_path: path.clone(),
+            ..Config::default()
+        };
+        config.save().expect("seed settings config");
+        let shared = Arc::new(Shared::new(config));
+        let interface = WorkerInterface {
+            shared: shared.clone(),
+        };
+
+        interface
+            .set_settings(patch(0.73))
+            .expect("apply and persist settings");
+
+        let published = shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(published.revision, 1);
+        assert!((published.config.brightness - 0.73).abs() < f32::EPSILON);
+        drop(published);
+
+        let saved = Config::load(&path).expect("read persisted config");
+        assert!((saved.brightness - 0.73).abs() < f32::EPSILON);
+        assert_eq!(saved.fps, Config::default().fps);
     }
 }
 

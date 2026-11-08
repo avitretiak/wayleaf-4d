@@ -49,8 +49,9 @@ struct Shared {
 
 struct State {
     config: Config,
-    status: String,
+    status: ControlStatus,
     error: String,
+    refresh_error: bool,
     running: bool,
     enabled: bool,
     busy: bool,
@@ -67,6 +68,36 @@ struct State {
     revision: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ControlStatus {
+    Stopped,
+    Starting,
+    Running,
+    Stopping,
+    Error,
+}
+
+impl ControlStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Stopped => "stopped",
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Stopping => "stopping",
+            Self::Error => "error",
+        }
+    }
+
+    fn from_worker_status(status: &str) -> Option<Self> {
+        match status {
+            "starting" => Some(Self::Starting),
+            "running" => Some(Self::Running),
+            "stopping" => Some(Self::Stopping),
+            _ => None,
+        }
+    }
+}
+
 struct WorkerSnapshot {
     present: Option<bool>,
     status: Option<std::result::Result<String, String>>,
@@ -79,8 +110,9 @@ impl State {
         let device_connected = !config.host.is_empty() && !config.token.is_empty();
         Self {
             config,
-            status: "stopped".into(),
+            status: ControlStatus::Stopped,
             error: String::new(),
+            refresh_error: false,
             running: false,
             enabled: false,
             busy: false,
@@ -101,8 +133,9 @@ impl State {
     fn json(&self) -> Value {
         json!({
             "settings": self.config.settings_json(),
-            "status": self.status,
+            "status": self.status.as_str(),
             "error": self.error,
+            "refreshError": self.refresh_error,
             "running": self.running,
             "enabled": self.enabled,
             "busy": self.busy,
@@ -254,6 +287,7 @@ impl ControlApi {
             state.busy = true;
             state.revision = state.revision.wrapping_add(1);
             state.error.clear();
+            state.refresh_error = false;
         }
         spawn_task(
             &self.shared,
@@ -277,14 +311,21 @@ impl ControlApi {
             state.busy = true;
             state.revision = state.revision.wrapping_add(1);
             state.error.clear();
-            state.status = "starting".into();
+            state.refresh_error = false;
+            state.status = ControlStatus::Starting;
         }
         spawn_task(
             &self.shared,
             "wayleaf-control-run",
             BusyKind::Control,
             move |shared| {
-                finish_control(&shared, run_worker(), Some(true), None, Some("starting"));
+                finish_control(
+                    &shared,
+                    run_worker(),
+                    Some(true),
+                    None,
+                    Some(ControlStatus::Starting),
+                );
             },
         )
     }
@@ -301,7 +342,8 @@ impl ControlApi {
             state.busy = true;
             state.revision = state.revision.wrapping_add(1);
             state.error.clear();
-            state.status = "stopping".into();
+            state.refresh_error = false;
+            state.status = ControlStatus::Stopping;
         }
         spawn_task(
             &self.shared,
@@ -326,6 +368,7 @@ impl ControlApi {
             state.busy = true;
             state.revision = state.revision.wrapping_add(1);
             state.error.clear();
+            state.refresh_error = false;
         }
         spawn_task(
             &self.shared,
@@ -367,8 +410,9 @@ impl ControlApi {
             state.busy = true;
             state.revision = state.revision.wrapping_add(1);
             state.error.clear();
+            state.refresh_error = false;
             if state.running {
-                state.status = "stopping".into();
+                state.status = ControlStatus::Stopping;
             }
         }
         spawn_task(
@@ -425,7 +469,11 @@ impl ControlApi {
                     "another control operation is in progress".into(),
                 ));
             }
-            if state.running || matches!(state.status.as_str(), "starting" | "running" | "stopping")
+            if state.running
+                || matches!(
+                    state.status,
+                    ControlStatus::Starting | ControlStatus::Running | ControlStatus::Stopping
+                )
             {
                 state.device_message =
                     "Turn sync off before pairing or forgetting a device.".into();
@@ -497,7 +545,11 @@ impl ControlApi {
                     "another control operation is in progress".into(),
                 ));
             }
-            if state.running || matches!(state.status.as_str(), "starting" | "running" | "stopping")
+            if state.running
+                || matches!(
+                    state.status,
+                    ControlStatus::Starting | ControlStatus::Running | ControlStatus::Stopping
+                )
             {
                 state.device_message =
                     "Turn sync off before pairing or forgetting a device.".into();
@@ -547,6 +599,7 @@ impl ControlApi {
     fn clear_error(&self) {
         let mut state = state_lock(&self.shared);
         state.error.clear();
+        state.refresh_error = false;
         state.revision = state.revision.wrapping_add(1);
     }
 }
@@ -572,8 +625,9 @@ where
             match kind {
                 BusyKind::Control => {
                     state.busy = false;
-                    state.status = "error".into();
+                    state.status = ControlStatus::Error;
                     state.error = "cannot start control operation".into();
+                    state.refresh_error = false;
                 }
                 BusyKind::Device => {
                     state.device_busy = false;
@@ -590,7 +644,7 @@ fn finish_control(
     result: std::result::Result<(), String>,
     running: Option<bool>,
     enabled: Option<bool>,
-    success_status: Option<&str>,
+    success_status: Option<ControlStatus>,
 ) {
     let mut state = state_lock(shared);
     state.busy = false;
@@ -603,12 +657,13 @@ fn finish_control(
                 state.enabled = enabled;
             }
             if let Some(status) = success_status {
-                state.status = status.into();
+                state.status = status;
             }
         }
         Err(error) => {
-            state.status = "error".into();
+            state.status = ControlStatus::Error;
             state.error = error;
+            state.refresh_error = false;
         }
     }
     state.revision = state.revision.wrapping_add(1);
@@ -619,8 +674,9 @@ fn finish_stop(shared: &Shared, warning: Option<String>) {
     state.busy = false;
     state.running = false;
     state.worker_present = false;
-    state.status = "stopped".into();
+    state.status = ControlStatus::Stopped;
     state.error = warning.unwrap_or_default();
+    state.refresh_error = false;
     state.revision = state.revision.wrapping_add(1);
 }
 
@@ -711,7 +767,7 @@ fn stop_worker_and_power_off(shared: &Shared) -> std::result::Result<Option<Stri
         let mut state = state_lock(shared);
         state.running = false;
         state.worker_present = false;
-        state.status = "stopped".into();
+        state.status = ControlStatus::Stopped;
     }
 
     let config = state_lock(shared).config.clone();
@@ -735,7 +791,7 @@ fn stop_worker_and_forget_device(shared: &Shared) -> std::result::Result<(), Str
         let mut state = state_lock(shared);
         state.running = false;
         state.worker_present = false;
-        state.status = "stopped".into();
+        state.status = ControlStatus::Stopped;
     }
 
     let config = state_lock(shared).config.clone();
@@ -800,7 +856,7 @@ fn select_monitor(shared: &Shared, name: &str) -> std::result::Result<(), String
         let mut state = state_lock(shared);
         state.running = false;
         state.worker_present = false;
-        state.status = "stopped".into();
+        state.status = ControlStatus::Stopped;
     }
 
     if let Err(save_error) = previous.save_settings(&update) {
@@ -815,7 +871,7 @@ fn select_monitor(shared: &Shared, name: &str) -> std::result::Result<(), String
         let mut state = state_lock(shared);
         if recovery.is_ok() && was_running {
             state.running = true;
-            state.status = "starting".into();
+            state.status = ControlStatus::Starting;
         }
         if let Err(recovery_error) = recovery {
             state.running = false;
@@ -833,7 +889,7 @@ fn select_monitor(shared: &Shared, name: &str) -> std::result::Result<(), String
         state.config = candidate;
         state.running = false;
         state.worker_present = false;
-        state.status = "stopped".into();
+        state.status = ControlStatus::Stopped;
         state.device_connected = !state.config.host.is_empty() && !state.config.token.is_empty();
     }
     if was_running {
@@ -843,7 +899,7 @@ fn select_monitor(shared: &Shared, name: &str) -> std::result::Result<(), String
         )?;
         let mut state = state_lock(shared);
         state.running = true;
-        state.status = "starting".into();
+        state.status = ControlStatus::Starting;
     }
     Ok(())
 }
@@ -964,41 +1020,44 @@ fn apply_refresh_snapshot(
             state.worker_present = true;
             state.running = true;
             match worker_status.unwrap_or_else(|| Err("could not query worker status".into())) {
-                Ok(status) if matches!(status.as_str(), "starting" | "running" | "stopping") => {
-                    state.status = status;
-                    match worker_settings
-                        .unwrap_or_else(|| Err("could not query worker settings".into()))
-                    {
-                        Ok(values) => match owned_settings_json(values) {
-                            Ok(values) => {
-                                let mut config = state.config.clone();
-                                if config.apply_settings(&values).is_ok() {
-                                    state.config = config;
-                                    state.device_connected = !state.config.host.is_empty()
-                                        && !state.config.token.is_empty();
-                                } else {
-                                    state.status = "error".into();
-                                    refresh_error =
-                                        Some("worker returned unsupported settings".into());
+                Ok(status) => match ControlStatus::from_worker_status(&status) {
+                    Some(status) => {
+                        state.status = status;
+                        match worker_settings
+                            .unwrap_or_else(|| Err("could not query worker settings".into()))
+                        {
+                            Ok(values) => match owned_settings_json(values) {
+                                Ok(values) => {
+                                    let mut config = state.config.clone();
+                                    if config.apply_settings(&values).is_ok() {
+                                        state.config = config;
+                                        state.device_connected = !state.config.host.is_empty()
+                                            && !state.config.token.is_empty();
+                                    } else {
+                                        state.status = ControlStatus::Error;
+                                        refresh_error = Some(
+                                            "worker returned unsupported settings".into(),
+                                        );
+                                    }
                                 }
-                            }
+                                Err(error) => {
+                                    state.status = ControlStatus::Error;
+                                    refresh_error = Some(error);
+                                }
+                            },
                             Err(error) => {
-                                state.status = "error".into();
+                                state.status = ControlStatus::Error;
                                 refresh_error = Some(error);
                             }
-                        },
-                        Err(error) => {
-                            state.status = "error".into();
-                            refresh_error = Some(error);
                         }
                     }
-                }
-                Ok(_) => {
-                    state.status = "error".into();
-                    refresh_error = Some("worker reported an unknown status".into());
-                }
+                    None => {
+                        state.status = ControlStatus::Error;
+                        refresh_error = Some("worker reported an unknown status".into());
+                    }
+                },
                 Err(error) => {
-                    state.status = "error".into();
+                    state.status = ControlStatus::Error;
                     refresh_error = Some(error);
                 }
             }
@@ -1008,11 +1067,11 @@ fn apply_refresh_snapshot(
             match active {
                 Ok(true) => {
                     state.running = true;
-                    state.status = "starting".into();
+                    state.status = ControlStatus::Starting;
                 }
                 Ok(false) => {
                     state.running = false;
-                    state.status = "stopped".into();
+                    state.status = ControlStatus::Stopped;
                 }
                 Err(error) => refresh_error = Some(error),
             }
@@ -1020,13 +1079,17 @@ fn apply_refresh_snapshot(
         None => {
             if matches!(active, Ok(true)) {
                 state.running = true;
-                state.status = "starting".into();
+                state.status = ControlStatus::Starting;
             }
         }
     }
     if let Some(error) = refresh_error {
-        state.status = "error".into();
+        state.status = ControlStatus::Error;
         state.error = error;
+        state.refresh_error = true;
+    } else if state.refresh_error {
+        state.error.clear();
+        state.refresh_error = false;
     }
 }
 
@@ -1469,6 +1532,22 @@ mod tests {
     }
 
     #[test]
+    fn control_status_serializes_to_the_existing_json_vocabulary() {
+        for (status, expected) in [
+            (ControlStatus::Stopped, "stopped"),
+            (ControlStatus::Starting, "starting"),
+            (ControlStatus::Running, "running"),
+            (ControlStatus::Stopping, "stopping"),
+            (ControlStatus::Error, "error"),
+        ] {
+            let mut state = State::new(Config::default(), Vec::new());
+            state.status = status;
+            assert_eq!(state.json()["status"], expected);
+            assert_eq!(status.as_str(), expected);
+        }
+    }
+
+    #[test]
     fn state_json_never_contains_credentials() {
         let config = Config {
             host: "192.0.2.1".into(),
@@ -1522,7 +1601,7 @@ mod tests {
             state.running = true;
             state.enabled = true;
             state.worker_present = true;
-            state.status = "running".into();
+            state.status = ControlStatus::Running;
         }
 
         apply_refresh_snapshot(
@@ -1538,7 +1617,7 @@ mod tests {
         assert!(state.running);
         assert!(state.enabled);
         assert!(state.worker_present);
-        assert_eq!(state.status, "running");
+        assert_eq!(state.status, ControlStatus::Running);
         assert_eq!(state.monitors.len(), 1);
     }
 
@@ -1573,5 +1652,81 @@ mod tests {
         let state = state_lock(&shared);
         assert!(state.monitors.is_empty());
         assert!(state.monitor_error.is_empty());
+    }
+
+    #[test]
+    fn refresh_error_clears_on_recovery_without_erasing_operation_errors() {
+        let shared = Shared {
+            state: Mutex::new(State::new(Config::default(), Vec::new())),
+        };
+        apply_refresh_snapshot(
+            &shared, 0, Ok(Vec::new()), Err("refresh failed".into()), Ok(false), stopped_worker(),
+        );
+        {
+            let state = state_lock(&shared);
+            assert!(state.refresh_error);
+            assert_eq!(state.error, "refresh failed");
+        }
+        apply_refresh_snapshot(&shared, 0, Ok(Vec::new()), Ok(false), Ok(false), stopped_worker());
+        {
+            let mut state = state_lock(&shared);
+            assert!(!state.refresh_error);
+            assert!(state.error.is_empty());
+            state.error = "operation failed".into();
+        }
+        apply_refresh_snapshot(&shared, 0, Ok(Vec::new()), Ok(false), Ok(false), stopped_worker());
+        assert_eq!(state_lock(&shared).error, "operation failed");
+    }
+
+    #[test]
+    fn refresh_reconciles_known_worker_statuses_and_rejects_unknown_status() {
+        for (worker_status, expected) in [
+            ("starting", ControlStatus::Starting),
+            ("running", ControlStatus::Running),
+            ("stopping", ControlStatus::Stopping),
+        ] {
+            let shared = Shared {
+                state: Mutex::new(State::new(Config::default(), Vec::new())),
+            };
+            apply_refresh_snapshot(
+                &shared,
+                0,
+                Ok(Vec::new()),
+                Ok(false),
+                Ok(true),
+                WorkerSnapshot {
+                    present: Some(true),
+                    status: Some(Ok(worker_status.to_owned())),
+                    settings: Some(Ok(HashMap::new())),
+                    error: None,
+                },
+            );
+            let state = state_lock(&shared);
+            assert_eq!(state.status, expected);
+            assert!(state.running);
+            assert!(state.worker_present);
+            assert!(!state.refresh_error);
+        }
+
+        let shared = Shared {
+            state: Mutex::new(State::new(Config::default(), Vec::new())),
+        };
+        apply_refresh_snapshot(
+            &shared,
+            0,
+            Ok(Vec::new()),
+            Ok(false),
+            Ok(true),
+            WorkerSnapshot {
+                present: Some(true),
+                status: Some(Ok("unexpected".to_owned())),
+                settings: Some(Ok(HashMap::new())),
+                error: None,
+            },
+        );
+        let state = state_lock(&shared);
+        assert_eq!(state.status, ControlStatus::Error);
+        assert!(state.refresh_error);
+        assert_eq!(state.error, "worker reported an unknown status");
     }
 }

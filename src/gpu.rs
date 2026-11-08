@@ -1,3 +1,4 @@
+use crate::capture::PlaneDiagnostic;
 use crate::kms::{Monitor, Plane};
 use crate::{AppError, Result};
 use glow::HasContext;
@@ -6,6 +7,7 @@ use std::ffi::{c_void, CStr, CString};
 use std::fs::OpenOptions;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::rc::Rc;
+
 
 const EGL_NONE: i32 = 0x3038;
 const EGL_SUCCESS: i32 = 0x3000;
@@ -85,6 +87,7 @@ pub struct Gpu {
     width: usize,
     height: usize,
     rgba: Vec<u8>,
+    diagnostic_rgba: Vec<u8>,
     _thread_bound: std::marker::PhantomData<Rc<()>>,
 }
 
@@ -135,6 +138,7 @@ impl Gpu {
             width,
             height,
             rgba: vec![0; bytes],
+            diagnostic_rgba: Vec::new(),
             _thread_bound: std::marker::PhantomData,
         };
         gpu.initialize_gl()?;
@@ -284,6 +288,24 @@ impl Gpu {
     }
 
     pub fn render(&mut self, monitor: &Monitor, planes: &[Plane]) -> Result<()> {
+        self.render_inner(monitor, planes, None)
+    }
+
+    pub fn render_diagnostic(
+        &mut self,
+        monitor: &Monitor,
+        planes: &[Plane],
+        summaries: &mut Vec<PlaneDiagnostic>,
+    ) -> Result<()> {
+        self.render_inner(monitor, planes, Some(summaries))
+    }
+
+    fn render_inner(
+        &mut self,
+        monitor: &Monitor,
+        planes: &[Plane],
+        mut summaries: Option<&mut Vec<PlaneDiagnostic>>,
+    ) -> Result<()> {
         self.egl.make_current()?;
         let mut selected: [Option<&Plane>; 8] = [None; 8];
         let mut primary: Option<&Plane> = None;
@@ -335,6 +357,7 @@ impl Gpu {
                 .program
                 .ok_or_else(|| AppError::new("capture shader is not initialized"))?;
             self.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+            self.gl.enable(glow::BLEND);
             self.gl
                 .viewport(0, 0, self.width as i32, self.height as i32);
             self.gl.clear_color(0.0, 0.0, 0.0, 1.0);
@@ -343,6 +366,90 @@ impl Gpu {
             self.gl.bind_vertex_array(self.vao);
             self.gl.active_texture(glow::TEXTURE0);
             self.gl.uniform_1_i32(self.sampler_uniform.as_ref(), 0);
+            if let Some(output) = summaries.as_mut() {
+                output.clear();
+                let byte_len = self.width * self.height * 4;
+                if self.diagnostic_rgba.len() != byte_len {
+                    self.diagnostic_rgba.resize(byte_len, 0);
+                }
+                self.gl.disable(glow::BLEND);
+                for (index, selected_plane) in selected[..count].iter().enumerate() {
+                    let plane = selected_plane.unwrap();
+                    validate_plane(plane)?;
+                    let image = self.egl.import_image(plane)?;
+                    let texture = self.inputs[index];
+                    self.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+                    self.egl.bind_image(texture, image.image);
+                    let gl_error = self.gl.get_error();
+                    if gl_error != glow::NO_ERROR {
+                        return Err(AppError::new(format!(
+                            "binding KMS DMA-BUF to GL failed (error 0x{gl_error:04x})"
+                        )));
+                    }
+                    self.gl.clear_color(0.0, 0.0, 0.0, 0.0);
+                    self.gl.clear(glow::COLOR_BUFFER_BIT);
+                    set_plane_uniforms(
+                        &self.gl, self.width, self.height, monitor, plane,
+                        self.dst_uniform.as_ref(), self.src_uniform.as_ref(),
+                        self.rotation_uniform.as_ref(), self.hdr_eotf_uniform.as_ref(),
+                        self.hdr_peak_uniform.as_ref(), self.hdr_white_uniform.as_ref(),
+                        self.hdr_scale_uniform.as_ref(), self.hdr_peak_nits_uniform.as_ref(),
+                    )?;
+                    self.gl.draw_arrays(glow::TRIANGLES, 0, 3);
+                    let gl_error = self.gl.get_error();
+                    if gl_error != glow::NO_ERROR {
+                        return Err(AppError::new(format!(
+                            "rendering KMS plane failed (GL error 0x{gl_error:04x})"
+                        )));
+                    }
+                    self.gl.read_pixels(
+                        0, 0, self.width as i32, self.height as i32,
+                        glow::RGBA, glow::UNSIGNED_BYTE,
+                        glow::PixelPackData::Slice(Some(&mut self.diagnostic_rgba)),
+                    );
+                    let gl_error = self.gl.get_error();
+                    if gl_error != glow::NO_ERROR {
+                        return Err(AppError::new(format!(
+                            "reading diagnostic plane pixels failed (GL error 0x{gl_error:04x})"
+                        )));
+                    }
+                    let (sample_count, r, g, b, a) = plane_rgb_stats(
+                        &self.diagnostic_rgba,
+                        self.width,
+                        self.height,
+                        monitor,
+                        plane,
+                    );
+                    output.push(PlaneDiagnostic {
+                        index,
+                        plane_type: plane.plane_type,
+                        width: plane.width,
+                        height: plane.height,
+                        pixel_format: plane.pixel_format,
+                        modifier: plane.modifier,
+                        rotation: plane.rotation,
+                        src_x: plane.src_x,
+                        src_y: plane.src_y,
+                        src_w: plane.src_w,
+                        src_h: plane.src_h,
+                        dst_x: plane.dst_x,
+                        dst_y: plane.dst_y,
+                        dst_w: plane.dst_w,
+                        dst_h: plane.dst_h,
+                        zpos: plane.zpos,
+                        hdr: plane.hdr,
+                        sample_count,
+                        r,
+                        g,
+                        b,
+                        a,
+                    });
+                    drop(image);
+                }
+                self.gl.enable(glow::BLEND);
+                self.gl.clear_color(0.0, 0.0, 0.0, 1.0);
+                self.gl.clear(glow::COLOR_BUFFER_BIT);
+            }
             for (slot, plane) in selected[..count].iter().enumerate() {
                 let plane = plane.unwrap();
                 validate_plane(plane)?;
@@ -648,6 +755,110 @@ impl Drop for Gpu {
             }
         }
     }
+}
+
+fn set_plane_uniforms(
+    gl: &glow::Context,
+    width: usize,
+    height: usize,
+    monitor: &Monitor,
+    plane: &Plane,
+    dst: Option<&glow::UniformLocation>,
+    src: Option<&glow::UniformLocation>,
+    rotation: Option<&glow::UniformLocation>,
+    eotf_uniform: Option<&glow::UniformLocation>,
+    peak_uniform: Option<&glow::UniformLocation>,
+    white_uniform: Option<&glow::UniformLocation>,
+    scale_uniform: Option<&glow::UniformLocation>,
+    peak_nits_uniform: Option<&glow::UniformLocation>,
+) -> Result<()> {
+    let sx = width as f32 / monitor.width as f32;
+    let sy = height as f32 / monitor.height as f32;
+    let left = plane.dst_x as f32 * sx;
+    let right = (i64::from(plane.dst_x) + i64::from(plane.dst_w)) as f32 * sx;
+    let bottom = height as f32
+        - (i64::from(plane.dst_y) + i64::from(plane.dst_h)) as f32 * sy;
+    let top = height as f32 - plane.dst_y as f32 * sy;
+    unsafe {
+        gl.uniform_4_f32(
+            dst,
+            left / width as f32 * 2.0 - 1.0,
+            bottom / height as f32 * 2.0 - 1.0,
+            right / width as f32 * 2.0 - 1.0,
+            top / height as f32 * 2.0 - 1.0,
+        );
+        gl.uniform_4_f32(
+            src,
+            plane.src_x as f32 / plane.width as f32,
+            plane.src_y as f32 / plane.height as f32,
+            plane.src_w as f32 / plane.width as f32,
+            plane.src_h as f32 / plane.height as f32,
+        );
+        gl.uniform_1_i32(rotation, plane.rotation as i32);
+        let (eotf, peak_pq, white_pq, white_scale, peak_nits) = hdr_uniforms(plane)?;
+        gl.uniform_1_i32(eotf_uniform, eotf);
+        gl.uniform_1_f32(peak_uniform, peak_pq);
+        gl.uniform_1_f32(white_uniform, white_pq);
+        gl.uniform_1_f32(scale_uniform, white_scale);
+        gl.uniform_1_f32(peak_nits_uniform, peak_nits);
+    }
+    Ok(())
+}
+
+fn plane_rgb_stats(
+    pixels: &[u8],
+    width: usize,
+    height: usize,
+    monitor: &Monitor,
+    plane: &Plane,
+) -> (usize, f32, f32, f32, f32) {
+    let sx = width as f64 / monitor.width as f64;
+    let sy = height as f64 / monitor.height as f64;
+    let left = (plane.dst_x as f64 * sx).max(0.0);
+    let right = ((i64::from(plane.dst_x) + i64::from(plane.dst_w)) as f64 * sx)
+        .min(width as f64);
+    let top = (plane.dst_y as f64 * sy).max(0.0);
+    let bottom = ((i64::from(plane.dst_y) + i64::from(plane.dst_h)) as f64 * sy)
+        .min(height as f64);
+    let x0 = (left - 0.5).ceil().max(0.0) as usize;
+    let x1 = (right - 0.5).ceil().max(0.0).min(width as f64) as usize;
+    let top_y0 = (top - 0.5).ceil().max(0.0) as usize;
+    let top_y1 = (bottom - 0.5).ceil().max(0.0).min(height as f64) as usize;
+    rgba_stats(pixels, width, height, x0, x1, top_y0, top_y1)
+}
+
+fn rgba_stats(
+    pixels: &[u8],
+    width: usize,
+    height: usize,
+    x0: usize,
+    x1: usize,
+    top_y0: usize,
+    top_y1: usize,
+) -> (usize, f32, f32, f32, f32) {
+    let mut sums = [0u64; 4];
+    let mut count = 0usize;
+    for y in top_y0..top_y1 {
+        let gl_y = height - 1 - y;
+        for x in x0..x1 {
+            let offset = (gl_y * width + x) * 4;
+            for channel in 0..4 {
+                sums[channel] += u64::from(pixels[offset + channel]);
+            }
+            count += 1;
+        }
+    }
+    if count == 0 {
+        return (0, 0.0, 0.0, 0.0, 0.0);
+    }
+    let scale = 1.0 / count as f32;
+    (
+        count,
+        sums[0] as f32 * scale,
+        sums[1] as f32 * scale,
+        sums[2] as f32 * scale,
+        sums[3] as f32 * scale,
+    )
 }
 
 fn validate_plane(plane: &Plane) -> Result<()> {
@@ -1271,6 +1482,48 @@ mod tests {
             hdr,
         }
     }
+
+    #[test]
+    fn rgba_stats_averages_only_selected_pixels_including_alpha() {
+        // GL readback rows are bottom-up; the selected top-left pixel is the final texel.
+        let pixels = [
+            1, 2, 3, 4, 5, 6, 7, 8, // bottom row
+            10, 20, 30, 40, 50, 60, 70, 80, // top row
+        ];
+        assert_eq!(rgba_stats(&pixels, 2, 2, 0, 1, 0, 1), (1, 10.0, 20.0, 30.0, 40.0));
+        assert_eq!(
+            rgba_stats(&pixels, 2, 2, 0, 2, 0, 2),
+            (4, 16.5, 22.0, 27.5, 33.0)
+        );
+    }
+    #[test]
+    fn plane_rgb_stats_clips_offscreen_destination() {
+        let monitor = Monitor {
+            name: "DP-3".into(),
+            card_path: "/dev/dri/card0".into(),
+            connector_id: 1,
+            width: 2,
+            height: 2,
+        };
+        let mut plane = plane(None);
+        plane.width = 2;
+        plane.height = 2;
+        plane.src_w = 2;
+        plane.src_h = 2;
+        plane.dst_x = -1;
+        plane.dst_w = 2;
+        plane.dst_h = 2;
+        let pixels = [
+            1, 2, 3, 4, 5, 6, 7, 8, // bottom row
+            10, 20, 30, 40, 50, 60, 70, 80, // top row
+        ];
+
+        assert_eq!(
+            plane_rgb_stats(&pixels, 2, 2, &monitor, &plane),
+            (2, 5.5, 11.0, 16.5, 22.0)
+        );
+    }
+
 
     #[test]
     fn egl_dma_buf_keys_cover_planes_zero_through_three() {
