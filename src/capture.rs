@@ -1,5 +1,5 @@
 use crate::gpu::{self, Gpu};
-use crate::kms::{self, GammaTracker, HdrMetadata, KmsClient, Monitor};
+use crate::kms::{self, GammaStatus, GammaTracker, HdrMetadata, KmsClient, Monitor};
 use crate::Result;
 
 pub struct Capture {
@@ -41,6 +41,8 @@ pub struct DiagnosticFrame<'a> {
     pub frame: Frame<'a>,
     pub planes: &'a [PlaneDiagnostic],
     pub crtc_gamma_applied: bool,
+    pub crtc_gamma_status: &'static str,
+    pub plane_pipeline_check: &'static str,
 }
 
 pub struct Frame<'a> {
@@ -66,7 +68,12 @@ impl Capture {
     }
     pub fn frame(&mut self, area_filter: bool) -> Result<Frame<'_>> {
         let planes = self.kms.capture()?;
-        let gamma = self.gamma.as_mut().and_then(GammaTracker::current);
+        let status = self.gamma.as_mut().map(GammaTracker::refresh).unwrap_or(GammaStatus::Unavailable);
+        let gamma = if status == GammaStatus::Ready {
+            self.gamma.as_ref().and_then(GammaTracker::lut)
+        } else {
+            None
+        };
         self.gpu.render(&self.monitor, planes, area_filter, gamma)?;
         let (data, width, height, stride) = self.gpu.frame();
         Ok(Frame {
@@ -79,7 +86,12 @@ impl Capture {
 
     pub fn diagnostic_frame(&mut self, area_filter: bool) -> Result<DiagnosticFrame<'_>> {
         let planes = self.kms.capture()?;
-        let gamma = self.gamma.as_mut().and_then(GammaTracker::current);
+        let status = self.gamma.as_mut().map(GammaTracker::refresh).unwrap_or(GammaStatus::Unavailable);
+        let gamma = if status == GammaStatus::Ready {
+            self.gamma.as_ref().and_then(GammaTracker::lut)
+        } else {
+            None
+        };
         self.gpu
             .render_diagnostic(&self.monitor, planes, &mut self.diagnostics, area_filter, gamma)?;
         let (data, width, height, stride) = self.gpu.frame();
@@ -93,6 +105,11 @@ impl Capture {
             frame,
             planes: &self.diagnostics,
             crtc_gamma_applied: self.gpu.crtc_gamma_active(),
+            crtc_gamma_status: if self.gpu.crtc_gamma_active() { "applied" }
+                else if status == GammaStatus::Ready { self.gpu.crtc_gamma_ineligible_reason() }
+                else { status.as_str() },
+            plane_pipeline_check: self.gamma.as_ref()
+                .map(|tracker| tracker.plane_pipeline_check(status)).unwrap_or("unavailable"),
         })
     }
 

@@ -149,6 +149,7 @@ pub struct Gpu {
     gamma_texture: Option<glow::NativeTexture>,
     gamma_blob: Option<u32>,
     gamma_active: bool,
+    gamma_ineligible: &'static str,
     width: usize,
     height: usize,
     rgba: Vec<u8>,
@@ -206,6 +207,7 @@ impl Gpu {
             gamma_texture: None,
             gamma_blob: None,
             gamma_active: false,
+            gamma_ineligible: "unavailable",
             width,
             height,
             rgba: vec![0; bytes],
@@ -462,7 +464,8 @@ impl Gpu {
             // A CRTC LUT follows composition, so it is only equivalent here for
             // a single full-screen HDR plane. Do not apply it per overlay.
             let plane = selected[0].unwrap();
-            let gamma = gamma.filter(|_| crtc_gamma_applicable(monitor, plane, count));
+            self.gamma_ineligible = crtc_gamma_ineligible_reason(monitor, plane, count);
+            let gamma = gamma.filter(|_| self.gamma_ineligible == "eligible");
             self.gamma_active = gamma.is_some();
             self.gl.active_texture(glow::TEXTURE1);
             self.gl.bind_texture(glow::TEXTURE_2D, self.gamma_texture);
@@ -1000,12 +1003,17 @@ impl Gpu {
     }
 
     pub fn crtc_gamma_active(&self) -> bool { self.gamma_active }
+    pub fn crtc_gamma_ineligible_reason(&self) -> &'static str { self.gamma_ineligible }
 }
 
-fn crtc_gamma_applicable(monitor: &Monitor, plane: &Plane, plane_count: usize) -> bool {
-    plane_count == 1 && matches!(plane.hdr, Some(hdr) if hdr.eotf == 2 || hdr.eotf == 3)
-        && plane.dst_x == 0 && plane.dst_y == 0
-        && plane.dst_w == monitor.width as i32 && plane.dst_h == monitor.height as i32
+fn crtc_gamma_ineligible_reason(monitor: &Monitor, plane: &Plane, plane_count: usize) -> &'static str {
+    if plane_count != 1 { return "multiple_planes"; }
+    if !matches!(plane.hdr, Some(hdr) if hdr.eotf == 2 || hdr.eotf == 3) { return "not_hdr"; }
+    if plane.dst_x != 0 || plane.dst_y != 0
+        || plane.dst_w != monitor.width as i32 || plane.dst_h != monitor.height as i32 {
+        return "partial_plane";
+    }
+    "eligible"
 }
 
 impl Drop for Gpu {
@@ -1216,18 +1224,7 @@ fn hdr_uniforms(plane: &Plane) -> Result<(i32, f32, f32, f32, f32)> {
         0 => Ok((0, 0.0, 0.0, 1.0, 0.0)),
         2 | 3 => {
             let white = 203.0f32;
-            let reported_peak = if hdr.max_cll > 0 {
-                hdr.max_cll
-            } else {
-                hdr.max_luminance
-            };
-            let peak = f32::from(if reported_peak > 0 {
-                reported_peak
-            } else {
-                1000
-            })
-            .max(white)
-            .min(10000.0);
+            let (peak, _) = hdr_peak_selection(hdr);
             Ok((
                 hdr.eotf as i32,
                 pq_encode(peak),
@@ -1240,6 +1237,17 @@ fn hdr_uniforms(plane: &Plane) -> Result<(i32, f32, f32, f32, f32)> {
             "unsupported KMS HDR transfer function {eotf}"
         ))),
     }
+}
+
+pub(crate) fn hdr_peak_selection(hdr: &crate::kms::HdrMetadata) -> (f32, &'static str) {
+    let (peak, source) = if hdr.max_cll > 0 {
+        (hdr.max_cll, "max_cll")
+    } else if hdr.max_luminance > 0 {
+        (hdr.max_luminance, "max_luminance")
+    } else {
+        (1000, "fallback")
+    };
+    (f32::from(peak).clamp(203.0, 10000.0), source)
 }
 
 fn pq_encode(luminance: f32) -> f32 {
@@ -1766,15 +1774,30 @@ mod tests {
         let hdr = HdrMetadata { metadata_type: 0, infoframe_metadata_type: 0, eotf: 2,
             max_luminance: 1000, min_luminance: 0, max_cll: 1000, max_fall: 1000 };
         let mut p = plane(Some(hdr));
-        assert!(crtc_gamma_applicable(&monitor, &p, 1));
-        assert!(!crtc_gamma_applicable(&monitor, &p, 2));
+        assert_eq!(crtc_gamma_ineligible_reason(&monitor, &p, 1), "eligible");
+        assert_eq!(crtc_gamma_ineligible_reason(&monitor, &p, 2), "multiple_planes");
         p.dst_x = 1;
-        assert!(!crtc_gamma_applicable(&monitor, &p, 1));
+        assert_ne!(crtc_gamma_ineligible_reason(&monitor, &p, 1), "eligible");
         p.dst_x = 0;
         p.hdr = None;
-        assert!(!crtc_gamma_applicable(&monitor, &p, 1));
+        assert_ne!(crtc_gamma_ineligible_reason(&monitor, &p, 1), "eligible");
         p.hdr = Some(HdrMetadata { eotf: 0, ..hdr });
-        assert!(!crtc_gamma_applicable(&monitor, &p, 1));
+        assert_ne!(crtc_gamma_ineligible_reason(&monitor, &p, 1), "eligible");
+    }
+
+    #[test]
+    fn hdr_peak_reports_metadata_source_and_clamps_consistently() {
+        let mut hdr = HdrMetadata { metadata_type: 0, infoframe_metadata_type: 0, eotf: 2,
+            max_luminance: 600, min_luminance: 0, max_cll: 800, max_fall: 0 };
+        assert_eq!(hdr_peak_selection(&hdr), (800.0, "max_cll"));
+        hdr.max_cll = 0;
+        assert_eq!(hdr_peak_selection(&hdr), (600.0, "max_luminance"));
+        hdr.max_luminance = 0;
+        assert_eq!(hdr_peak_selection(&hdr), (1000.0, "fallback"));
+        hdr.max_cll = 100;
+        assert_eq!(hdr_peak_selection(&hdr), (203.0, "max_cll"));
+        hdr.max_cll = u16::MAX;
+        assert_eq!(hdr_peak_selection(&hdr), (10000.0, "max_cll"));
     }
 
     #[test]

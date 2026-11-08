@@ -816,7 +816,7 @@ pub fn capture_planes(monitor_name: &str, area_filter: bool) -> Result<()> {
             break;
         }
         let diagnostic = capture.diagnostic_frame(area_filter)?;
-        let layout = plane_layout(&monitor, diagnostic.planes, diagnostic.crtc_gamma_applied);
+        let layout = plane_layout(&monitor, diagnostic.planes, diagnostic.crtc_gamma_applied, diagnostic.crtc_gamma_status, diagnostic.plane_pipeline_check);
         if layout != previous_layout {
             writeln!(output, "{layout}").map_err(diagnostic_io)?;
             output.flush().map_err(diagnostic_io)?;
@@ -856,16 +856,16 @@ pub fn capture_planes(monitor_name: &str, area_filter: bool) -> Result<()> {
     Ok(())
 }
 
-fn plane_layout(monitor: &Monitor, planes: &[PlaneDiagnostic], crtc_gamma_applied: bool) -> String {
+fn plane_layout(monitor: &Monitor, planes: &[PlaneDiagnostic], crtc_gamma_applied: bool, crtc_gamma_status: &str, plane_pipeline_check: &str) -> String {
     let mut layout = format!(
-        "monitor={} connector={} mode={}x{} crtc_gamma_applied={}",
-        monitor.name, monitor.connector_id, monitor.width, monitor.height, crtc_gamma_applied
+        "monitor={} connector={} mode={}x{} crtc_gamma_applied={} crtc_gamma_status={} plane_pipeline_check={}",
+        monitor.name, monitor.connector_id, monitor.width, monitor.height, crtc_gamma_applied, crtc_gamma_status, plane_pipeline_check
     );
     for plane in planes {
         use std::fmt::Write as _;
         let _ = write!(
             layout,
-            "\nplane index={} role={} fb={}x{} format={} modifier=0x{:016x} src=({},{} {}x{}) dst=({},{} {}x{}) rotation={} zpos={} hdr={:?}",
+            "\nplane index={} role={} fb={}x{} format={} modifier=0x{:016x} src=({},{} {}x{}) dst=({},{} {}x{}) rotation={} zpos={} hdr={:?} global_alpha=unknown blend_mode=unknown color_encoding=unknown",
             plane.index,
             plane_role_name(plane.plane_type),
             plane.width,
@@ -884,6 +884,10 @@ fn plane_layout(monitor: &Monitor, planes: &[PlaneDiagnostic], crtc_gamma_applie
             plane.zpos,
             plane.hdr
         );
+        if let Some(hdr) = plane.hdr.filter(|hdr| matches!(hdr.eotf, 2 | 3)) {
+            let (peak, source) = crate::gpu::hdr_peak_selection(&hdr);
+            let _ = write!(layout, " hdr_reference_white_nits=203 hdr_peak_nits={peak:.0} hdr_peak_source={source} hdr_primaries=assumed_bt2020");
+        }
     }
     layout
 }
@@ -913,7 +917,8 @@ fn fourcc(format: u32) -> String {
 
 #[cfg(test)]
 mod plane_role_tests {
-    use super::plane_role_name;
+    use super::{plane_layout, plane_role_name, Monitor, PlaneDiagnostic};
+    use crate::kms::HdrMetadata;
 
     #[test]
     fn names_known_and_unknown_gsr_plane_roles() {
@@ -921,6 +926,26 @@ mod plane_role_tests {
         assert_eq!(plane_role_name(1), "Cursor");
         assert_eq!(plane_role_name(2), "Overlay");
         assert_eq!(plane_role_name(3), "Unknown(3)");
+    }
+
+    #[test]
+    fn plane_diagnostic_reports_unknowns_and_hdr_assumptions() {
+        let monitor = Monitor { name: "fixture".into(), card_path: "fixture".into(), connector_id: 1, width: 1, height: 1 };
+        let plane = PlaneDiagnostic {
+            index: 0, plane_type: 0, width: 1, height: 1, pixel_format: 0, modifier: 0,
+            rotation: 0, src_x: 0, src_y: 0, src_w: 1, src_h: 1,
+            dst_x: 0, dst_y: 0, dst_w: 1, dst_h: 1, zpos: 0,
+            hdr: Some(HdrMetadata { metadata_type: 0, infoframe_metadata_type: 0, eotf: 2,
+                max_luminance: 0, min_luminance: 0, max_cll: 0, max_fall: 0 }),
+            sample_count: 1, r: 0.0, g: 0.0, b: 0.0, a: 255.0,
+        };
+        let text = plane_layout(&monitor, &[plane], false, "plane_pipeline_active", "checked");
+        for expected in ["crtc_gamma_applied=false", "crtc_gamma_status=plane_pipeline_active",
+            "plane_pipeline_check=checked", "global_alpha=unknown", "blend_mode=unknown", "color_encoding=unknown",
+            "hdr_reference_white_nits=203", "hdr_peak_nits=1000", "hdr_peak_source=fallback",
+            "hdr_primaries=assumed_bt2020"] {
+            assert!(text.contains(expected), "missing {expected}");
+        }
     }
 }
 

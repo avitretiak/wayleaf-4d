@@ -28,7 +28,9 @@ const HELPER: &str = "/usr/bin/gsr-kms-server";
 const DRM_MODE_CONNECTED: i32 = 1;
 const DRM_MODE_OBJECT_CONNECTOR: u32 = 0xc0c0_c0c0;
 const DRM_MODE_OBJECT_CRTC: u32 = 0xcccc_cccc;
+const DRM_MODE_OBJECT_PLANE: u32 = 0xeeee_eeee;
 const DRM_CLIENT_CAP_ATOMIC: u64 = 3;
+const DRM_CLIENT_CAP_PLANE_COLOR_PIPELINE: u64 = 7;
 
 #[derive(Clone, Serialize)]
 pub struct Monitor {
@@ -83,10 +85,36 @@ pub struct GammaLut {
     pub entries: Vec<[u16; 4]>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GammaStatus {
+    Ready,
+    Inactive,
+    Unavailable,
+    MatrixActive,
+    DegammaActive,
+    PlanePipelineActive,
+    InvalidLut,
+}
+
+impl GammaStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "available",
+            Self::Inactive => "inactive",
+            Self::Unavailable => "unavailable",
+            Self::MatrixActive => "matrix_active",
+            Self::DegammaActive => "degamma_active",
+            Self::PlanePipelineActive => "plane_pipeline_active",
+            Self::InvalidLut => "invalid_lut",
+        }
+    }
+}
+
 pub struct GammaTracker {
     fd: File,
     connector_id: u32,
     cached: Option<GammaLut>,
+    plane_color_pipeline: bool,
 }
 
 impl GammaTracker {
@@ -95,33 +123,76 @@ impl GammaTracker {
             .open(&monitor.card_path).ok()?;
         // Atomic properties, including GAMMA_LUT, are per-client capabilities.
         if unsafe { drmSetClientCap(fd.as_raw_fd(), DRM_CLIENT_CAP_ATOMIC, 1) } != 0 { return None; }
-        Some(Self { fd, connector_id: monitor.connector_id, cached: None })
+        let result = unsafe { drmSetClientCap(fd.as_raw_fd(), DRM_CLIENT_CAP_PLANE_COLOR_PIPELINE, 1) };
+        let plane_color_pipeline = if result == 0 {
+            true
+        } else {
+            match io::Error::last_os_error().raw_os_error() {
+                Some(libc::EINVAL) | Some(libc::EOPNOTSUPP) => false,
+                _ => return None,
+            }
+        };
+        Some(Self { fd, connector_id: monitor.connector_id, cached: None, plane_color_pipeline })
     }
 
-    pub fn current(&mut self) -> Option<&GammaLut> {
+    pub fn refresh(&mut self) -> GammaStatus {
+        self.refresh_inner().unwrap_or(GammaStatus::Unavailable)
+    }
+
+    pub fn lut(&self) -> Option<&GammaLut> { self.cached.as_ref() }
+
+    pub fn plane_pipeline_check(&self, status: GammaStatus) -> &'static str {
+        plane_pipeline_check_status(self.plane_color_pipeline, status)
+    }
+
+    fn refresh_inner(&mut self) -> Option<GammaStatus> {
         let fd = self.fd.as_raw_fd();
         let connector = NonNull::new(unsafe { drmModeGetConnectorCurrent(fd, self.connector_id) })?;
         let connector = DrmConnector(connector);
         let crtc = connector_crtc(fd, unsafe { connector.0.as_ref() }).ok()??;
         let (gamma, ctm, degamma) = crtc_color_properties(fd, crtc)?;
-        // The CRTC matrix or degamma would also need to be reproduced.
-        if ctm != 0 || degamma != 0 { return None; }
-        let id = u32::try_from(gamma?).ok()?;
-        if id == 0 { self.cached = None; return None; }
+        let id = match gamma_blob_id(gamma, ctm, degamma) {
+            Ok(id) => id,
+            Err(status) => {
+                if status == GammaStatus::Inactive { self.cached = None; }
+                return Some(status);
+            }
+        };
+        if self.plane_color_pipeline && active_plane_color_pipeline(fd, crtc)? {
+            return Some(GammaStatus::PlanePipelineActive);
+        }
         if self.cached.as_ref().is_none_or(|lut| lut.blob_id != id) {
             let blob = NonNull::new(unsafe { drmModeGetPropertyBlob(fd, id) })?;
             let blob = DrmPropertyBlob(blob);
             let data = unsafe { blob.0.as_ref() };
             if data.data.is_null() || data.length % 8 != 0 || !(16..=131_072).contains(&data.length) {
                 self.cached = None;
-                return None;
+                return Some(GammaStatus::InvalidLut);
             }
             let bytes = unsafe { slice::from_raw_parts(data.data.cast::<u8>(), data.length as usize) };
             let entries = parse_gamma_lut(bytes)?;
             self.cached = Some(GammaLut { blob_id: id, entries });
         }
-        self.cached.as_ref()
+        Some(GammaStatus::Ready)
     }
+}
+
+fn plane_pipeline_check_status(supported: bool, status: GammaStatus) -> &'static str {
+    if !supported { return "unsupported"; }
+    match status {
+        GammaStatus::Ready | GammaStatus::PlanePipelineActive => "checked",
+        GammaStatus::Unavailable => "unavailable",
+        _ => "not_checked",
+    }
+}
+
+fn gamma_blob_id(gamma: Option<u64>, ctm: u64, degamma: u64) -> std::result::Result<u32, GammaStatus> {
+    // Matrix and degamma cannot safely be skipped when applying post-blend gamma.
+    if ctm != 0 { return Err(GammaStatus::MatrixActive); }
+    if degamma != 0 { return Err(GammaStatus::DegammaActive); }
+    let id = u32::try_from(gamma.ok_or(GammaStatus::Unavailable)?)
+        .map_err(|_| GammaStatus::InvalidLut)?;
+    if id == 0 { Err(GammaStatus::Inactive) } else { Ok(id) }
 }
 
 fn parse_gamma_lut(bytes: &[u8]) -> Option<Vec<[u16; 4]>> {
@@ -799,6 +870,58 @@ fn crtc_color_properties(fd: RawFd, crtc: u32) -> Option<(Option<u64>, u64, u64)
     Some((gamma, ctm, degamma))
 }
 
+// The helper does not report plane IDs. Inspect every active non-cursor
+// plane on this CRTC; never assign an operation to a guessed plane.
+fn active_plane_color_pipeline(fd: RawFd, crtc: u32) -> Option<bool> {
+    let resources = NonNull::new(unsafe { drmModeGetPlaneResources(fd) })?;
+    let resources = DrmPlaneResources(resources);
+    let resources = unsafe { resources.0.as_ref() };
+    if resources.count_planes > 4096 || (resources.count_planes > 0 && resources.planes.is_null()) {
+        return None;
+    }
+    let mut active = Vec::new();
+    for i in 0..resources.count_planes as usize {
+        let id = unsafe { *resources.planes.add(i) };
+        let plane = NonNull::new(unsafe { drmModeGetPlane(fd, id) })?;
+        let plane = DrmPlane(plane);
+        let plane = unsafe { plane.0.as_ref() };
+        if plane.crtc_id != crtc || plane.fb_id == 0 { continue; }
+        let (kind, pipeline) = plane_color_properties(fd, id)?;
+        active.push((kind, pipeline));
+    }
+    plane_color_pipeline_active(&active)
+}
+
+fn plane_color_pipeline_active(planes: &[(Option<u64>, Option<u64>)]) -> Option<bool> {
+    let mut active = false;
+    for (kind, pipeline) in planes {
+        if *kind == Some(2) { continue; } // DRM_PLANE_TYPE_CURSOR
+        active = true;
+        if pipeline.unwrap_or(0) != 0 { return Some(true); }
+    }
+    active.then_some(false)
+}
+
+fn plane_color_properties(fd: RawFd, id: u32) -> Option<(Option<u64>, Option<u64>)> {
+    let props = NonNull::new(unsafe { drmModeObjectGetProperties(fd, id, DRM_MODE_OBJECT_PLANE) })?;
+    let props = DrmObjectProperties(props);
+    let details = unsafe { props.0.as_ref() };
+    if details.count_props > 0 && (details.props.is_null() || details.prop_values.is_null()) { return None; }
+    let (mut kind, mut pipeline) = (None, None);
+    for i in 0..details.count_props as usize {
+        let property = NonNull::new(unsafe { drmModeGetProperty(fd, *details.props.add(i)) })?;
+        let property = DrmProperty(property);
+        let name = unsafe { CStr::from_ptr(property.0.as_ref().name.as_ptr()) };
+        let value = unsafe { *details.prop_values.add(i) };
+        match name.to_bytes() {
+            b"type" => kind = Some(value),
+            b"COLOR_PIPELINE" => pipeline = Some(value),
+            _ => {}
+        }
+    }
+    Some((kind, pipeline))
+}
+
 fn parse_control_messages(message: &libc::msghdr, received: &mut ReceivedFds) {
     let control = message.msg_control.cast::<u8>();
     let total = message.msg_controllen;
@@ -1397,6 +1520,27 @@ struct DrmModePropertyBlob {
     data: *mut libc::c_void,
 }
 
+#[repr(C)]
+struct DrmModePlaneResources {
+    count_planes: u32,
+    planes: *mut u32,
+}
+
+#[repr(C)]
+struct DrmModePlane {
+    _count_formats: u32,
+    _formats: *mut u32,
+    _plane_id: u32,
+    crtc_id: u32,
+    fb_id: u32,
+    _crtc_x: u32,
+    _crtc_y: u32,
+    _x: u32,
+    _y: u32,
+    _possible_crtcs: u32,
+    _gamma_size: u32,
+}
+
 #[link(name = "drm")]
 extern "C" {
     fn drmSetClientCap(fd: libc::c_int, capability: u64, value: u64) -> libc::c_int;
@@ -1418,6 +1562,10 @@ extern "C" {
     fn drmModeFreeProperty(property: *mut DrmModeProperty);
     fn drmModeGetPropertyBlob(fd: libc::c_int, id: u32) -> *mut DrmModePropertyBlob;
     fn drmModeFreePropertyBlob(blob: *mut DrmModePropertyBlob);
+    fn drmModeGetPlaneResources(fd: libc::c_int) -> *mut DrmModePlaneResources;
+    fn drmModeFreePlaneResources(resources: *mut DrmModePlaneResources);
+    fn drmModeGetPlane(fd: libc::c_int, plane: u32) -> *mut DrmModePlane;
+    fn drmModeFreePlane(plane: *mut DrmModePlane);
     fn drmModeGetConnectorTypeName(connector_type: u32) -> *const libc::c_char;
 }
 
@@ -1428,6 +1576,8 @@ struct DrmCrtc(NonNull<DrmModeCrtc>);
 struct DrmObjectProperties(NonNull<DrmModeObjectProperties>);
 struct DrmProperty(NonNull<DrmModeProperty>);
 struct DrmPropertyBlob(NonNull<DrmModePropertyBlob>);
+struct DrmPlaneResources(NonNull<DrmModePlaneResources>);
+struct DrmPlane(NonNull<DrmModePlane>);
 
 impl Drop for DrmResources {
     fn drop(&mut self) {
@@ -1464,10 +1614,40 @@ impl Drop for DrmPropertyBlob {
         unsafe { drmModeFreePropertyBlob(self.0.as_ptr()) }
     }
 }
+impl Drop for DrmPlaneResources {
+    fn drop(&mut self) { unsafe { drmModeFreePlaneResources(self.0.as_ptr()) } }
+}
+impl Drop for DrmPlane {
+    fn drop(&mut self) { unsafe { drmModeFreePlane(self.0.as_ptr()) } }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gamma_status_distinguishes_inactive_unsupported_and_invalid_state() {
+        assert_eq!(gamma_blob_id(None, 0, 0), Err(GammaStatus::Unavailable));
+        assert_eq!(gamma_blob_id(Some(0), 0, 0), Err(GammaStatus::Inactive));
+        assert_eq!(gamma_blob_id(Some(9), 1, 0), Err(GammaStatus::MatrixActive));
+        assert_eq!(gamma_blob_id(Some(9), 0, 1), Err(GammaStatus::DegammaActive));
+        assert_eq!(gamma_blob_id(Some(u64::MAX), 0, 0), Err(GammaStatus::InvalidLut));
+        assert_eq!(gamma_blob_id(Some(9), 0, 0), Ok(9));
+    }
+
+    #[test]
+    fn plane_pipeline_guard_handles_cursors_missing_and_active_operations() {
+        assert_eq!(plane_color_pipeline_active(&[]), None);
+        assert_eq!(plane_color_pipeline_active(&[(Some(2), Some(7))]), None);
+        assert_eq!(plane_color_pipeline_active(&[(Some(1), None), (Some(2), Some(7))]), Some(false));
+        assert_eq!(plane_color_pipeline_active(&[(Some(1), Some(0)), (Some(0), Some(7))]), Some(true));
+        assert_eq!(plane_color_pipeline_active(&[(None, Some(7))]), Some(true));
+        assert_eq!(plane_pipeline_check_status(false, GammaStatus::Ready), "unsupported");
+        assert_eq!(plane_pipeline_check_status(true, GammaStatus::Ready), "checked");
+        assert_eq!(plane_pipeline_check_status(true, GammaStatus::PlanePipelineActive), "checked");
+        assert_eq!(plane_pipeline_check_status(true, GammaStatus::Unavailable), "unavailable");
+        assert_eq!(plane_pipeline_check_status(true, GammaStatus::Inactive), "not_checked");
+    }
 
     #[test]
     fn gamma_lut_parser_checks_bounds_and_preserves_channels() {

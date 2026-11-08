@@ -2,10 +2,13 @@
 
 For installation and requirements, see the [README](../README.md). Current controls and configuration are documented in the [User Guide](USAGE.md).
 
-## Unreleased
+## 0.5.0 — 2026-11-08
 
 - Added an optional fine-pattern capture filter to reduce color artifacts from CRT masks and other fine screen detail. It is off by default and independent of Looks and strip alignment.
 - HDR capture now uses sRGB output encoding. For a single full-screen HDR plane, it can apply an active CRTC gamma LUT before HDR conversion when no CRTC matrix or degamma LUT is active. The optional filter averages HDR in linear light.
+- HDR capture avoids applying a CRTC gamma LUT when an active plane color pipeline is detected, and capture diagnostics explain LUT decisions and HDR interpretation assumptions.
+
+- The capture diagnostic reports plane-pipeline inspection status and clearly labels unavailable alpha, blend, and encoding details. It does not infer unreported DRM plane IDs or change KWin settings.
 
 ## 0.4.4 — 2026-11-08
 
